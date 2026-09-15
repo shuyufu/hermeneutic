@@ -26,6 +26,7 @@ if(HERMENEUTIC_BUILD_TESTS)
     add_executable(hermeneutic_tests
         tests/fixed_point_test.cpp
         tests/order_book_test.cpp
+        tests/aggregate_order_book_test.cpp
     )
     target_link_libraries(hermeneutic_tests PRIVATE hermeneutic GTest::gtest_main)
     gtest_discover_tests(hermeneutic_tests)
