@@ -2,9 +2,9 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <system_error>
 #include <utility>
-#include <vector>
 
 namespace bobby::hermeneutic {
 namespace {
@@ -132,8 +132,7 @@ TEST(AggregateOrderBook, ApplySnapshotReplacesVenueSideWholesale) {
     book.apply_delta("okx", Side::Ask, Price(100.0), Size(4.0));
 
     // REST snapshot: 100.0 unchanged, 101.0 gone, 102.0 new.
-    const std::vector<std::pair<Price, Size>> snapshot = {{Price(100.0), Size(1.0)},
-                                                            {Price(102.0), Size(3.0)}};
+    const std::array snapshot = {std::pair{Price(100.0), Size(1.0)}, std::pair{Price(102.0), Size(3.0)}};
     book.apply_snapshot("binance", Side::Ask, snapshot);
 
     EXPECT_EQ(book.venues().at("binance").asks.count(Price(101.0)), 0u);
@@ -157,8 +156,7 @@ TEST(AggregateOrderBook, InvalidateThenApplySnapshotResyncsCleanly) {
     ASSERT_TRUE(book.aggregate().bids.empty());
 
     // Resync from a fresh REST snapshot.
-    const std::vector<std::pair<Price, Size>> snapshot = {{Price(99.0), Size(1.5)},
-                                                            {Price(97.0), Size(1.0)}};
+    const std::array snapshot = {std::pair{Price(99.0), Size(1.5)}, std::pair{Price(97.0), Size(1.0)}};
     book.apply_snapshot("binance", Side::Bid, snapshot);
 
     EXPECT_EQ(book.aggregate().bids.at(Price(99.0)), Size(1.5));
@@ -183,8 +181,8 @@ TEST(AggregateOrderBook, ApplySnapshotRejectsNegativeSizeAtomically) {
     AggregateOrderBook book;
     book.apply_delta("binance", Side::Ask, Price(100.0), Size(1.0));
 
-    const std::vector<std::pair<Price, Size>> snapshot = {{Price(100.0), Size(2.0)},
-                                                            {Price(101.0), Size(-1.0)}};
+    const std::array snapshot = {std::pair{Price(100.0), Size(2.0)},
+                                  std::pair{Price(101.0), Size(-1.0)}};
     auto result = book.apply_snapshot("binance", Side::Ask, snapshot);
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), std::errc::invalid_argument);

@@ -2,6 +2,7 @@
 
 #include <expected>
 #include <map>
+#include <new>
 #include <span>
 #include <string>
 #include <system_error>
@@ -22,16 +23,22 @@ enum class Side { Bid, Ask };
 class AggregateOrderBook {
   public:
     // A `size` of zero removes that venue's level (Binance L2 diff semantics).
-    // Returns std::errc::invalid_argument if `size` is negative.
+    // Returns std::errc::invalid_argument if `size` is negative, or
+    // std::errc::not_enough_memory if a new venue's book could not be
+    // allocated.
     std::expected<void, std::errc> apply_delta(const VenueId& venue, Side side, Price price,
                                                 Size size) noexcept {
         if (auto check = require_non_negative_size(size); !check) return check;
 
-        auto& venue_book = venues_[venue];
-        if (side == Side::Bid) {
-            apply_side(venue_book.bids, aggregate_.bids, price, size);
-        } else {
-            apply_side(venue_book.asks, aggregate_.asks, price, size);
+        try {
+            auto& venue_book = venues_[venue];
+            if (side == Side::Bid) {
+                apply_side(venue_book.bids, aggregate_.bids, price, size);
+            } else {
+                apply_side(venue_book.asks, aggregate_.asks, price, size);
+            }
+        } catch (const std::bad_alloc&) {
+            return std::unexpected(std::errc::not_enough_memory);
         }
         return {};
     }
@@ -57,18 +64,23 @@ class AggregateOrderBook {
     // Any price the venue previously held that is absent from `levels` is
     // treated as removed. Use this to resynchronize after invalidate_venue().
     // Returns std::errc::invalid_argument, without modifying any state, if
-    // any level's size is negative.
+    // any level's size is negative, or std::errc::not_enough_memory if
+    // allocation fails partway through applying the snapshot.
     std::expected<void, std::errc> apply_snapshot(
         const VenueId& venue, Side side, std::span<const std::pair<Price, Size>> levels) noexcept {
         for (const auto& level : levels) {
             if (auto check = require_non_negative_size(level.second); !check) return check;
         }
 
-        auto& venue_book = venues_[venue];
-        if (side == Side::Bid) {
-            apply_snapshot_side(venue_book.bids, aggregate_.bids, levels);
-        } else {
-            apply_snapshot_side(venue_book.asks, aggregate_.asks, levels);
+        try {
+            auto& venue_book = venues_[venue];
+            if (side == Side::Bid) {
+                apply_snapshot_side(venue_book.bids, aggregate_.bids, levels);
+            } else {
+                apply_snapshot_side(venue_book.asks, aggregate_.asks, levels);
+            }
+        } catch (const std::bad_alloc&) {
+            return std::unexpected(std::errc::not_enough_memory);
         }
         return {};
     }
