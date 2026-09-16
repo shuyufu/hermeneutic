@@ -34,3 +34,55 @@ if(HERMENEUTIC_BUILD_TESTS)
     target_link_libraries(hermeneutic_tests PRIVATE hermeneutic GTest::gtest_main)
     gtest_discover_tests(hermeneutic_tests)
 endif()
+
+option(HERMENEUTIC_BUILD_SERVICE "Build gRPC service targets (requires vcpkg toolchain, see README)" OFF)
+
+if(HERMENEUTIC_BUILD_SERVICE)
+    find_package(Protobuf CONFIG REQUIRED)
+    find_package(gRPC CONFIG REQUIRED)
+
+    set(HERMENEUTIC_PROTO_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/proto)
+    set(HERMENEUTIC_PROTO_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
+    file(MAKE_DIRECTORY ${HERMENEUTIC_PROTO_GEN_DIR})
+
+    # Picks up every proto/**/*.proto automatically. A .proto's directory
+    # should mirror its `package` (e.g. proto/bobby/hermeneutic/aggregator/aggregator.proto
+    # for `package bobby.hermeneutic.aggregator`) so generated/ mirrors it too and
+    # same-named messages/services in different packages can't collide.
+    # CONFIGURE_DEPENDS re-globs on `cmake --build`, so adding, removing, or
+    # moving a .proto needs no manual CMakeLists.txt change.
+    file(GLOB_RECURSE HERMENEUTIC_PROTO_FILES CONFIGURE_DEPENDS
+        ${HERMENEUTIC_PROTO_ROOT}/*.proto)
+
+    set(HERMENEUTIC_PROTO_GENERATED_SRCS "")
+    foreach(proto_file ${HERMENEUTIC_PROTO_FILES})
+        file(RELATIVE_PATH proto_rel ${HERMENEUTIC_PROTO_ROOT} ${proto_file})
+        get_filename_component(proto_rel_dir ${proto_rel} DIRECTORY)
+        get_filename_component(proto_name ${proto_rel} NAME_WE)
+        set(out_dir ${HERMENEUTIC_PROTO_GEN_DIR}/${proto_rel_dir})
+
+        set(proto_srcs ${out_dir}/${proto_name}.pb.cc)
+        set(proto_hdrs ${out_dir}/${proto_name}.pb.h)
+        set(grpc_srcs ${out_dir}/${proto_name}.grpc.pb.cc)
+        set(grpc_hdrs ${out_dir}/${proto_name}.grpc.pb.h)
+
+        add_custom_command(
+            OUTPUT ${proto_srcs} ${proto_hdrs} ${grpc_srcs} ${grpc_hdrs}
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${out_dir}
+            COMMAND protobuf::protoc
+            ARGS --cpp_out=${HERMENEUTIC_PROTO_GEN_DIR}
+                 --grpc_out=${HERMENEUTIC_PROTO_GEN_DIR}
+                 -I ${HERMENEUTIC_PROTO_ROOT}
+                 --plugin=protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>
+                 ${proto_file}
+            DEPENDS ${proto_file}
+            COMMENT "Generating gRPC/protobuf code for ${proto_rel}"
+        )
+        list(APPEND HERMENEUTIC_PROTO_GENERATED_SRCS ${proto_srcs} ${grpc_srcs})
+    endforeach()
+
+    # All generated protobuf/gRPC code, one library for every proto/**/*.proto.
+    add_library(hermeneutic_proto STATIC ${HERMENEUTIC_PROTO_GENERATED_SRCS})
+    target_include_directories(hermeneutic_proto PUBLIC ${HERMENEUTIC_PROTO_GEN_DIR})
+    target_link_libraries(hermeneutic_proto PUBLIC gRPC::grpc++ protobuf::libprotobuf)
+endif()

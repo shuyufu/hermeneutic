@@ -3,9 +3,12 @@
   "configurePresets": [
     {
       "name": "vcpkg",
-      "displayName": "vcpkg toolchain",
+      "displayName": "vcpkg toolchain (gRPC service build)",
       "binaryDir": "${sourceDir}/build-vcpkg",
-      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "HERMENEUTIC_BUILD_SERVICE": "ON"
+      }
     }
   ]
 }
