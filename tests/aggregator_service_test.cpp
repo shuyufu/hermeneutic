@@ -46,6 +46,47 @@ class UpdateQueue {
     std::deque<L2Update> queue_;
 };
 
+TEST(SubscriberQueueTest, DrainsInFifoOrderAndReportsResultKind) {
+    SubscriberQueue queue(4);
+
+    std::vector<L2Update> out;
+    EXPECT_EQ(queue.wait_and_drain(std::chrono::milliseconds(10), out),
+              SubscriberQueue::DrainResult::TimedOut);
+    EXPECT_TRUE(out.empty());
+
+    L2Update first, second;
+    first.mutable_heartbeat()->set_ts_ns(1);
+    second.mutable_heartbeat()->set_ts_ns(2);
+    EXPECT_TRUE(queue.push_or_close(first));
+    EXPECT_TRUE(queue.push_or_close(second));
+
+    EXPECT_EQ(queue.wait_and_drain(std::chrono::milliseconds(10), out),
+              SubscriberQueue::DrainResult::Drained);
+    ASSERT_EQ(out.size(), 2u);
+    EXPECT_EQ(out[0].heartbeat().ts_ns(), 1u);
+    EXPECT_EQ(out[1].heartbeat().ts_ns(), 2u);
+}
+
+TEST(SubscriberQueueTest, OverflowClosesAndDiscardsEverythingQueued) {
+    SubscriberQueue queue(2);
+
+    L2Update update;
+    ASSERT_TRUE(queue.push_or_close(update));
+    ASSERT_TRUE(queue.push_or_close(update));
+    // Third push finds the queue already at capacity: closes it instead of
+    // dropping the oldest entry, since a gap in an L2Diff stream leaves the
+    // subscriber's book genuinely wrong - only a fresh snapshot recovers it,
+    // so there's nothing worth keeping once it's fallen this far behind.
+    EXPECT_FALSE(queue.push_or_close(update));
+    // Pushes after closing are also rejected, not re-queued.
+    EXPECT_FALSE(queue.push_or_close(update));
+
+    std::vector<L2Update> out;
+    EXPECT_EQ(queue.wait_and_drain(std::chrono::milliseconds(10), out),
+              SubscriberQueue::DrainResult::Closed);
+    EXPECT_TRUE(out.empty());  // the two successfully queued updates were discarded, not delivered
+}
+
 class AggregatorServiceTest : public ::testing::Test {
   protected:
     // Starts a real server on an ephemeral port and a real client stub
@@ -305,6 +346,41 @@ TEST_F(AggregatorServiceTest, HeartbeatIsDeliveredAndDoesNotAdvanceSeq) {
     L2Update diff_msg = updates_.wait_for(2);
     ASSERT_TRUE(diff_msg.has_diff());
     EXPECT_EQ(diff_msg.diff().seq(), 1u);
+}
+
+TEST_F(AggregatorServiceTest, StuckSubscriberDoesNotBlockIngestionOrOtherSubscribers) {
+    updates_.wait_for(0);  // initial snapshot for the fixture's own (fast) subscriber
+
+    // A second subscriber that never reads from its stream, simulating one
+    // that's stopped draining. broadcast_to_subscribers() only ever does a
+    // non-blocking push into each subscriber's own queue (see
+    // SubscriberQueue::push_or_close), so ingestion and the first (fast)
+    // subscriber must be unaffected by this one - regardless of whether its
+    // queue has overflowed yet, which depends on OS-level socket buffering
+    // this test doesn't control and so doesn't assert on.
+    grpc::ClientContext stuck_context;
+    auto stuck_reader = stub_->Subscribe(&stuck_context, SubscribeRequest{});
+
+    // Stays comfortably under kSubscriberQueueCapacity (256): this test is
+    // about a non-draining subscriber not blocking anyone else, not about
+    // burst volume exceeding a single subscriber's own queue capacity (a
+    // real but separate concern - a big enough burst can overflow even an
+    // actively-draining subscriber if it can't Write() fast enough, which
+    // would otherwise make this test flaky for the wrong reason).
+    constexpr int kUpdates = 100;
+    auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < kUpdates; ++i) {
+        ASSERT_TRUE(service_.apply_delta("binance", Side::Bid, Price(1.0 + i * 0.01), Size(1.0))
+                        .has_value());
+    }
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_LT(elapsed, std::chrono::seconds(2))
+        << "ingestion stalled - likely blocked on the non-draining subscriber";
+
+    // The fast subscriber must still have received every diff.
+    updates_.wait_for(kUpdates);
+
+    stuck_context.TryCancel();
 }
 
 }  // namespace

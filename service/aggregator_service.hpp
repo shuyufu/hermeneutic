@@ -3,15 +3,16 @@
 #include <grpcpp/grpcpp.h>
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <expected>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
-#include <set>
 #include <span>
 #include <system_error>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -26,15 +27,76 @@ namespace bobby::hermeneutic::aggregator {
 static_assert(Price::decimals == 9);
 static_assert(Size::decimals == 6);
 
+// One bounded mailbox per subscriber. Publishers (apply_delta/apply_snapshot/
+// invalidate_venue/send_heartbeat, via AggregatorService::broadcast_to_
+// subscribers()) only ever push; the Subscribe() handler thread that owns
+// this subscriber's ServerWriter is the only one that drains it and calls
+// Write(). Never shared across subscribers, so one slow drainer never
+// contends with another subscriber's push or drain.
+//
+// A full queue closes rather than drops the oldest entry: an L2Diff stream
+// is not a series of independently useful events -- missing even one leaves
+// the subscriber's replica of the book genuinely wrong, not just stale, and
+// the only valid recovery is a fresh Subscribe() (a new full snapshot), not
+// resuming the same stream with a gap in it. So there is nothing worth
+// keeping once a subscriber has fallen behind past capacity; the queue is
+// cleared and closed instead.
+class SubscriberQueue {
+  public:
+    enum class DrainResult { TimedOut, Drained, Closed };
+
+    explicit SubscriberQueue(std::size_t capacity) : capacity_(capacity) {}
+
+    // Non-blocking. False means this push found the queue already closed,
+    // or just closed it by overflowing `capacity_`.
+    bool push_or_close(L2Update update) {
+        std::lock_guard lock(mutex_);
+        if (closed_) return false;
+        if (queue_.size() >= capacity_) {
+            closed_ = true;
+            queue_.clear();
+            cv_.notify_one();
+            return false;
+        }
+        queue_.push_back(std::move(update));
+        cv_.notify_one();
+        return true;
+    }
+
+    // Blocks up to `timeout` for a queued update or a close. Closed takes
+    // priority over whatever's queued, though push_or_close() never leaves
+    // anything queued alongside a close. Returns Drained with `out`
+    // populated, or TimedOut/Closed with `out` left untouched.
+    DrainResult wait_and_drain(std::chrono::milliseconds timeout, std::vector<L2Update>& out) {
+        std::unique_lock lock(mutex_);
+        cv_.wait_for(lock, timeout, [this] { return !queue_.empty() || closed_; });
+        if (closed_) return DrainResult::Closed;
+        if (queue_.empty()) return DrainResult::TimedOut;
+        while (!queue_.empty()) {
+            out.push_back(std::move(queue_.front()));
+            queue_.pop_front();
+        }
+        return DrainResult::Drained;
+    }
+
+  private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<L2Update> queue_;
+    std::size_t capacity_;
+    bool closed_ = false;
+};
+
 // Wraps an AggregateOrderBook and fans out every change to subscribed gRPC
-// clients. Concurrency model (V1): a single mutex guards both the book and
-// the subscriber set; apply_delta/apply_snapshot/invalidate_venue and
-// Subscribe's initial snapshot all write to ServerWriters synchronously,
-// under that same lock. Trade-off accepted: a slow subscriber can slow down
-// broadcasting (and therefore ingestion) for everyone. Bounded, not solved,
-// by the server-side gRPC keepalive configured in aggregator_main.cpp: an
-// unresponsive connection eventually fails its Write() instead of blocking
-// forever.
+// clients. Concurrency model: `mutex_` guards only `book_`/`seq_` --
+// applying a delta and computing the resulting diff, never any socket I/O.
+// Each subscriber gets its own SubscriberQueue; broadcasting is a
+// non-blocking push into every subscriber's queue (still done under
+// `mutex_`, since it can no longer block), and the actual Write() to gRPC
+// happens later, off the ingestion thread, on that subscriber's own
+// Subscribe() handler thread. A stuck or slow subscriber can therefore only
+// ever stall itself -- until it overflows its queue and SubscriberQueue
+// closes it -- never ingestion or any other subscriber.
 class AggregatorService final : public Aggregator::Service {
   public:
     std::expected<void, std::errc> apply_delta(const VenueId& venue, Side side, Price price,
@@ -122,29 +184,48 @@ class AggregatorService final : public Aggregator::Service {
 
     grpc::Status Subscribe(grpc::ServerContext* context, const SubscribeRequest*,
                             grpc::ServerWriter<L2Update>* writer) override {
+        auto queue = std::make_shared<SubscriberQueue>(kSubscriberQueueCapacity);
         {
             std::lock_guard lock(mutex_);
             if (!writer->Write(build_snapshot())) return grpc::Status::OK;
-            subscribers_.insert(writer);
+            subscribers_.emplace(writer, queue);
         }
 
-        // gRPC's synchronous API has no primitive to block on "cancelled or a
-        // broadcast happened"; poll instead. Broadcasts (publish()) write to
-        // `writer` directly from whichever thread calls apply_delta/
-        // apply_snapshot/invalidate_venue, always under mutex_, so there is
-        // never a concurrent Write() to the same writer from two threads.
+        // This thread is the sole owner of `writer`/`queue` from here on:
+        // it's the only one that calls Write() on `writer`, and the only one
+        // that drains `queue`. gRPC's synchronous API has no primitive to
+        // block on "cancelled or a new update queued"; the 50ms timeout is
+        // only there to re-check IsCancelled() -- an actual push wakes this
+        // thread immediately via SubscriberQueue's condition variable.
+        std::vector<L2Update> batch;
         while (true) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            std::lock_guard lock(mutex_);
-            if (context->IsCancelled() || !subscribers_.contains(writer)) {
+            batch.clear();
+            auto result = queue->wait_and_drain(std::chrono::milliseconds(50), batch);
+            if (result == SubscriberQueue::DrainResult::Closed) {
+                std::lock_guard lock(mutex_);
                 subscribers_.erase(writer);
-                break;
+                return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
+                                     "subscriber fell too far behind; reconnect for a fresh "
+                                     "snapshot");
+            }
+            for (auto& update : batch) {
+                if (!writer->Write(update)) {
+                    std::lock_guard lock(mutex_);
+                    subscribers_.erase(writer);
+                    return grpc::Status::OK;
+                }
+            }
+            if (context->IsCancelled()) {
+                std::lock_guard lock(mutex_);
+                subscribers_.erase(writer);
+                return grpc::Status::OK;
             }
         }
-        return grpc::Status::OK;
     }
 
   private:
+    static constexpr std::size_t kSubscriberQueueCapacity = 256;
+
     struct Change {
         Side side;
         Price price;
@@ -244,22 +325,21 @@ class AggregatorService final : public Aggregator::Service {
         broadcast_to_subscribers(update);
     }
 
-    // Must be called with mutex_ held. Writes `update` to every subscriber,
-    // removing any whose Write() fails (see the class comment's note on
-    // Write() failures and cleanup).
+    // Must be called with mutex_ held. Non-blocking: pushes `update` into
+    // every subscriber's own queue. The actual Write() happens later, off
+    // this thread, on that subscriber's own Subscribe() handler thread --
+    // see the class comment. A subscriber whose queue overflows closes
+    // itself; its Subscribe() handler notices on its own next drain and
+    // removes it from `subscribers_` then, not here.
     void broadcast_to_subscribers(const L2Update& update) {
-        for (auto it = subscribers_.begin(); it != subscribers_.end();) {
-            if ((*it)->Write(update)) {
-                ++it;
-            } else {
-                it = subscribers_.erase(it);
-            }
+        for (auto& [writer, queue] : subscribers_) {
+            queue->push_or_close(update);
         }
     }
 
     std::mutex mutex_;
     AggregateOrderBook book_;
-    std::set<grpc::ServerWriter<L2Update>*> subscribers_;
+    std::map<grpc::ServerWriter<L2Update>*, std::shared_ptr<SubscriberQueue>> subscribers_;
     std::uint64_t seq_ = 0;
 };
 
