@@ -4,15 +4,41 @@
 #include <chrono>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "aggregator_service.hpp"
 
+namespace {
+
+// Splits a comma-separated symbol list ("BTCUSDT,ETHUSDT") into its parts.
+// Empty entries (e.g. a trailing comma) are dropped rather than producing a
+// blank symbol no client could ever usefully subscribe to.
+std::vector<std::string> split_symbols(const std::string& csv) {
+    std::vector<std::string> symbols;
+    std::stringstream stream(csv);
+    std::string symbol;
+    while (std::getline(stream, symbol, ',')) {
+        if (!symbol.empty()) symbols.push_back(symbol);
+    }
+    return symbols;
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
     std::string address = argc > 1 ? argv[1] : "0.0.0.0:50051";
+    std::vector<std::string> symbols = argc > 2 ? split_symbols(argv[2]) : std::vector{
+        std::string("BTCUSDT")};
+    if (symbols.empty()) {
+        std::cerr << "no symbols given (usage: hermeneutic_aggregator_service [address] "
+                     "[SYMBOL1,SYMBOL2,...])\n";
+        return 1;
+    }
 
-    bobby::hermeneutic::aggregator::AggregatorService service;
+    bobby::hermeneutic::aggregator::AggregatorService service(symbols);
 
     grpc::ServerBuilder builder;
     builder.AddListeningPort(address, grpc::InsecureServerCredentials());
@@ -50,7 +76,10 @@ int main(int argc, char** argv) {
     });
     heartbeat_thread.detach();
 
-    std::cout << "hermeneutic_aggregator_service listening on " << address << std::endl;
+    std::cout << "hermeneutic_aggregator_service listening on " << address << " for "
+              << symbols.size() << " symbol(s):";
+    for (const auto& symbol : symbols) std::cout << ' ' << symbol;
+    std::cout << std::endl;
     server->Wait();
     return 0;
 }

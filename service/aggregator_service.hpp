@@ -2,6 +2,7 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <cassert>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -12,6 +13,8 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -27,8 +30,8 @@ namespace bobby::hermeneutic::aggregator {
 static_assert(Price::decimals == 9);
 static_assert(Size::decimals == 6);
 
-// One bounded mailbox per subscriber. Publishers (apply_delta/apply_snapshot/
-// invalidate_venue/send_heartbeat, via AggregatorService::broadcast_to_
+// One bounded mailbox per subscriber. Publishers (SymbolBook::apply_delta/
+// apply_snapshot/invalidate_venue/send_heartbeat, via broadcast_to_
 // subscribers()) only ever push; the Subscribe() handler thread that owns
 // this subscriber's ServerWriter is the only one that drains it and calls
 // Write(). Never shared across subscribers, so one slow drainer never
@@ -87,17 +90,28 @@ class SubscriberQueue {
     bool closed_ = false;
 };
 
-// Wraps an AggregateOrderBook and fans out every change to subscribed gRPC
-// clients. Concurrency model: `mutex_` guards only `book_`/`seq_` --
-// applying a delta and computing the resulting diff, never any socket I/O.
-// Each subscriber gets its own SubscriberQueue; broadcasting is a
-// non-blocking push into every subscriber's queue (still done under
-// `mutex_`, since it can no longer block), and the actual Write() to gRPC
-// happens later, off the ingestion thread, on that subscriber's own
-// Subscribe() handler thread. A stuck or slow subscriber can therefore only
-// ever stall itself -- until it overflows its queue and SubscriberQueue
-// closes it -- never ingestion or any other subscriber.
-class AggregatorService final : public Aggregator::Service {
+// Per-symbol aggregated book plus its gRPC fan-out state. Not a gRPC type
+// itself: AggregatorService (the sole grpc::Service in this file) owns one
+// SymbolBook per symbol and routes every Subscribe() call, and every
+// ingestion call (apply_delta et al.), to the right one by symbol. This is
+// what keeps a multi-symbol deployment to one gRPC service on one port
+// instead of one process/port per symbol -- two grpc::Service instances of
+// the same generated type can't be registered on one grpc::Server (their
+// RPC method paths collide), but two SymbolBooks in one map have no such
+// restriction.
+//
+// Concurrency model: `mutex_` guards only `book_`/`seq_` -- applying a delta
+// and computing the resulting diff, never any socket I/O. Each subscriber
+// gets its own SubscriberQueue; broadcasting is a non-blocking push into
+// every subscriber's queue (still done under `mutex_`, since it can no
+// longer block), and the actual Write() to gRPC happens later, off the
+// caller's thread, on that subscriber's own Subscribe() handler thread. A
+// stuck or slow subscriber can therefore only ever stall itself -- until it
+// overflows its queue and SubscriberQueue closes it -- never ingestion or
+// any other subscriber. A separate SymbolBook (and separate `mutex_`) per
+// symbol means two symbols never contend with each other either, so
+// ingestion for one symbol can never be slowed by another's traffic.
+class SymbolBook {
   public:
     std::expected<void, std::errc> apply_delta(const VenueId& venue, Side side, Price price,
                                                  Size size) {
@@ -170,9 +184,10 @@ class AggregatorService final : public Aggregator::Service {
         publish(changed);
     }
 
-    // Broadcasts a liveness signal to every subscriber, independent of any
-    // book change - unlike publish(), this never touches seq_ (a heartbeat
-    // is not a book revision). Callers (e.g. aggregator_main.cpp) are
+    // Broadcasts a liveness signal to every subscriber of this symbol,
+    // independent of any book change - unlike publish(), this never touches
+    // seq_ (a heartbeat is not a book revision). Callers (e.g.
+    // AggregatorService::send_heartbeat(), driven by aggregator_main.cpp) are
     // expected to invoke this on a fixed interval; this class has no
     // internal timer of its own.
     void send_heartbeat() {
@@ -182,45 +197,22 @@ class AggregatorService final : public Aggregator::Service {
         broadcast_to_subscribers(update);
     }
 
-    grpc::Status Subscribe(grpc::ServerContext* context, const SubscribeRequest*,
-                            grpc::ServerWriter<L2Update>* writer) override {
+    // Writes the initial snapshot to `writer` and, if that succeeds,
+    // registers it for subsequent updates and returns its queue. Returns
+    // nullptr (without registering anything) if the initial Write() fails -
+    // the caller (AggregatorService::Subscribe()) should end the RPC without
+    // draining a queue that was never created.
+    std::shared_ptr<SubscriberQueue> subscribe(grpc::ServerWriter<L2Update>* writer) {
+        std::lock_guard lock(mutex_);
+        if (!writer->Write(build_snapshot())) return nullptr;
         auto queue = std::make_shared<SubscriberQueue>(kSubscriberQueueCapacity);
-        {
-            std::lock_guard lock(mutex_);
-            if (!writer->Write(build_snapshot())) return grpc::Status::OK;
-            subscribers_.emplace(writer, queue);
-        }
+        subscribers_.emplace(writer, queue);
+        return queue;
+    }
 
-        // This thread is the sole owner of `writer`/`queue` from here on:
-        // it's the only one that calls Write() on `writer`, and the only one
-        // that drains `queue`. gRPC's synchronous API has no primitive to
-        // block on "cancelled or a new update queued"; the 50ms timeout is
-        // only there to re-check IsCancelled() -- an actual push wakes this
-        // thread immediately via SubscriberQueue's condition variable.
-        std::vector<L2Update> batch;
-        while (true) {
-            batch.clear();
-            auto result = queue->wait_and_drain(std::chrono::milliseconds(50), batch);
-            if (result == SubscriberQueue::DrainResult::Closed) {
-                std::lock_guard lock(mutex_);
-                subscribers_.erase(writer);
-                return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
-                                     "subscriber fell too far behind; reconnect for a fresh "
-                                     "snapshot");
-            }
-            for (auto& update : batch) {
-                if (!writer->Write(update)) {
-                    std::lock_guard lock(mutex_);
-                    subscribers_.erase(writer);
-                    return grpc::Status::OK;
-                }
-            }
-            if (context->IsCancelled()) {
-                std::lock_guard lock(mutex_);
-                subscribers_.erase(writer);
-                return grpc::Status::OK;
-            }
-        }
+    void unsubscribe(grpc::ServerWriter<L2Update>* writer) {
+        std::lock_guard lock(mutex_);
+        subscribers_.erase(writer);
     }
 
   private:
@@ -341,6 +333,82 @@ class AggregatorService final : public Aggregator::Service {
     AggregateOrderBook book_;
     std::map<grpc::ServerWriter<L2Update>*, std::shared_ptr<SubscriberQueue>> subscribers_;
     std::uint64_t seq_ = 0;
+};
+
+// The sole gRPC service type in this file: one instance serves every symbol
+// it was constructed with, on one port, by routing each RPC (and each
+// ingestion call) to that symbol's own SymbolBook - see SymbolBook's class
+// comment for why that beats one grpc::Service instance per symbol.
+class AggregatorService final : public Aggregator::Service {
+  public:
+    // `symbols` must be non-empty with unique entries - both are startup
+    // configuration preconditions (asserted, not runtime-checked: this
+    // isn't external input), not something a client's request can violate.
+    // The resulting symbol set is fixed for this instance's lifetime - no
+    // dynamic add/remove.
+    explicit AggregatorService(std::span<const std::string> symbols) {
+        assert(!symbols.empty());
+        for (const auto& symbol : symbols) {
+            [[maybe_unused]] auto [it, inserted] = books_.try_emplace(symbol);
+            assert(inserted);
+        }
+    }
+
+    // Returns nullptr if `symbol` isn't one this instance was constructed
+    // with. Used by Subscribe() below, and by an ingestion layer routing a
+    // parsed delta/snapshot/invalidation to the right book.
+    SymbolBook* book(std::string_view symbol) {
+        auto it = books_.find(symbol);
+        return it != books_.end() ? &it->second : nullptr;
+    }
+
+    // Broadcasts a liveness heartbeat to every subscriber of every symbol.
+    void send_heartbeat() {
+        for (auto& [symbol, symbol_book] : books_) symbol_book.send_heartbeat();
+    }
+
+    grpc::Status Subscribe(grpc::ServerContext* context, const SubscribeRequest* request,
+                            grpc::ServerWriter<L2Update>* writer) override {
+        SymbolBook* target = book(request->symbol());
+        if (!target) {
+            return grpc::Status(grpc::StatusCode::NOT_FOUND,
+                                 "unknown symbol: " + request->symbol());
+        }
+
+        auto queue = target->subscribe(writer);
+        if (!queue) return grpc::Status::OK;
+
+        // This thread is the sole owner of `writer`/`queue` from here on:
+        // it's the only one that calls Write() on `writer`, and the only one
+        // that drains `queue`. gRPC's synchronous API has no primitive to
+        // block on "cancelled or a new update queued"; the 50ms timeout is
+        // only there to re-check IsCancelled() -- an actual push wakes this
+        // thread immediately via SubscriberQueue's condition variable.
+        std::vector<L2Update> batch;
+        while (true) {
+            batch.clear();
+            auto result = queue->wait_and_drain(std::chrono::milliseconds(50), batch);
+            if (result == SubscriberQueue::DrainResult::Closed) {
+                target->unsubscribe(writer);
+                return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
+                                     "subscriber fell too far behind; reconnect for a fresh "
+                                     "snapshot");
+            }
+            for (auto& update : batch) {
+                if (!writer->Write(update)) {
+                    target->unsubscribe(writer);
+                    return grpc::Status::OK;
+                }
+            }
+            if (context->IsCancelled()) {
+                target->unsubscribe(writer);
+                return grpc::Status::OK;
+            }
+        }
+    }
+
+  private:
+    std::map<std::string, SymbolBook, std::less<>> books_;
 };
 
 }  // namespace bobby::hermeneutic::aggregator

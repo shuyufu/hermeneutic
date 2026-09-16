@@ -43,14 +43,18 @@ example, alongside its hand-written service in `service/aggregator_service.hpp`.
 ### Aggregator service
 
 `hermeneutic_aggregator_service` (`service/aggregator_main.cpp`) streams the
-aggregated L2 order book to subscribers: a client calls `Subscribe`, gets an
-initial snapshot, then every subsequent change as it happens. It only wraps
-`AggregateOrderBook` and broadcasts to subscribers — feeding it real market
-data (`AggregatorService::apply_delta`/`apply_snapshot`/`invalidate_venue`)
-is up to the caller.
+aggregated L2 order book to subscribers: a client calls `Subscribe` with the
+symbol it wants, gets an initial snapshot, then every subsequent change as it
+happens. One instance serves any number of symbols on a single port — each
+gets its own `SymbolBook` (an `AggregateOrderBook` plus its own subscriber
+fan-out), routed by `SubscribeRequest.symbol`. It only wraps the book(s) and
+broadcasts to subscribers — feeding real market data
+(`SymbolBook::apply_delta`/`apply_snapshot`/`invalidate_venue`, reached via
+`AggregatorService::book(symbol)`) is up to the caller.
 
 ```sh
 cmake --build build-vcpkg --target hermeneutic_aggregator_service
+./build-vcpkg/hermeneutic_aggregator_service 0.0.0.0:50051 BTCUSDT,ETHUSDT
 ```
 
 `hermeneutic_aggregator_service_test` exercises it over a real (in-process)

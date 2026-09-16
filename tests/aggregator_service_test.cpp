@@ -10,11 +10,19 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace bobby::hermeneutic::aggregator {
 namespace {
+
+SubscribeRequest subscribe_request(std::string_view symbol) {
+    SubscribeRequest request;
+    request.set_symbol(std::string(symbol));
+    return request;
+}
 
 // Thread-safe queue the client-reader thread pushes into and the test
 // thread polls, so assertions can wait for a specific message to arrive
@@ -89,6 +97,10 @@ TEST(SubscriberQueueTest, OverflowClosesAndDiscardsEverythingQueued) {
 
 class AggregatorServiceTest : public ::testing::Test {
   protected:
+    static constexpr std::string_view kSymbol = "BTCUSDT";
+
+    AggregatorServiceTest() : service_(std::vector<std::string>{std::string(kSymbol)}) {}
+
     // Starts a real server on an ephemeral port and a real client stub
     // against it, so this exercises the actual gRPC wire path rather than
     // calling AggregatorService's methods directly against each other.
@@ -104,7 +116,7 @@ class AggregatorServiceTest : public ::testing::Test {
                                             grpc::InsecureChannelCredentials());
         stub_ = Aggregator::NewStub(channel);
 
-        reader_ = stub_->Subscribe(&context_, SubscribeRequest{});
+        reader_ = stub_->Subscribe(&context_, subscribe_request(kSymbol));
         reader_thread_ = std::thread([this] {
             L2Update update;
             while (reader_->Read(&update)) {
@@ -118,6 +130,13 @@ class AggregatorServiceTest : public ::testing::Test {
         if (reader_thread_.joinable()) reader_thread_.join();
         server_->Shutdown();
     }
+
+    // Ingestion for this fixture's tests goes through the symbol's own
+    // SymbolBook directly, the same way a real ingestion dispatch layer
+    // would - the fixture used to expose apply_delta/apply_snapshot/
+    // invalidate_venue/send_heartbeat straight on AggregatorService, back
+    // when it wrapped exactly one symbol.
+    SymbolBook& book() { return *service_.book(kSymbol); }
 
     AggregatorService service_;
     std::unique_ptr<grpc::Server> server_;
@@ -139,7 +158,7 @@ TEST_F(AggregatorServiceTest, SubscribingToEmptyBookYieldsEmptySnapshot) {
 TEST_F(AggregatorServiceTest, ApplyDeltaAfterSubscribeProducesDiff) {
     updates_.wait_for(0);  // initial snapshot
 
-    auto result = service_.apply_delta("binance", Side::Bid, Price(100.0), Size(1.0));
+    auto result = book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0));
     ASSERT_TRUE(result.has_value());
 
     L2Update msg = updates_.wait_for(1);
@@ -154,13 +173,13 @@ TEST_F(AggregatorServiceTest, ApplyDeltaAfterSubscribeProducesDiff) {
 TEST_F(AggregatorServiceTest, MultipleVenuesAggregateAndPartialRemovalKeepsRemainder) {
     updates_.wait_for(0);  // initial snapshot
 
-    ASSERT_TRUE(service_.apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
     EXPECT_EQ(updates_.wait_for(1).diff().bids(0).size_raw(), Size(1.0).raw());
 
-    ASSERT_TRUE(service_.apply_delta("okx", Side::Bid, Price(100.0), Size(2.0)).has_value());
+    ASSERT_TRUE(book().apply_delta("okx", Side::Bid, Price(100.0), Size(2.0)).has_value());
     EXPECT_EQ(updates_.wait_for(2).diff().bids(0).size_raw(), Size(3.0).raw());
 
-    ASSERT_TRUE(service_.apply_delta("binance", Side::Bid, Price(100.0), Size(0.0)).has_value());
+    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(0.0)).has_value());
     L2Update msg = updates_.wait_for(3);
     ASSERT_EQ(msg.diff().bids_size(), 1);
     // okx's remaining size, not a removal (binance's own contribution was
@@ -171,14 +190,14 @@ TEST_F(AggregatorServiceTest, MultipleVenuesAggregateAndPartialRemovalKeepsRemai
 TEST_F(AggregatorServiceTest, InvalidateVenueRemovesOnlyItsExclusiveLevels) {
     updates_.wait_for(0);  // initial snapshot
 
-    ASSERT_TRUE(service_.apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
     updates_.wait_for(1);
-    ASSERT_TRUE(service_.apply_delta("okx", Side::Bid, Price(100.0), Size(2.0)).has_value());
+    ASSERT_TRUE(book().apply_delta("okx", Side::Bid, Price(100.0), Size(2.0)).has_value());
     updates_.wait_for(2);
-    ASSERT_TRUE(service_.apply_delta("binance", Side::Ask, Price(101.0), Size(5.0)).has_value());
+    ASSERT_TRUE(book().apply_delta("binance", Side::Ask, Price(101.0), Size(5.0)).has_value());
     updates_.wait_for(3);
 
-    service_.invalidate_venue("binance");
+    book().invalidate_venue("binance");
     L2Update msg = updates_.wait_for(4);
     ASSERT_TRUE(msg.has_diff());
     EXPECT_EQ(msg.diff().seq(), 4u);
@@ -195,11 +214,11 @@ TEST_F(AggregatorServiceTest, ApplySnapshotDiffsAgainstAggregateNotJustThatVenue
     updates_.wait_for(0);  // initial snapshot
 
     // binance holds two bid levels; okx also contributes at 100.
-    ASSERT_TRUE(service_.apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
     updates_.wait_for(1);
-    ASSERT_TRUE(service_.apply_delta("binance", Side::Bid, Price(103.0), Size(2.0)).has_value());
+    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(103.0), Size(2.0)).has_value());
     updates_.wait_for(2);
-    ASSERT_TRUE(service_.apply_delta("okx", Side::Bid, Price(100.0), Size(5.0)).has_value());
+    ASSERT_TRUE(book().apply_delta("okx", Side::Bid, Price(100.0), Size(5.0)).has_value());
     updates_.wait_for(3);
 
     // Replace binance's entire bid side: 100 changes size, 103 is dropped
@@ -208,7 +227,7 @@ TEST_F(AggregatorServiceTest, ApplySnapshotDiffsAgainstAggregateNotJustThatVenue
         {Price(100.0), Size(3.0)},
         {Price(102.0), Size(4.0)},
     }};
-    auto result = service_.apply_snapshot("binance", Side::Bid, levels);
+    auto result = book().apply_snapshot("binance", Side::Bid, levels);
     ASSERT_TRUE(result.has_value());
 
     L2Update msg = updates_.wait_for(4);
@@ -230,9 +249,9 @@ TEST_F(AggregatorServiceTest, ApplySnapshotDiffsAgainstAggregateNotJustThatVenue
 TEST_F(AggregatorServiceTest, ApplySnapshotOnAskSideProducesAscendingDiff) {
     updates_.wait_for(0);  // initial snapshot
 
-    ASSERT_TRUE(service_.apply_delta("binance", Side::Ask, Price(101.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta("binance", Side::Ask, Price(101.0), Size(1.0)).has_value());
     updates_.wait_for(1);
-    ASSERT_TRUE(service_.apply_delta("binance", Side::Ask, Price(105.0), Size(2.0)).has_value());
+    ASSERT_TRUE(book().apply_delta("binance", Side::Ask, Price(105.0), Size(2.0)).has_value());
     updates_.wait_for(2);
 
     // Replace binance's entire ask side: 101 changes size, 105 is dropped,
@@ -241,7 +260,7 @@ TEST_F(AggregatorServiceTest, ApplySnapshotOnAskSideProducesAscendingDiff) {
         {Price(101.0), Size(4.0)},
         {Price(103.0), Size(3.0)},
     }};
-    ASSERT_TRUE(service_.apply_snapshot("binance", Side::Ask, levels).has_value());
+    ASSERT_TRUE(book().apply_snapshot("binance", Side::Ask, levels).has_value());
 
     L2Update msg = updates_.wait_for(3);
     ASSERT_TRUE(msg.has_diff());
@@ -259,24 +278,24 @@ TEST_F(AggregatorServiceTest, ApplySnapshotOnAskSideProducesAscendingDiff) {
 TEST_F(AggregatorServiceTest, SnapshotOrderingMatchesBookConvention) {
     updates_.wait_for(0);  // initial (empty) snapshot for the fixture's own subscriber
 
-    ASSERT_TRUE(service_.apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
     updates_.wait_for(1);
-    ASSERT_TRUE(service_.apply_delta("binance", Side::Bid, Price(102.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(102.0), Size(1.0)).has_value());
     updates_.wait_for(2);
-    ASSERT_TRUE(service_.apply_delta("binance", Side::Bid, Price(101.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(101.0), Size(1.0)).has_value());
     updates_.wait_for(3);
-    ASSERT_TRUE(service_.apply_delta("binance", Side::Ask, Price(105.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta("binance", Side::Ask, Price(105.0), Size(1.0)).has_value());
     updates_.wait_for(4);
-    ASSERT_TRUE(service_.apply_delta("binance", Side::Ask, Price(103.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta("binance", Side::Ask, Price(103.0), Size(1.0)).has_value());
     updates_.wait_for(5);
-    ASSERT_TRUE(service_.apply_delta("binance", Side::Ask, Price(104.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta("binance", Side::Ask, Price(104.0), Size(1.0)).has_value());
     updates_.wait_for(6);
 
     // A second, independent subscriber joining now must see the book's own
     // ordering directly in its initial snapshot: bids descending, asks
     // ascending.
     grpc::ClientContext second_context;
-    auto second_reader = stub_->Subscribe(&second_context, SubscribeRequest{});
+    auto second_reader = stub_->Subscribe(&second_context, subscribe_request(kSymbol));
     L2Update snapshot_msg;
     ASSERT_TRUE(second_reader->Read(&snapshot_msg));
     second_context.TryCancel();
@@ -296,11 +315,11 @@ TEST_F(AggregatorServiceTest, SnapshotOrderingMatchesBookConvention) {
 TEST_F(AggregatorServiceTest, FailedApplyDoesNotBroadcast) {
     updates_.wait_for(0);  // initial snapshot
 
-    auto bad = service_.apply_delta("binance", Side::Bid, Price(100.0), Size(-1.0));
+    auto bad = book().apply_delta("binance", Side::Bid, Price(100.0), Size(-1.0));
     ASSERT_FALSE(bad.has_value());
     EXPECT_EQ(bad.error(), std::errc::invalid_argument);
 
-    auto good = service_.apply_delta("binance", Side::Bid, Price(100.0), Size(1.0));
+    auto good = book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0));
     ASSERT_TRUE(good.has_value());
 
     // If the failed call had broadcast anything, this would be seq 2 / the
@@ -315,13 +334,13 @@ TEST_F(AggregatorServiceTest, FailedApplyDoesNotBroadcast) {
 TEST_F(AggregatorServiceTest, NoOpApplyDeltaDoesNotBroadcast) {
     updates_.wait_for(0);  // initial snapshot
 
-    ASSERT_TRUE(service_.apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
     updates_.wait_for(1);
 
     // Re-applying the exact same size changes nothing in the aggregate.
-    ASSERT_TRUE(service_.apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
 
-    ASSERT_TRUE(service_.apply_delta("binance", Side::Bid, Price(100.0), Size(2.0)).has_value());
+    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(2.0)).has_value());
 
     // If the no-op call had broadcast anything, this would be seq 3 / the
     // third message overall instead of seq 2 / the second.
@@ -335,14 +354,14 @@ TEST_F(AggregatorServiceTest, NoOpApplyDeltaDoesNotBroadcast) {
 TEST_F(AggregatorServiceTest, HeartbeatIsDeliveredAndDoesNotAdvanceSeq) {
     updates_.wait_for(0);  // initial snapshot
 
-    service_.send_heartbeat();
+    book().send_heartbeat();
     L2Update heartbeat_msg = updates_.wait_for(1);
     ASSERT_TRUE(heartbeat_msg.has_heartbeat());
     EXPECT_NE(heartbeat_msg.heartbeat().ts_ns(), 0u);
 
     // A real book change right after must still be seq 1 / the third
     // message overall - proof the heartbeat above didn't touch seq_.
-    ASSERT_TRUE(service_.apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
     L2Update diff_msg = updates_.wait_for(2);
     ASSERT_TRUE(diff_msg.has_diff());
     EXPECT_EQ(diff_msg.diff().seq(), 1u);
@@ -359,7 +378,7 @@ TEST_F(AggregatorServiceTest, StuckSubscriberDoesNotBlockIngestionOrOtherSubscri
     // queue has overflowed yet, which depends on OS-level socket buffering
     // this test doesn't control and so doesn't assert on.
     grpc::ClientContext stuck_context;
-    auto stuck_reader = stub_->Subscribe(&stuck_context, SubscribeRequest{});
+    auto stuck_reader = stub_->Subscribe(&stuck_context, subscribe_request(kSymbol));
 
     // Stays comfortably under kSubscriberQueueCapacity (256): this test is
     // about a non-draining subscriber not blocking anyone else, not about
@@ -370,7 +389,7 @@ TEST_F(AggregatorServiceTest, StuckSubscriberDoesNotBlockIngestionOrOtherSubscri
     constexpr int kUpdates = 100;
     auto start = std::chrono::steady_clock::now();
     for (int i = 0; i < kUpdates; ++i) {
-        ASSERT_TRUE(service_.apply_delta("binance", Side::Bid, Price(1.0 + i * 0.01), Size(1.0))
+        ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(1.0 + i * 0.01), Size(1.0))
                         .has_value());
     }
     auto elapsed = std::chrono::steady_clock::now() - start;
@@ -381,6 +400,94 @@ TEST_F(AggregatorServiceTest, StuckSubscriberDoesNotBlockIngestionOrOtherSubscri
     updates_.wait_for(kUpdates);
 
     stuck_context.TryCancel();
+}
+
+// Not part of AggregatorServiceTest: these need their own multi-symbol
+// AggregatorService instance rather than the fixture's single-symbol one.
+class MultiSymbolAggregatorServiceTest : public ::testing::Test {
+  protected:
+    void SetUp() override {
+        std::vector<std::string> symbols{"BTCUSDT", "ETHUSDT"};
+        service_ = std::make_unique<AggregatorService>(symbols);
+
+        grpc::ServerBuilder builder;
+        int port = 0;
+        builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
+        builder.RegisterService(service_.get());
+        server_ = builder.BuildAndStart();
+        ASSERT_NE(server_, nullptr);
+
+        auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(port),
+                                            grpc::InsecureChannelCredentials());
+        stub_ = Aggregator::NewStub(channel);
+    }
+
+    void TearDown() override { server_->Shutdown(); }
+
+    std::unique_ptr<AggregatorService> service_;
+    std::unique_ptr<grpc::Server> server_;
+    std::unique_ptr<Aggregator::Stub> stub_;
+};
+
+TEST_F(MultiSymbolAggregatorServiceTest, SymbolsAreFullyIsolated) {
+    grpc::ClientContext btc_context;
+    auto btc_reader = stub_->Subscribe(&btc_context, subscribe_request("BTCUSDT"));
+    UpdateQueue btc_updates;
+    std::thread btc_thread([&] {
+        L2Update update;
+        while (btc_reader->Read(&update)) btc_updates.push(update);
+    });
+
+    grpc::ClientContext eth_context;
+    auto eth_reader = stub_->Subscribe(&eth_context, subscribe_request("ETHUSDT"));
+    UpdateQueue eth_updates;
+    std::thread eth_thread([&] {
+        L2Update update;
+        while (eth_reader->Read(&update)) eth_updates.push(update);
+    });
+
+    btc_updates.wait_for(0);  // initial snapshot
+    eth_updates.wait_for(0);
+
+    // Ingestion routes through AggregatorService::book(symbol), the same
+    // interface a real ingestion dispatch layer would use to reach the
+    // right SymbolBook directly.
+    ASSERT_TRUE(service_->book("BTCUSDT")
+                    ->apply_delta("binance", Side::Bid, Price(100.0), Size(1.0))
+                    .has_value());
+    L2Update btc_diff = btc_updates.wait_for(1);
+    ASSERT_TRUE(btc_diff.has_diff());
+    EXPECT_EQ(btc_diff.diff().seq(), 1u);
+
+    ASSERT_TRUE(service_->book("ETHUSDT")
+                    ->apply_delta("binance", Side::Ask, Price(2000.0), Size(3.0))
+                    .has_value());
+    L2Update eth_diff = eth_updates.wait_for(1);
+    ASSERT_TRUE(eth_diff.has_diff());
+    // ETHUSDT's own seq starts independently at 1, not "2" - proof the two
+    // symbols don't share a seq counter (or anything else): BTCUSDT's
+    // update above must never have reached ETHUSDT's subscriber, and
+    // vice versa below.
+    EXPECT_EQ(eth_diff.diff().seq(), 1u);
+    ASSERT_EQ(eth_diff.diff().asks_size(), 1);
+    EXPECT_EQ(eth_diff.diff().asks(0).price_raw(), Price(2000.0).raw());
+    EXPECT_EQ(eth_diff.diff().bids_size(), 0);
+
+    btc_context.TryCancel();
+    eth_context.TryCancel();
+    if (btc_thread.joinable()) btc_thread.join();
+    if (eth_thread.joinable()) eth_thread.join();
+}
+
+TEST_F(MultiSymbolAggregatorServiceTest, UnknownSymbolFailsWithNotFound) {
+    grpc::ClientContext context;
+    auto reader = stub_->Subscribe(&context, subscribe_request("DOGEUSDT"));
+
+    L2Update update;
+    EXPECT_FALSE(reader->Read(&update));  // no snapshot ever sent - the RPC fails immediately
+
+    grpc::Status status = reader->Finish();
+    EXPECT_EQ(status.error_code(), grpc::StatusCode::NOT_FOUND);
 }
 
 }  // namespace

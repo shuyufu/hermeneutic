@@ -8,7 +8,13 @@ service Aggregator {
   rpc Subscribe(SubscribeRequest) returns (stream L2Update);
 }
 
-message SubscribeRequest {}
+message SubscribeRequest {
+  // Must match one of the symbols this server instance was started with
+  // (a fixed, immutable set - see AggregatorService's constructor). Unknown
+  // symbol fails the RPC with NOT_FOUND rather than returning an empty
+  // stream, so a typo'd symbol is loud, not silently useless.
+  string symbol = 1;
+}
 
 // Fixed-point encoding, fixed by this protocol (not configurable per
 // subscription - see bobby::hermeneutic::Price/Size in fixed_point.hpp):
