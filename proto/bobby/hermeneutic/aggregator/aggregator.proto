@@ -1,0 +1,88 @@
+syntax = "proto3";
+
+package bobby.hermeneutic.aggregator;
+
+// Streams the current aggregated L2 order book (as an initial snapshot)
+// followed by every subsequent change, until the client cancels.
+service Aggregator {
+  rpc Subscribe(SubscribeRequest) returns (stream L2Update);
+}
+
+message SubscribeRequest {}
+
+// Fixed-point encoding, fixed by this protocol (not configurable per
+// subscription - see bobby::hermeneutic::Price/Size in fixed_point.hpp):
+//   price = price_raw / 1e9
+//   size  = size_raw  / 1e6
+//
+// In L2Snapshot.bids/asks, size_raw is always > 0.
+//
+// In L2Diff.bids/asks, a level is a replacement, not a delta: size_raw > 0
+// replaces the aggregate size at price_raw with size_raw (the resulting
+// absolute size, never something to add to a previous value); size_raw == 0
+// removes the level entirely.
+message PriceLevel {
+  int64 price_raw = 1;
+  int64 size_raw = 2;
+}
+
+message L2Snapshot {
+  // seq is a monotonically increasing book revision.
+  //
+  // A snapshot with seq=N represents the complete book state after revision N.
+  // The next observable update is expected to have seq=N+1.
+  //
+  // Clients that observe a sequence gap must discard their local book and
+  // resubscribe for a new snapshot.
+  uint64 seq = 1;
+  // Unix epoch timestamp in nanoseconds, captured by the aggregator's own
+  // wall clock when this update is published. It is not an exchange/source
+  // timestamp, an upstream-receive timestamp, or a book-mutation timestamp -
+  // only when the aggregator built this outbound message.
+  //
+  // For observability (e.g. latency measurement) only - never for ordering.
+  // Wall-clock time is not monotonic (NTP sync, manual clock changes can
+  // make it jump backward); seq is what establishes order and gaps.
+  //
+  // fixed64, not int64/uint64: a current epoch-nanos value is large enough
+  // (~61 bits) that varint encoding needs 9 bytes, one more than fixed64's
+  // constant 8 - same choice OpenTelemetry's *_unix_nano fields make.
+  fixed64 ts_ns = 2;
+  // Sorted best-to-worst (descending by price).
+  repeated PriceLevel bids = 3;
+  // Sorted best-to-worst (ascending by price).
+  repeated PriceLevel asks = 4;
+}
+
+message L2Diff {
+  // See L2Snapshot.seq for the sequence contract this participates in.
+  uint64 seq = 1;
+  // See L2Snapshot.ts_ns: same semantics (aggregator publish time, not for
+  // ordering) and same fixed64 rationale.
+  fixed64 ts_ns = 2;
+  // Same ordering guarantee as L2Snapshot.bids (descending by price) - this
+  // falls out of the aggregate book's own ordering by construction, not a
+  // separate sort step, so it costs nothing extra to guarantee.
+  repeated PriceLevel bids = 3;
+  // Same ordering guarantee as L2Snapshot.asks (ascending by price).
+  repeated PriceLevel asks = 4;
+}
+
+// Liveness signal, sent on a fixed interval independent of any book change -
+// so a client that has seen nothing for a while can tell "book genuinely
+// unchanged" apart from "aggregator/feed stalled" (a client would otherwise
+// have no way to distinguish those from a quiet stream alone). No seq: a
+// heartbeat is not a book revision and must never advance the seq sequence
+// L2Snapshot/L2Diff participate in. ts_ns has the same semantics as
+// L2Snapshot.ts_ns (aggregator wall-clock publish time, observability only).
+message Heartbeat {
+  fixed64 ts_ns = 1;
+}
+
+message L2Update {
+  oneof update {
+    L2Snapshot snapshot = 1;
+    L2Diff diff = 2;
+    Heartbeat heartbeat = 3;
+  }
+}

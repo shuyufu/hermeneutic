@@ -85,4 +85,16 @@ if(HERMENEUTIC_BUILD_SERVICE)
     add_library(hermeneutic_proto STATIC ${HERMENEUTIC_PROTO_GENERATED_SRCS})
     target_include_directories(hermeneutic_proto PUBLIC ${HERMENEUTIC_PROTO_GEN_DIR})
     target_link_libraries(hermeneutic_proto PUBLIC gRPC::grpc++ protobuf::libprotobuf)
+
+    add_executable(hermeneutic_aggregator_service service/aggregator_main.cpp)
+    target_link_libraries(hermeneutic_aggregator_service PRIVATE hermeneutic_proto hermeneutic)
+
+    if(HERMENEUTIC_BUILD_TESTS)
+        add_executable(hermeneutic_aggregator_service_test tests/aggregator_service_test.cpp)
+        target_include_directories(hermeneutic_aggregator_service_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/service)
+        target_link_libraries(hermeneutic_aggregator_service_test PRIVATE
+            hermeneutic_proto hermeneutic GTest::gtest_main)
+        gtest_discover_tests(hermeneutic_aggregator_service_test)
+    endif()
 endif()

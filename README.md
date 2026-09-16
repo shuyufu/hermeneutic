@@ -37,4 +37,30 @@ regenerates and recompiles after you add, edit, or remove one). Put each
 goes in `proto/bobby/hermeneutic/foo/*.proto`, matching the generated headers under
 `generated/bobby/hermeneutic/foo/`. This keeps the C++ namespace, the file layout,
 and the generated include paths consistent, and avoids filename collisions
-between packages.
+between packages. `proto/bobby/hermeneutic/aggregator/aggregator.proto` is a worked
+example, alongside its hand-written service in `service/aggregator_service.hpp`.
+
+### Aggregator service
+
+`hermeneutic_aggregator_service` (`service/aggregator_main.cpp`) streams the
+aggregated L2 order book to subscribers: a client calls `Subscribe`, gets an
+initial snapshot, then every subsequent change as it happens. It only wraps
+`AggregateOrderBook` and broadcasts to subscribers — feeding it real market
+data (`AggregatorService::apply_delta`/`apply_snapshot`/`invalidate_venue`)
+is up to the caller.
+
+```sh
+cmake --build build-vcpkg --target hermeneutic_aggregator_service
+```
+
+`hermeneutic_aggregator_service_test` exercises it over a real (in-process)
+gRPC connection; it only builds when both `HERMENEUTIC_BUILD_SERVICE` and
+`HERMENEUTIC_BUILD_TESTS` are `ON`:
+
+```sh
+cmake -B build-vcpkg-full -S . \
+  -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake \
+  -DHERMENEUTIC_BUILD_SERVICE=ON -DHERMENEUTIC_BUILD_TESTS=ON
+cmake --build build-vcpkg-full --target hermeneutic_aggregator_service_test
+./build-vcpkg-full/hermeneutic_aggregator_service_test
+```
