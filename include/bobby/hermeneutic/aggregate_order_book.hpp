@@ -1,10 +1,11 @@
 #pragma once
 
+#include <expected>
 #include <map>
-#include <stdexcept>
+#include <span>
 #include <string>
+#include <system_error>
 #include <utility>
-#include <vector>
 
 #include "bobby/hermeneutic/order_book.hpp"
 
@@ -21,15 +22,18 @@ enum class Side { Bid, Ask };
 class AggregateOrderBook {
   public:
     // A `size` of zero removes that venue's level (Binance L2 diff semantics).
-    // Throws std::invalid_argument if `size` is negative.
-    void apply_delta(const VenueId& venue, Side side, Price price, Size size) {
-        require_non_negative_size(size);
+    // Returns std::errc::invalid_argument if `size` is negative.
+    std::expected<void, std::errc> apply_delta(const VenueId& venue, Side side, Price price,
+                                                Size size) noexcept {
+        if (auto check = require_non_negative_size(size); !check) return check;
+
         auto& venue_book = venues_[venue];
         if (side == Side::Bid) {
             apply_side(venue_book.bids, aggregate_.bids, price, size);
         } else {
             apply_side(venue_book.asks, aggregate_.asks, price, size);
         }
+        return {};
     }
 
     // Removes every level `venue` contributed and drops its book entirely.
@@ -52,12 +56,12 @@ class AggregateOrderBook {
     // Replaces one side of `venue`'s book wholesale from a REST snapshot.
     // Any price the venue previously held that is absent from `levels` is
     // treated as removed. Use this to resynchronize after invalidate_venue().
-    // Throws std::invalid_argument, without modifying any state, if any
-    // level's size is negative.
-    void apply_snapshot(const VenueId& venue, Side side,
-                         const std::vector<std::pair<Price, Size>>& levels) {
+    // Returns std::errc::invalid_argument, without modifying any state, if
+    // any level's size is negative.
+    std::expected<void, std::errc> apply_snapshot(
+        const VenueId& venue, Side side, std::span<const std::pair<Price, Size>> levels) noexcept {
         for (const auto& level : levels) {
-            require_non_negative_size(level.second);
+            if (auto check = require_non_negative_size(level.second); !check) return check;
         }
 
         auto& venue_book = venues_[venue];
@@ -66,16 +70,18 @@ class AggregateOrderBook {
         } else {
             apply_snapshot_side(venue_book.asks, aggregate_.asks, levels);
         }
+        return {};
     }
 
     const L2OrderBook& aggregate() const noexcept { return aggregate_; }
     const std::map<VenueId, L2OrderBook>& venues() const noexcept { return venues_; }
 
   private:
-    static void require_non_negative_size(Size size) {
+    static std::expected<void, std::errc> require_non_negative_size(Size size) noexcept {
         if (size.raw() < 0) {
-            throw std::invalid_argument("AggregateOrderBook: size must not be negative");
+            return std::unexpected(std::errc::invalid_argument);
         }
+        return {};
     }
 
     // Sets `price` to `new_size` in `side` (erasing it when <= 0) and
@@ -121,7 +127,7 @@ class AggregateOrderBook {
 
     template <typename Map>
     static void apply_snapshot_side(Map& venue_side, Map& aggregate_side,
-                                     const std::vector<std::pair<Price, Size>>& levels) {
+                                     std::span<const std::pair<Price, Size>> levels) {
         std::map<Price, Size> new_levels(levels.begin(), levels.end());
 
         for (auto it = venue_side.begin(); it != venue_side.end();) {
