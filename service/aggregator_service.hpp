@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -32,34 +33,54 @@ static_assert(Size::decimals == 6);
 
 // One bounded mailbox per subscriber. Publishers (SymbolBook::apply_delta/
 // apply_snapshot/invalidate_venue/send_heartbeat, via broadcast_to_
-// subscribers()) only ever push; the Subscribe() handler thread that owns
-// this subscriber's ServerWriter is the only one that drains it and calls
-// Write(). Never shared across subscribers, so one slow drainer never
-// contends with another subscriber's push or drain.
+// subscribers()) only ever push; the SubscribeL2Diff()/SubscribeBbo()
+// handler thread that owns this subscriber's ServerWriter is the only one
+// that drains it and calls Write(). Never shared across subscribers, so one
+// slow drainer never contends with another subscriber's push or drain.
 //
-// A full queue closes rather than drops the oldest entry: an L2Diff stream
-// is not a series of independently useful events -- missing even one leaves
-// the subscriber's replica of the book genuinely wrong, not just stale, and
-// the only valid recovery is a fresh Subscribe() (a new full snapshot), not
-// resuming the same stream with a gap in it. So there is nothing worth
-// keeping once a subscriber has fallen behind past capacity; the queue is
-// cleared and closed instead.
+// What a full queue should do differs by stream, hence `OverflowPolicy`:
+//
+// - Close (used for L2Update/SubscribeL2Diff): an L2Diff stream is not a
+//   series of independently useful events -- missing even one leaves the
+//   subscriber's replica of the book genuinely wrong, not just stale, and
+//   the only valid recovery is a fresh SubscribeL2Diff() (a new full
+//   snapshot), not resuming the same stream with a gap in it. So there is
+//   nothing worth keeping once a subscriber has fallen behind past
+//   capacity; the queue is cleared and closed instead.
+// - DropOldest (used for BboUpdate/SubscribeBbo): a Bbo is the complete
+//   current top-of-book state, not a delta -- it never depends on a
+//   previously queued message for reconstruction. A slow BBO subscriber
+//   costs nothing by having a stale queued Bbo replaced by a newer one, so
+//   overflow drops the oldest entry and keeps accepting pushes instead of
+//   disconnecting the subscriber for a condition that doesn't actually
+//   corrupt anything it will eventually receive.
+//
+// Whichever policy is chosen, `closed_` (and DrainResult::Closed) is only
+// ever set by the Close policy's overflow path; a DropOldest queue is never
+// closed by this class, so its DrainResult is always TimedOut or Drained.
+enum class OverflowPolicy { Close, DropOldest };
+
+template <typename T>
 class SubscriberQueue {
   public:
     enum class DrainResult { TimedOut, Drained, Closed };
 
-    explicit SubscriberQueue(std::size_t capacity) : capacity_(capacity) {}
+    SubscriberQueue(std::size_t capacity, OverflowPolicy overflow_policy)
+        : capacity_(capacity), overflow_policy_(overflow_policy) {}
 
     // Non-blocking. False means this push found the queue already closed,
-    // or just closed it by overflowing `capacity_`.
-    bool push_or_close(L2Update update) {
+    // or (Close policy only) just closed it by overflowing `capacity_`.
+    bool push_or_close(T update) {
         std::lock_guard lock(mutex_);
         if (closed_) return false;
         if (queue_.size() >= capacity_) {
-            closed_ = true;
-            queue_.clear();
-            cv_.notify_one();
-            return false;
+            if (overflow_policy_ == OverflowPolicy::Close) {
+                closed_ = true;
+                queue_.clear();
+                cv_.notify_one();
+                return false;
+            }
+            queue_.pop_front();
         }
         queue_.push_back(std::move(update));
         cv_.notify_one();
@@ -70,7 +91,7 @@ class SubscriberQueue {
     // priority over whatever's queued, though push_or_close() never leaves
     // anything queued alongside a close. Returns Drained with `out`
     // populated, or TimedOut/Closed with `out` left untouched.
-    DrainResult wait_and_drain(std::chrono::milliseconds timeout, std::vector<L2Update>& out) {
+    DrainResult wait_and_drain(std::chrono::milliseconds timeout, std::vector<T>& out) {
         std::unique_lock lock(mutex_);
         cv_.wait_for(lock, timeout, [this] { return !queue_.empty() || closed_; });
         if (closed_) return DrainResult::Closed;
@@ -85,32 +106,45 @@ class SubscriberQueue {
   private:
     std::mutex mutex_;
     std::condition_variable cv_;
-    std::deque<L2Update> queue_;
+    std::deque<T> queue_;
     std::size_t capacity_;
+    OverflowPolicy overflow_policy_;
     bool closed_ = false;
 };
 
 // Per-symbol aggregated book plus its gRPC fan-out state. Not a gRPC type
 // itself: AggregatorService (the sole grpc::Service in this file) owns one
-// SymbolBook per symbol and routes every Subscribe() call, and every
-// ingestion call (apply_delta et al.), to the right one by symbol. This is
-// what keeps a multi-symbol deployment to one gRPC service on one port
-// instead of one process/port per symbol -- two grpc::Service instances of
-// the same generated type can't be registered on one grpc::Server (their
-// RPC method paths collide), but two SymbolBooks in one map have no such
-// restriction.
+// SymbolBook per symbol and routes every SubscribeL2Diff()/SubscribeBbo()
+// call, and every ingestion call (apply_delta et al.), to the right one by
+// symbol. This is what keeps a multi-symbol deployment to one gRPC service
+// on one port instead of one process/port per symbol -- two grpc::Service
+// instances of the same generated type can't be registered on one
+// grpc::Server (their RPC method paths collide), but two SymbolBooks in one
+// map have no such restriction.
 //
-// Concurrency model: `mutex_` guards only `book_`/`seq_` -- applying a delta
-// and computing the resulting diff, never any socket I/O. Each subscriber
-// gets its own SubscriberQueue; broadcasting is a non-blocking push into
-// every subscriber's queue (still done under `mutex_`, since it can no
-// longer block), and the actual Write() to gRPC happens later, off the
-// caller's thread, on that subscriber's own Subscribe() handler thread. A
-// stuck or slow subscriber can therefore only ever stall itself -- until it
+// Concurrency model: `mutex_` guards only `book_`/`seq_`/the cached last-
+// published BBO -- applying a delta and computing the resulting diff, never
+// any socket I/O. Each subscriber (L2 or BBO) gets its own SubscriberQueue;
+// broadcasting is a non-blocking push into every subscriber's queue (still
+// done under `mutex_`, since it can no longer block), and the actual
+// Write() to gRPC happens later, off the caller's thread, on that
+// subscriber's own SubscribeL2Diff()/SubscribeBbo() handler thread. A stuck
+// or slow L2 subscriber can therefore only ever stall itself -- until it
 // overflows its queue and SubscriberQueue closes it -- never ingestion or
-// any other subscriber. A separate SymbolBook (and separate `mutex_`) per
-// symbol means two symbols never contend with each other either, so
-// ingestion for one symbol can never be slowed by another's traffic.
+// any other subscriber; a stuck or slow BBO subscriber never gets closed at
+// all (see SubscriberQueue's OverflowPolicy::DropOldest). A separate
+// SymbolBook (and separate `mutex_`) per symbol means two symbols never
+// contend with each other either, so ingestion for one symbol can never be
+// slowed by another's traffic.
+//
+// `seq_` is a single counter shared by both the L2Diff stream and the Bbo
+// stream: it names the aggregate-book revision, not "how many messages this
+// stream has sent". A revision that doesn't move the top of book still
+// bumps `seq_` and produces an L2Diff, but produces no Bbo at all -- so
+// Bbo.book_seq is expected to skip values relative to L2Diff.book_seq. This
+// is also what lets a client correlate a Bbo against the L2Diff stream (or
+// a recording of it), which two independent per-stream counters could not
+// do.
 class SymbolBook {
   public:
     std::expected<void, std::errc> apply_delta(const VenueId& venue, Side side, Price price,
@@ -240,28 +274,35 @@ class SymbolBook {
         publish(changed);
     }
 
-    // Broadcasts a liveness signal to every subscriber of this symbol,
-    // independent of any book change - unlike publish(), this never touches
-    // seq_ (a heartbeat is not a book revision). Callers (e.g.
-    // AggregatorService::send_heartbeat(), driven by aggregator_main.cpp) are
-    // expected to invoke this on a fixed interval; this class has no
-    // internal timer of its own.
+    // Broadcasts a liveness signal to every subscriber of this symbol (both
+    // the L2Diff and the Bbo stream), independent of any book change -
+    // unlike publish(), this never touches seq_ (a heartbeat is not a book
+    // revision). Callers (e.g. AggregatorService::send_heartbeat(), driven
+    // by aggregator_main.cpp) are expected to invoke this on a fixed
+    // interval; this class has no internal timer of its own.
     void send_heartbeat() {
         std::lock_guard lock(mutex_);
-        L2Update update;
-        update.mutable_heartbeat()->set_ts_ns(now_ns());
-        broadcast_to_subscribers(update);
+        auto ts_ns = now_ns();
+
+        L2Update l2_update;
+        l2_update.mutable_heartbeat()->set_ts_ns(ts_ns);
+        broadcast_to_subscribers(l2_update);
+
+        BboUpdate bbo_update;
+        bbo_update.mutable_heartbeat()->set_ts_ns(ts_ns);
+        broadcast_to_bbo_subscribers(bbo_update);
     }
 
     // Writes the initial snapshot to `writer` and, if that succeeds,
     // registers it for subsequent updates and returns its queue. Returns
     // nullptr (without registering anything) if the initial Write() fails -
-    // the caller (AggregatorService::Subscribe()) should end the RPC without
-    // draining a queue that was never created.
-    std::shared_ptr<SubscriberQueue> subscribe(grpc::ServerWriter<L2Update>* writer) {
+    // the caller (AggregatorService::SubscribeL2Diff()) should end the RPC
+    // without draining a queue that was never created.
+    std::shared_ptr<SubscriberQueue<L2Update>> subscribe(grpc::ServerWriter<L2Update>* writer) {
         std::lock_guard lock(mutex_);
         if (!writer->Write(build_snapshot())) return nullptr;
-        auto queue = std::make_shared<SubscriberQueue>(kSubscriberQueueCapacity);
+        auto queue =
+            std::make_shared<SubscriberQueue<L2Update>>(kSubscriberQueueCapacity, OverflowPolicy::Close);
         subscribers_.emplace(writer, queue);
         return queue;
     }
@@ -269,6 +310,27 @@ class SymbolBook {
     void unsubscribe(grpc::ServerWriter<L2Update>* writer) {
         std::lock_guard lock(mutex_);
         subscribers_.erase(writer);
+    }
+
+    // Writes the current complete BBO state to `writer` and, if that
+    // succeeds, registers it for subsequent updates and returns its queue.
+    // Returns nullptr (without registering anything) if the initial Write()
+    // fails - mirrors subscribe() above. Uses OverflowPolicy::DropOldest,
+    // not Close: see SubscriberQueue's class comment for why a slow BBO
+    // subscriber should never be disconnected for falling behind.
+    std::shared_ptr<SubscriberQueue<BboUpdate>> subscribe_bbo(
+        grpc::ServerWriter<BboUpdate>* writer) {
+        std::lock_guard lock(mutex_);
+        if (!writer->Write(build_bbo())) return nullptr;
+        auto queue = std::make_shared<SubscriberQueue<BboUpdate>>(kSubscriberQueueCapacity,
+                                                                    OverflowPolicy::DropOldest);
+        bbo_subscribers_.emplace(writer, queue);
+        return queue;
+    }
+
+    void unsubscribe_bbo(grpc::ServerWriter<BboUpdate>* writer) {
+        std::lock_guard lock(mutex_);
+        bbo_subscribers_.erase(writer);
     }
 
   private:
@@ -341,7 +403,7 @@ class SymbolBook {
     L2Update build_snapshot() const {
         L2Update update;
         auto* snapshot = update.mutable_snapshot();
-        snapshot->set_seq(seq_);
+        snapshot->set_book_seq(seq_);
         snapshot->set_ts_ns(now_ns());
         for (const auto& kv : book_.aggregate().bids) {
             *snapshot->add_bids() = make_level(kv.first, kv.second);
@@ -352,14 +414,48 @@ class SymbolBook {
         return update;
     }
 
+    // Must be called with mutex_ held. The book's own comparators make
+    // begin() the best level on each side (descending for bids, ascending
+    // for asks), so no bids/asks ternary is needed here (contrast
+    // lookup_aggregate(), which does need the explicit branch because it
+    // looks up an arbitrary price, not just the best one).
+    std::optional<std::pair<Price, Size>> best_bid() const {
+        const auto& bids = book_.aggregate().bids;
+        if (bids.empty()) return std::nullopt;
+        return *bids.begin();
+    }
+    std::optional<std::pair<Price, Size>> best_ask() const {
+        const auto& asks = book_.aggregate().asks;
+        if (asks.empty()) return std::nullopt;
+        return *asks.begin();
+    }
+
+    // Must be called with mutex_ held. Builds the complete current BBO
+    // state - bid/ask are left unset (proto3 message-field presence) when
+    // that side of the book is currently empty, per Bbo's own comment.
+    BboUpdate build_bbo() const {
+        BboUpdate update;
+        auto* bbo = update.mutable_bbo();
+        bbo->set_book_seq(seq_);
+        bbo->set_ts_ns(now_ns());
+        if (auto bid = best_bid()) *bbo->mutable_bid() = make_level(bid->first, bid->second);
+        if (auto ask = best_ask()) *bbo->mutable_ask() = make_level(ask->first, ask->second);
+        return update;
+    }
+
     // Must be called with mutex_ held. No-op if `changed` is empty, so seq_
-    // only advances on an observable change.
+    // only advances on an observable change. Also emits a Bbo to
+    // bbo_subscribers_, sharing this same (already-bumped) seq_ value, but
+    // only when the best bid or best ask actually changed - a deep-book
+    // change that doesn't touch the top of book produces an L2Diff here but
+    // no Bbo at all, which is why Bbo.book_seq is allowed to skip values
+    // (see Bbo's proto comment).
     void publish(const std::vector<Change>& changed) {
         if (changed.empty()) return;
 
         L2Update update;
         auto* diff = update.mutable_diff();
-        diff->set_seq(++seq_);
+        diff->set_book_seq(++seq_);
         diff->set_ts_ns(now_ns());
         for (const auto& change : changed) {
             PriceLevel level = make_level(change.price, change.size);
@@ -371,24 +467,49 @@ class SymbolBook {
         }
 
         broadcast_to_subscribers(update);
+
+        auto bid = best_bid();
+        auto ask = best_ask();
+        if (bid != last_bbo_bid_ || ask != last_bbo_ask_) {
+            last_bbo_bid_ = bid;
+            last_bbo_ask_ = ask;
+            broadcast_to_bbo_subscribers(build_bbo());
+        }
     }
 
     // Must be called with mutex_ held. Non-blocking: pushes `update` into
     // every subscriber's own queue. The actual Write() happens later, off
-    // this thread, on that subscriber's own Subscribe() handler thread --
-    // see the class comment. A subscriber whose queue overflows closes
-    // itself; its Subscribe() handler notices on its own next drain and
-    // removes it from `subscribers_` then, not here.
+    // this thread, on that subscriber's own SubscribeL2Diff() handler
+    // thread -- see the class comment. A subscriber whose queue overflows
+    // closes itself; its SubscribeL2Diff() handler notices on its own next
+    // drain and removes it from `subscribers_` then, not here.
     void broadcast_to_subscribers(const L2Update& update) {
         for (auto& [writer, queue] : subscribers_) {
             queue->push_or_close(update);
         }
     }
 
+    // Must be called with mutex_ held. Same shape as broadcast_to_
+    // subscribers(), for the BBO stream's subscribers - see
+    // SubscriberQueue's OverflowPolicy::DropOldest for why a full queue
+    // here never closes the subscriber.
+    void broadcast_to_bbo_subscribers(const BboUpdate& update) {
+        for (auto& [writer, queue] : bbo_subscribers_) {
+            queue->push_or_close(update);
+        }
+    }
+
     std::mutex mutex_;
     AggregateOrderBook book_;
-    std::map<grpc::ServerWriter<L2Update>*, std::shared_ptr<SubscriberQueue>> subscribers_;
+    std::map<grpc::ServerWriter<L2Update>*, std::shared_ptr<SubscriberQueue<L2Update>>> subscribers_;
+    std::map<grpc::ServerWriter<BboUpdate>*, std::shared_ptr<SubscriberQueue<BboUpdate>>>
+        bbo_subscribers_;
     std::uint64_t seq_ = 0;
+    // Last best bid/ask actually broadcast to bbo_subscribers_, compared
+    // against on every publish() to decide whether this revision touched
+    // the top of book. nullopt means that side had no level.
+    std::optional<std::pair<Price, Size>> last_bbo_bid_;
+    std::optional<std::pair<Price, Size>> last_bbo_ask_;
 };
 
 // The sole gRPC service type in this file: one instance serves every symbol
@@ -411,8 +532,9 @@ class AggregatorService final : public Aggregator::Service {
     }
 
     // Returns nullptr if `symbol` isn't one this instance was constructed
-    // with. Used by Subscribe() below, and by an ingestion layer routing a
-    // parsed delta/snapshot/invalidation to the right book.
+    // with. Used by SubscribeL2Diff()/SubscribeBbo() below, and by an
+    // ingestion layer routing a parsed delta/snapshot/invalidation to the
+    // right book.
     SymbolBook* book(std::string_view symbol) {
         auto it = books_.find(symbol);
         return it != books_.end() ? &it->second : nullptr;
@@ -423,8 +545,8 @@ class AggregatorService final : public Aggregator::Service {
         for (auto& [symbol, symbol_book] : books_) symbol_book.send_heartbeat();
     }
 
-    grpc::Status Subscribe(grpc::ServerContext* context, const SubscribeRequest* request,
-                            grpc::ServerWriter<L2Update>* writer) override {
+    grpc::Status SubscribeL2Diff(grpc::ServerContext* context, const SubscribeL2DiffRequest* request,
+                                  grpc::ServerWriter<L2Update>* writer) override {
         SymbolBook* target = book(request->symbol());
         if (!target) {
             return grpc::Status(grpc::StatusCode::NOT_FOUND,
@@ -444,7 +566,7 @@ class AggregatorService final : public Aggregator::Service {
         while (true) {
             batch.clear();
             auto result = queue->wait_and_drain(std::chrono::milliseconds(50), batch);
-            if (result == SubscriberQueue::DrainResult::Closed) {
+            if (result == SubscriberQueue<L2Update>::DrainResult::Closed) {
                 target->unsubscribe(writer);
                 return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
                                      "subscriber fell too far behind; reconnect for a fresh "
@@ -458,6 +580,45 @@ class AggregatorService final : public Aggregator::Service {
             }
             if (context->IsCancelled()) {
                 target->unsubscribe(writer);
+                return grpc::Status::OK;
+            }
+        }
+    }
+
+    grpc::Status SubscribeBbo(grpc::ServerContext* context, const SubscribeBboRequest* request,
+                               grpc::ServerWriter<BboUpdate>* writer) override {
+        SymbolBook* target = book(request->symbol());
+        if (!target) {
+            return grpc::Status(grpc::StatusCode::NOT_FOUND,
+                                 "unknown symbol: " + request->symbol());
+        }
+
+        auto queue = target->subscribe_bbo(writer);
+        if (!queue) return grpc::Status::OK;
+
+        // Same single-owner-thread shape as SubscribeL2Diff() above. Unlike
+        // there, DrainResult::Closed is unreachable in practice - this
+        // queue uses OverflowPolicy::DropOldest, which never closes - but
+        // the branch is kept for switch-style exhaustiveness, and returns
+        // OK rather than RESOURCE_EXHAUSTED: a BBO subscriber has no
+        // resync obligation, so that status code would be the wrong signal
+        // even if this path were ever reached.
+        std::vector<BboUpdate> batch;
+        while (true) {
+            batch.clear();
+            auto result = queue->wait_and_drain(std::chrono::milliseconds(50), batch);
+            if (result == SubscriberQueue<BboUpdate>::DrainResult::Closed) {
+                target->unsubscribe_bbo(writer);
+                return grpc::Status::OK;
+            }
+            for (auto& update : batch) {
+                if (!writer->Write(update)) {
+                    target->unsubscribe_bbo(writer);
+                    return grpc::Status::OK;
+                }
+            }
+            if (context->IsCancelled()) {
+                target->unsubscribe_bbo(writer);
                 return grpc::Status::OK;
             }
         }

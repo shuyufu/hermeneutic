@@ -2,17 +2,33 @@ syntax = "proto3";
 
 package bobby.hermeneutic.aggregator;
 
-// Streams the current aggregated L2 order book (as an initial snapshot)
-// followed by every subsequent change, until the client cancels.
+// SubscribeL2Diff streams the current aggregated L2 order book (as an
+// initial snapshot) followed by every subsequent change, until the client
+// cancels.
+//
+// SubscribeBbo streams the current best bid/ask (as an initial value)
+// followed by a new value whenever the published best bid or best ask
+// changes. A client that only cares about the top of book can use this
+// instead of SubscribeL2Diff and never has to parse an L2Diff message.
+//
+// The two are independent gRPC streams (independent lifecycle, independent
+// backpressure) even though they observe the same underlying aggregate book
+// - see Bbo.book_seq for how they correlate.
 service Aggregator {
-  rpc Subscribe(SubscribeRequest) returns (stream L2Update);
+  rpc SubscribeL2Diff(SubscribeL2DiffRequest) returns (stream L2Update);
+  rpc SubscribeBbo(SubscribeBboRequest) returns (stream BboUpdate);
 }
 
-message SubscribeRequest {
+message SubscribeL2DiffRequest {
   // Must match one of the symbols this server instance was started with
   // (a fixed, immutable set - see AggregatorService's constructor). Unknown
   // symbol fails the RPC with NOT_FOUND rather than returning an empty
   // stream, so a typo'd symbol is loud, not silently useless.
+  string symbol = 1;
+}
+
+message SubscribeBboRequest {
+  // Same contract as SubscribeL2DiffRequest.symbol.
   string symbol = 1;
 }
 
@@ -27,20 +43,28 @@ message SubscribeRequest {
 // replaces the aggregate size at price_raw with size_raw (the resulting
 // absolute size, never something to add to a previous value); size_raw == 0
 // removes the level entirely.
+//
+// Bbo.bid/Bbo.ask carry the same encoding and are always the resulting
+// absolute size too (Bbo is never a delta - see Bbo's own comment).
 message PriceLevel {
   int64 price_raw = 1;
   int64 size_raw = 2;
 }
 
 message L2Snapshot {
-  // seq is a monotonically increasing book revision.
+  // book_seq is the monotonically increasing revision of the aggregate
+  // order book itself (not merely a stream-local sequence number).
   //
-  // A snapshot with seq=N represents the complete book state after revision N.
-  // The next observable update is expected to have seq=N+1.
+  // A snapshot with book_seq=N represents the complete book state after
+  // revision N. On this stream (SubscribeL2Diff), the next observable
+  // update is guaranteed to have book_seq=N+1: every aggregate-book
+  // revision produces exactly one L2Diff here, so book_seq is contiguous.
   //
-  // Clients that observe a sequence gap must discard their local book and
-  // resubscribe for a new snapshot.
-  uint64 seq = 1;
+  // Clients that observe a gap in book_seq on this stream must discard
+  // their local book and resubscribe for a new snapshot - a gap means a
+  // revision's diff was never received, so the locally reconstructed book
+  // is no longer valid.
+  uint64 book_seq = 1;
   // Unix epoch timestamp in nanoseconds, captured by the aggregator's own
   // wall clock when this update is published. It is not an exchange/source
   // timestamp, an upstream-receive timestamp, or a book-mutation timestamp -
@@ -48,7 +72,7 @@ message L2Snapshot {
   //
   // For observability (e.g. latency measurement) only - never for ordering.
   // Wall-clock time is not monotonic (NTP sync, manual clock changes can
-  // make it jump backward); seq is what establishes order and gaps.
+  // make it jump backward); book_seq is what establishes order and gaps.
   //
   // fixed64, not int64/uint64: a current epoch-nanos value is large enough
   // (~61 bits) that varint encoding needs 9 bytes, one more than fixed64's
@@ -61,8 +85,12 @@ message L2Snapshot {
 }
 
 message L2Diff {
-  // See L2Snapshot.seq for the sequence contract this participates in.
-  uint64 seq = 1;
+  // Same aggregate-book revision domain as L2Snapshot.book_seq. On this
+  // stream (SubscribeL2Diff), book_seq must be contiguous: a gap means a
+  // revision was missed and the locally reconstructed book is invalid -
+  // resubscribe for a fresh snapshot. (Contrast with Bbo.book_seq on the
+  // SubscribeBbo stream, where gaps are normal - see Bbo's comment.)
+  uint64 book_seq = 1;
   // See L2Snapshot.ts_ns: same semantics (aggregator publish time, not for
   // ordering) and same fixed64 rationale.
   fixed64 ts_ns = 2;
@@ -74,13 +102,49 @@ message L2Diff {
   repeated PriceLevel asks = 4;
 }
 
+// The complete current best bid/ask state - never a delta, and never
+// dependent on a previously received Bbo for reconstruction. Sent as the
+// first message on a SubscribeBbo stream, then again whenever the published
+// best bid or best ask changes.
+message Bbo {
+  // Same aggregate-book revision domain as L2Snapshot.book_seq/L2Diff.book_seq
+  // - this is the revision of the aggregate book that produced this BBO
+  // state, which is what lets a client correlate a Bbo message against the
+  // L2Diff stream (or a recording of it) even though SubscribeBbo and
+  // SubscribeL2Diff are independent gRPC streams with no guaranteed arrival
+  // order relative to each other.
+  //
+  // Unlike on the SubscribeL2Diff stream, book_seq here is monotonically
+  // increasing but NOT required to be contiguous: most aggregate-book
+  // revisions only touch levels away from the top of book and therefore
+  // never produce a Bbo message at all. A gap in book_seq on this stream is
+  // expected and does NOT imply a missed message - every Bbo actually
+  // delivered is, by construction, the complete and correct state as of the
+  // book_seq it carries.
+  uint64 book_seq = 1;
+  // See L2Snapshot.ts_ns: same semantics (aggregator publish time, not for
+  // ordering) and same fixed64 rationale.
+  fixed64 ts_ns = 2;
+  // Absent (has_bid() == false) if the aggregate book currently has no bid.
+  // Never represented with a sentinel price or a zero size.
+  PriceLevel bid = 3;
+  // Absent (has_ask() == false) if the aggregate book currently has no ask.
+  PriceLevel ask = 4;
+}
+
 // Liveness signal, sent on a fixed interval independent of any book change -
 // so a client that has seen nothing for a while can tell "book genuinely
 // unchanged" apart from "aggregator/feed stalled" (a client would otherwise
-// have no way to distinguish those from a quiet stream alone). No seq: a
-// heartbeat is not a book revision and must never advance the seq sequence
-// L2Snapshot/L2Diff participate in. ts_ns has the same semantics as
-// L2Snapshot.ts_ns (aggregator wall-clock publish time, observability only).
+// have no way to distinguish those from a quiet stream alone). No book_seq:
+// a heartbeat is not a book revision and must never advance the book_seq
+// sequence L2Snapshot/L2Diff/Bbo participate in. ts_ns has the same
+// semantics as L2Snapshot.ts_ns (aggregator wall-clock publish time,
+// observability only).
+//
+// The same Heartbeat message is reused on both L2Update and BboUpdate;
+// heartbeats are still logically per-stream (a SubscribeL2Diff heartbeat
+// says nothing about SubscribeBbo's liveness or vice versa) since each is
+// carried on its own independent gRPC/HTTP2 stream.
 message Heartbeat {
   fixed64 ts_ns = 1;
 }
@@ -90,5 +154,12 @@ message L2Update {
     L2Snapshot snapshot = 1;
     L2Diff diff = 2;
     Heartbeat heartbeat = 3;
+  }
+}
+
+message BboUpdate {
+  oneof update {
+    Bbo bbo = 1;
+    Heartbeat heartbeat = 2;
   }
 }

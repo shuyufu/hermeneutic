@@ -198,9 +198,9 @@ TEST(VenueSessionTest, SnapshotFetchOverlapsReadingSoBufferedLiveEventBridgesIt)
                                         grpc::InsecureChannelCredentials());
     auto stub = bobby::hermeneutic::aggregator::Aggregator::NewStub(channel);
     grpc::ClientContext context;
-    bobby::hermeneutic::aggregator::SubscribeRequest request;
+    bobby::hermeneutic::aggregator::SubscribeL2DiffRequest request;
     request.set_symbol("BTCUSDT");
-    auto reader = stub->Subscribe(&context, request);
+    auto reader = stub->SubscribeL2Diff(&context, request);
 
     std::mutex mutex;
     std::condition_variable cv;

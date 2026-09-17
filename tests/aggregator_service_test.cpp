@@ -18,8 +18,14 @@
 namespace bobby::hermeneutic::aggregator {
 namespace {
 
-SubscribeRequest subscribe_request(std::string_view symbol) {
-    SubscribeRequest request;
+SubscribeL2DiffRequest subscribe_l2_diff_request(std::string_view symbol) {
+    SubscribeL2DiffRequest request;
+    request.set_symbol(std::string(symbol));
+    return request;
+}
+
+SubscribeBboRequest subscribe_bbo_request(std::string_view symbol) {
+    SubscribeBboRequest request;
     request.set_symbol(std::string(symbol));
     return request;
 }
@@ -27,9 +33,10 @@ SubscribeRequest subscribe_request(std::string_view symbol) {
 // Thread-safe queue the client-reader thread pushes into and the test
 // thread polls, so assertions can wait for a specific message to arrive
 // without racing the streaming thread.
+template <typename T>
 class UpdateQueue {
   public:
-    void push(L2Update update) {
+    void push(T update) {
         std::lock_guard lock(mutex_);
         queue_.push_back(std::move(update));
         cv_.notify_all();
@@ -37,7 +44,7 @@ class UpdateQueue {
 
     // Blocks until at least `index + 1` updates have arrived (or times out),
     // then returns the update at `index`.
-    L2Update wait_for(std::size_t index) {
+    T wait_for(std::size_t index) {
         std::unique_lock lock(mutex_);
         bool ok = cv_.wait_for(lock, std::chrono::seconds(5),
                                 [&] { return queue_.size() > index; });
@@ -51,15 +58,42 @@ class UpdateQueue {
   private:
     std::mutex mutex_;
     std::condition_variable cv_;
-    std::deque<L2Update> queue_;
+    std::deque<T> queue_;
 };
 
+// A BBO client reading in the background, mirroring the inline pattern used
+// for extra L2 readers elsewhere in this file (e.g. SnapshotOrdering
+// MatchesBookConvention's second_reader) but factored out since several BBO
+// tests each need one of these. Heap-allocated (returned via unique_ptr) so
+// `context`'s address stays stable for the reader thread's lambda.
+struct BboSubscription {
+    grpc::ClientContext context;
+    std::unique_ptr<grpc::ClientReaderInterface<BboUpdate>> reader;
+    UpdateQueue<BboUpdate> updates;
+    std::thread thread;
+
+    ~BboSubscription() {
+        context.TryCancel();
+        if (thread.joinable()) thread.join();
+    }
+};
+
+std::unique_ptr<BboSubscription> subscribe_bbo(Aggregator::Stub& stub, std::string_view symbol) {
+    auto sub = std::make_unique<BboSubscription>();
+    sub->reader = stub.SubscribeBbo(&sub->context, subscribe_bbo_request(symbol));
+    sub->thread = std::thread([raw = sub.get()] {
+        BboUpdate update;
+        while (raw->reader->Read(&update)) raw->updates.push(update);
+    });
+    return sub;
+}
+
 TEST(SubscriberQueueTest, DrainsInFifoOrderAndReportsResultKind) {
-    SubscriberQueue queue(4);
+    SubscriberQueue<L2Update> queue(4, OverflowPolicy::Close);
 
     std::vector<L2Update> out;
     EXPECT_EQ(queue.wait_and_drain(std::chrono::milliseconds(10), out),
-              SubscriberQueue::DrainResult::TimedOut);
+              SubscriberQueue<L2Update>::DrainResult::TimedOut);
     EXPECT_TRUE(out.empty());
 
     L2Update first, second;
@@ -69,14 +103,14 @@ TEST(SubscriberQueueTest, DrainsInFifoOrderAndReportsResultKind) {
     EXPECT_TRUE(queue.push_or_close(second));
 
     EXPECT_EQ(queue.wait_and_drain(std::chrono::milliseconds(10), out),
-              SubscriberQueue::DrainResult::Drained);
+              SubscriberQueue<L2Update>::DrainResult::Drained);
     ASSERT_EQ(out.size(), 2u);
     EXPECT_EQ(out[0].heartbeat().ts_ns(), 1u);
     EXPECT_EQ(out[1].heartbeat().ts_ns(), 2u);
 }
 
-TEST(SubscriberQueueTest, OverflowClosesAndDiscardsEverythingQueued) {
-    SubscriberQueue queue(2);
+TEST(SubscriberQueueTest, CloseOverflowClosesAndDiscardsEverythingQueued) {
+    SubscriberQueue<L2Update> queue(2, OverflowPolicy::Close);
 
     L2Update update;
     ASSERT_TRUE(queue.push_or_close(update));
@@ -91,8 +125,31 @@ TEST(SubscriberQueueTest, OverflowClosesAndDiscardsEverythingQueued) {
 
     std::vector<L2Update> out;
     EXPECT_EQ(queue.wait_and_drain(std::chrono::milliseconds(10), out),
-              SubscriberQueue::DrainResult::Closed);
+              SubscriberQueue<L2Update>::DrainResult::Closed);
     EXPECT_TRUE(out.empty());  // the two successfully queued updates were discarded, not delivered
+}
+
+TEST(SubscriberQueueTest, DropOldestOverflowKeepsNewestWithoutClosing) {
+    SubscriberQueue<BboUpdate> queue(2, OverflowPolicy::DropOldest);
+
+    BboUpdate first, second, third;
+    first.mutable_bbo()->set_book_seq(1);
+    second.mutable_bbo()->set_book_seq(2);
+    third.mutable_bbo()->set_book_seq(3);
+
+    ASSERT_TRUE(queue.push_or_close(first));
+    ASSERT_TRUE(queue.push_or_close(second));
+    // Third push overflows capacity 2: drops the oldest (seq 1) instead of
+    // closing, since a stale Bbo costs nothing to skip - each one is a
+    // complete, self-contained state, not a delta.
+    EXPECT_TRUE(queue.push_or_close(third));
+
+    std::vector<BboUpdate> out;
+    EXPECT_EQ(queue.wait_and_drain(std::chrono::milliseconds(10), out),
+              SubscriberQueue<BboUpdate>::DrainResult::Drained);
+    ASSERT_EQ(out.size(), 2u);
+    EXPECT_EQ(out[0].bbo().book_seq(), 2u);
+    EXPECT_EQ(out[1].bbo().book_seq(), 3u);
 }
 
 class AggregatorServiceTest : public ::testing::Test {
@@ -116,7 +173,7 @@ class AggregatorServiceTest : public ::testing::Test {
                                             grpc::InsecureChannelCredentials());
         stub_ = Aggregator::NewStub(channel);
 
-        reader_ = stub_->Subscribe(&context_, subscribe_request(kSymbol));
+        reader_ = stub_->SubscribeL2Diff(&context_, subscribe_l2_diff_request(kSymbol));
         reader_thread_ = std::thread([this] {
             L2Update update;
             while (reader_->Read(&update)) {
@@ -138,19 +195,21 @@ class AggregatorServiceTest : public ::testing::Test {
     // when it wrapped exactly one symbol.
     SymbolBook& book() { return *service_.book(kSymbol); }
 
+    std::unique_ptr<BboSubscription> subscribe_bbo() { return ::bobby::hermeneutic::aggregator::subscribe_bbo(*stub_, kSymbol); }
+
     AggregatorService service_;
     std::unique_ptr<grpc::Server> server_;
     std::unique_ptr<Aggregator::Stub> stub_;
     grpc::ClientContext context_;
     std::unique_ptr<grpc::ClientReaderInterface<L2Update>> reader_;
     std::thread reader_thread_;
-    UpdateQueue updates_;
+    UpdateQueue<L2Update> updates_;
 };
 
 TEST_F(AggregatorServiceTest, SubscribingToEmptyBookYieldsEmptySnapshot) {
     L2Update first = updates_.wait_for(0);
     ASSERT_TRUE(first.has_snapshot());
-    EXPECT_EQ(first.snapshot().seq(), 0u);
+    EXPECT_EQ(first.snapshot().book_seq(), 0u);
     EXPECT_EQ(first.snapshot().bids_size(), 0);
     EXPECT_EQ(first.snapshot().asks_size(), 0);
 }
@@ -163,7 +222,7 @@ TEST_F(AggregatorServiceTest, ApplyDeltaAfterSubscribeProducesDiff) {
 
     L2Update msg = updates_.wait_for(1);
     ASSERT_TRUE(msg.has_diff());
-    EXPECT_EQ(msg.diff().seq(), 1u);
+    EXPECT_EQ(msg.diff().book_seq(), 1u);
     ASSERT_EQ(msg.diff().bids_size(), 1);
     EXPECT_EQ(msg.diff().bids(0).price_raw(), Price(100.0).raw());
     EXPECT_EQ(msg.diff().bids(0).size_raw(), Size(1.0).raw());
@@ -200,7 +259,7 @@ TEST_F(AggregatorServiceTest, InvalidateVenueRemovesOnlyItsExclusiveLevels) {
     book().invalidate_venue("binance");
     L2Update msg = updates_.wait_for(4);
     ASSERT_TRUE(msg.has_diff());
-    EXPECT_EQ(msg.diff().seq(), 4u);
+    EXPECT_EQ(msg.diff().book_seq(), 4u);
 
     // Bid @100 still has okx's 2.0 left (not removed); ask @101 was
     // exclusively binance's and must be reported as removed (size_raw 0).
@@ -232,7 +291,7 @@ TEST_F(AggregatorServiceTest, ApplySnapshotDiffsAgainstAggregateNotJustThatVenue
 
     L2Update msg = updates_.wait_for(4);
     ASSERT_TRUE(msg.has_diff());
-    EXPECT_EQ(msg.diff().seq(), 4u);
+    EXPECT_EQ(msg.diff().book_seq(), 4u);
     ASSERT_EQ(msg.diff().bids_size(), 3);
     // L2Diff.bids is guaranteed to come out in the same order as
     // L2Snapshot.bids (descending by price, matching the aggregate book's
@@ -295,7 +354,7 @@ TEST_F(AggregatorServiceTest, SnapshotOrderingMatchesBookConvention) {
     // ordering directly in its initial snapshot: bids descending, asks
     // ascending.
     grpc::ClientContext second_context;
-    auto second_reader = stub_->Subscribe(&second_context, subscribe_request(kSymbol));
+    auto second_reader = stub_->SubscribeL2Diff(&second_context, subscribe_l2_diff_request(kSymbol));
     L2Update snapshot_msg;
     ASSERT_TRUE(second_reader->Read(&snapshot_msg));
     second_context.TryCancel();
@@ -326,7 +385,7 @@ TEST_F(AggregatorServiceTest, FailedApplyDoesNotBroadcast) {
     // third message overall instead of seq 1 / the second.
     L2Update msg = updates_.wait_for(1);
     ASSERT_TRUE(msg.has_diff());
-    EXPECT_EQ(msg.diff().seq(), 1u);
+    EXPECT_EQ(msg.diff().book_seq(), 1u);
     ASSERT_EQ(msg.diff().bids_size(), 1);
     EXPECT_EQ(msg.diff().bids(0).size_raw(), Size(1.0).raw());
 }
@@ -346,7 +405,7 @@ TEST_F(AggregatorServiceTest, NoOpApplyDeltaDoesNotBroadcast) {
     // third message overall instead of seq 2 / the second.
     L2Update msg = updates_.wait_for(2);
     ASSERT_TRUE(msg.has_diff());
-    EXPECT_EQ(msg.diff().seq(), 2u);
+    EXPECT_EQ(msg.diff().book_seq(), 2u);
     ASSERT_EQ(msg.diff().bids_size(), 1);
     EXPECT_EQ(msg.diff().bids(0).size_raw(), Size(2.0).raw());
 }
@@ -364,7 +423,7 @@ TEST_F(AggregatorServiceTest, HeartbeatIsDeliveredAndDoesNotAdvanceSeq) {
     ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
     L2Update diff_msg = updates_.wait_for(2);
     ASSERT_TRUE(diff_msg.has_diff());
-    EXPECT_EQ(diff_msg.diff().seq(), 1u);
+    EXPECT_EQ(diff_msg.diff().book_seq(), 1u);
 }
 
 TEST_F(AggregatorServiceTest, ApplyBatchProducesOneSeqBumpForMultipleLevels) {
@@ -383,7 +442,7 @@ TEST_F(AggregatorServiceTest, ApplyBatchProducesOneSeqBumpForMultipleLevels) {
     // apply_delta() calls for the same levels would have produced.
     L2Update msg = updates_.wait_for(1);
     ASSERT_TRUE(msg.has_diff());
-    EXPECT_EQ(msg.diff().seq(), 1u);
+    EXPECT_EQ(msg.diff().book_seq(), 1u);
 
     // Bids descending, asks ascending - same ordering guarantee as
     // apply_snapshot's diffs, not raw input order (bids were given
@@ -438,7 +497,7 @@ TEST_F(AggregatorServiceTest, ApplyBatchRejectsNegativeSizeWithoutMutatingOrBroa
     ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
     L2Update msg = updates_.wait_for(1);
     ASSERT_TRUE(msg.has_diff());
-    EXPECT_EQ(msg.diff().seq(), 1u);
+    EXPECT_EQ(msg.diff().book_seq(), 1u);
     ASSERT_EQ(msg.diff().bids_size(), 1);
     EXPECT_EQ(msg.diff().bids(0).price_raw(), Price(100.0).raw());
 }
@@ -454,7 +513,7 @@ TEST_F(AggregatorServiceTest, StuckSubscriberDoesNotBlockIngestionOrOtherSubscri
     // queue has overflowed yet, which depends on OS-level socket buffering
     // this test doesn't control and so doesn't assert on.
     grpc::ClientContext stuck_context;
-    auto stuck_reader = stub_->Subscribe(&stuck_context, subscribe_request(kSymbol));
+    auto stuck_reader = stub_->SubscribeL2Diff(&stuck_context, subscribe_l2_diff_request(kSymbol));
 
     // Stays comfortably under kSubscriberQueueCapacity (256): this test is
     // about a non-draining subscriber not blocking anyone else, not about
@@ -474,6 +533,165 @@ TEST_F(AggregatorServiceTest, StuckSubscriberDoesNotBlockIngestionOrOtherSubscri
 
     // The fast subscriber must still have received every diff.
     updates_.wait_for(kUpdates);
+
+    stuck_context.TryCancel();
+}
+
+TEST_F(AggregatorServiceTest, SubscribeBboOnEmptyBookHasNeitherSide) {
+    auto bbo_sub = subscribe_bbo();
+    BboUpdate first = bbo_sub->updates.wait_for(0);
+    ASSERT_TRUE(first.has_bbo());
+    EXPECT_EQ(first.bbo().book_seq(), 0u);
+    EXPECT_FALSE(first.bbo().has_bid());
+    EXPECT_FALSE(first.bbo().has_ask());
+}
+
+TEST_F(AggregatorServiceTest, SubscribeBboYieldsCurrentCompleteState) {
+    updates_.wait_for(0);  // initial L2 snapshot
+
+    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
+    updates_.wait_for(1);
+    ASSERT_TRUE(book().apply_delta("binance", Side::Ask, Price(101.0), Size(2.0)).has_value());
+    updates_.wait_for(2);
+
+    // A fresh BBO subscription's first message is the complete current top
+    // of book, not built up from deltas - same book_seq domain as
+    // L2Diff.book_seq (see Bbo's proto comment).
+    auto bbo_sub = subscribe_bbo();
+    BboUpdate first = bbo_sub->updates.wait_for(0);
+    ASSERT_TRUE(first.has_bbo());
+    EXPECT_EQ(first.bbo().book_seq(), 2u);
+    ASSERT_TRUE(first.bbo().has_bid());
+    EXPECT_EQ(first.bbo().bid().price_raw(), Price(100.0).raw());
+    EXPECT_EQ(first.bbo().bid().size_raw(), Size(1.0).raw());
+    ASSERT_TRUE(first.bbo().has_ask());
+    EXPECT_EQ(first.bbo().ask().price_raw(), Price(101.0).raw());
+    EXPECT_EQ(first.bbo().ask().size_raw(), Size(2.0).raw());
+}
+
+TEST_F(AggregatorServiceTest, DeepBookChangeDoesNotEmitBbo) {
+    updates_.wait_for(0);  // initial L2 snapshot
+
+    auto bbo_sub = subscribe_bbo();
+    bbo_sub->updates.wait_for(0);  // initial (empty) Bbo
+
+    // Establishes a best bid at 100 - this DOES move the top of book.
+    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
+    updates_.wait_for(1);  // corresponding L2Diff, book_seq=1
+    BboUpdate first_bbo = bbo_sub->updates.wait_for(1);
+    ASSERT_TRUE(first_bbo.has_bbo());
+    EXPECT_EQ(first_bbo.bbo().book_seq(), 1u);
+    EXPECT_EQ(first_bbo.bbo().bid().price_raw(), Price(100.0).raw());
+
+    // A worse (deeper) bid level doesn't change the best bid, so this
+    // revision (book_seq=2) must produce an L2Diff but no new Bbo at all -
+    // Bbo.book_seq is allowed to skip book_seq=2 entirely.
+    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(99.0), Size(5.0)).has_value());
+    updates_.wait_for(2);  // corresponding L2Diff did arrive on the L2 stream
+
+    // A heartbeat proves the absence of a second Bbo message isn't just
+    // "hasn't arrived yet" - it's genuinely the next thing delivered on
+    // this stream.
+    book().send_heartbeat();
+    BboUpdate next = bbo_sub->updates.wait_for(2);
+    EXPECT_TRUE(next.has_heartbeat());
+}
+
+TEST_F(AggregatorServiceTest, BestPriceSizeChangeEmitsNewBbo) {
+    updates_.wait_for(0);  // initial snapshot
+
+    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
+    updates_.wait_for(1);
+
+    auto bbo_sub = subscribe_bbo();
+    BboUpdate first = bbo_sub->updates.wait_for(0);
+    EXPECT_EQ(first.bbo().bid().size_raw(), Size(1.0).raw());
+
+    // Same best price, different size (a second venue joins at the same
+    // level) - still a top-of-book change, not just a deep-book one.
+    ASSERT_TRUE(book().apply_delta("okx", Side::Bid, Price(100.0), Size(2.0)).has_value());
+    updates_.wait_for(2);
+    BboUpdate second = bbo_sub->updates.wait_for(1);
+    ASSERT_TRUE(second.has_bbo());
+    EXPECT_EQ(second.bbo().bid().size_raw(), Size(3.0).raw());
+}
+
+TEST_F(AggregatorServiceTest, BestSideDisappearingIsReportedAsAbsent) {
+    updates_.wait_for(0);  // initial snapshot
+
+    ASSERT_TRUE(book().apply_delta("binance", Side::Ask, Price(101.0), Size(1.0)).has_value());
+    updates_.wait_for(1);
+
+    auto bbo_sub = subscribe_bbo();
+    BboUpdate first = bbo_sub->updates.wait_for(0);
+    ASSERT_TRUE(first.bbo().has_ask());
+
+    // Zeroing out the only ask level removes it entirely - the resulting
+    // Bbo must represent "no ask" via message-field absence, not a sentinel
+    // price or a zero size.
+    ASSERT_TRUE(book().apply_delta("binance", Side::Ask, Price(101.0), Size(0.0)).has_value());
+    updates_.wait_for(2);
+    BboUpdate second = bbo_sub->updates.wait_for(1);
+    ASSERT_TRUE(second.has_bbo());
+    EXPECT_FALSE(second.bbo().has_ask());
+}
+
+TEST_F(AggregatorServiceTest, BboBookSeqCorrelatesWithL2DiffBookSeqAndSkipsNonTopRevisions) {
+    updates_.wait_for(0);  // initial L2 snapshot
+
+    auto bbo_sub = subscribe_bbo();
+    bbo_sub->updates.wait_for(0);  // initial (empty) Bbo
+
+    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
+    updates_.wait_for(1);  // book_seq=1, top-of-book change
+    bbo_sub->updates.wait_for(1);
+
+    // book_seq=2: a deeper bid, doesn't touch the top on either side.
+    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(90.0), Size(1.0)).has_value());
+    L2Update deep_diff = updates_.wait_for(2);
+    EXPECT_EQ(deep_diff.diff().book_seq(), 2u);
+
+    // book_seq=3: a new best bid.
+    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(101.0), Size(1.0)).has_value());
+    L2Update top_diff = updates_.wait_for(3);
+    EXPECT_EQ(top_diff.diff().book_seq(), 3u);
+
+    // The BBO stream must skip straight from book_seq=1 to book_seq=3 -
+    // book_seq=2 (the deep change) never produced a Bbo message at all,
+    // which is expected, not a loss (see Bbo's proto comment).
+    BboUpdate bbo_after = bbo_sub->updates.wait_for(2);
+    ASSERT_TRUE(bbo_after.has_bbo());
+    EXPECT_EQ(bbo_after.bbo().book_seq(), 3u);
+    EXPECT_EQ(bbo_after.bbo().bid().price_raw(), Price(101.0).raw());
+}
+
+TEST_F(AggregatorServiceTest, StuckBboSubscriberDoesNotBlockIngestionOrOtherSubscribers) {
+    updates_.wait_for(0);
+
+    // A BBO subscriber that never reads from its stream, simulating one
+    // that's stopped draining - mirrors StuckSubscriberDoesNotBlock
+    // IngestionOrOtherSubscribers above, but for the BBO stream/queue.
+    grpc::ClientContext stuck_context;
+    auto stuck_reader = stub_->SubscribeBbo(&stuck_context, subscribe_bbo_request(kSymbol));
+
+    auto bbo_sub = subscribe_bbo();
+    bbo_sub->updates.wait_for(0);  // initial (empty) Bbo for the fast BBO subscriber
+
+    // Each iteration moves the best bid to a strictly higher price, so
+    // every one of these produces a Bbo broadcast, not just an L2Diff.
+    constexpr int kUpdates = 100;
+    auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < kUpdates; ++i) {
+        ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(1.0 + i * 0.01), Size(1.0))
+                        .has_value());
+    }
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_LT(elapsed, std::chrono::seconds(2))
+        << "ingestion stalled - likely blocked on the non-draining BBO subscriber";
+
+    // The fast BBO subscriber must still have received every Bbo change -
+    // the stuck one never gets to block or close it either way.
+    bbo_sub->updates.wait_for(kUpdates);
 
     stuck_context.TryCancel();
 }
@@ -507,16 +725,16 @@ class MultiSymbolAggregatorServiceTest : public ::testing::Test {
 
 TEST_F(MultiSymbolAggregatorServiceTest, SymbolsAreFullyIsolated) {
     grpc::ClientContext btc_context;
-    auto btc_reader = stub_->Subscribe(&btc_context, subscribe_request("BTCUSDT"));
-    UpdateQueue btc_updates;
+    auto btc_reader = stub_->SubscribeL2Diff(&btc_context, subscribe_l2_diff_request("BTCUSDT"));
+    UpdateQueue<L2Update> btc_updates;
     std::thread btc_thread([&] {
         L2Update update;
         while (btc_reader->Read(&update)) btc_updates.push(update);
     });
 
     grpc::ClientContext eth_context;
-    auto eth_reader = stub_->Subscribe(&eth_context, subscribe_request("ETHUSDT"));
-    UpdateQueue eth_updates;
+    auto eth_reader = stub_->SubscribeL2Diff(&eth_context, subscribe_l2_diff_request("ETHUSDT"));
+    UpdateQueue<L2Update> eth_updates;
     std::thread eth_thread([&] {
         L2Update update;
         while (eth_reader->Read(&update)) eth_updates.push(update);
@@ -533,7 +751,7 @@ TEST_F(MultiSymbolAggregatorServiceTest, SymbolsAreFullyIsolated) {
                     .has_value());
     L2Update btc_diff = btc_updates.wait_for(1);
     ASSERT_TRUE(btc_diff.has_diff());
-    EXPECT_EQ(btc_diff.diff().seq(), 1u);
+    EXPECT_EQ(btc_diff.diff().book_seq(), 1u);
 
     ASSERT_TRUE(service_->book("ETHUSDT")
                     ->apply_delta("binance", Side::Ask, Price(2000.0), Size(3.0))
@@ -544,7 +762,7 @@ TEST_F(MultiSymbolAggregatorServiceTest, SymbolsAreFullyIsolated) {
     // symbols don't share a seq counter (or anything else): BTCUSDT's
     // update above must never have reached ETHUSDT's subscriber, and
     // vice versa below.
-    EXPECT_EQ(eth_diff.diff().seq(), 1u);
+    EXPECT_EQ(eth_diff.diff().book_seq(), 1u);
     ASSERT_EQ(eth_diff.diff().asks_size(), 1);
     EXPECT_EQ(eth_diff.diff().asks(0).price_raw(), Price(2000.0).raw());
     EXPECT_EQ(eth_diff.diff().bids_size(), 0);
@@ -557,7 +775,7 @@ TEST_F(MultiSymbolAggregatorServiceTest, SymbolsAreFullyIsolated) {
 
 TEST_F(MultiSymbolAggregatorServiceTest, UnknownSymbolFailsWithNotFound) {
     grpc::ClientContext context;
-    auto reader = stub_->Subscribe(&context, subscribe_request("DOGEUSDT"));
+    auto reader = stub_->SubscribeL2Diff(&context, subscribe_l2_diff_request("DOGEUSDT"));
 
     L2Update update;
     EXPECT_FALSE(reader->Read(&update));  // no snapshot ever sent - the RPC fails immediately
