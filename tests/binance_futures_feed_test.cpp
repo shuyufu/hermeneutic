@@ -109,7 +109,15 @@ TEST(BinanceFuturesFeedTest, SnapshotRequestBuildsDocumentedRestEndpoint) {
     BinanceFuturesFeed feed;
     HttpRequestSpec spec = feed.snapshot_request("BTCUSDT");
     EXPECT_EQ(spec.host, "fapi.binance.com");
+    EXPECT_EQ(spec.port, "443");
     EXPECT_EQ(spec.target, "/fapi/v1/depth?symbol=BTCUSDT&limit=1000");
+}
+
+TEST(BinanceFuturesFeedTest, WebSocketEndpointMatchesDocumentedCombinedStream) {
+    BinanceFuturesFeed feed;
+    EXPECT_EQ(feed.ws_host(), "fstream.binance.com");
+    EXPECT_EQ(feed.ws_port(), "443");
+    EXPECT_EQ(feed.ws_target(), "/ws");
 }
 
 }  // namespace

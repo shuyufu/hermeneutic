@@ -21,9 +21,12 @@
 namespace bobby::hermeneutic::ingestion {
 
 // A REST request this feed wants made, pure data -- no I/O happens here.
-// The driver (VenueSession, not yet built) is what actually performs it.
+// The driver (VenueSession) is what actually performs it.
 struct HttpRequestSpec {
     std::string host;    // e.g. "fapi.binance.com"
+    std::string port;    // e.g. "443" -- kept separate from "is this TLS"
+                          // so a test double can point at a local plain
+                          // HTTP server on an arbitrary port.
     std::string target;  // path + query, e.g. "/fapi/v1/depth?symbol=BTCUSDT&limit=1000"
 };
 
@@ -74,6 +77,13 @@ class BinanceFuturesFeed {
     // other venues (see docs/ingestion_design.md's TrustConnectionOrderPolicy
     // note).
     static constexpr bool kSnapshotViaRest = true;
+
+    // Combined-stream endpoint used with the SUBSCRIBE message below -
+    // depth events arrive unwrapped (no {"stream":...,"data":...} envelope),
+    // matching what parse_message() expects.
+    std::string_view ws_host() const { return "fstream.binance.com"; }
+    std::string_view ws_port() const { return "443"; }
+    std::string_view ws_target() const { return "/ws"; }
 
     // Pure function: the JSON to send right after connecting, to subscribe
     // every symbol's depth diff stream. Stream name pattern is
@@ -134,7 +144,7 @@ class BinanceFuturesFeed {
     // GET /fapi/v1/depth?symbol=<symbol>&limit=1000 -- see
     // developers.binance.com's Order Book REST endpoint doc.
     HttpRequestSpec snapshot_request(const SymbolId& symbol) const {
-        return HttpRequestSpec{"fapi.binance.com", "/fapi/v1/depth?symbol=" + symbol + "&limit=1000"};
+        return HttpRequestSpec{"fapi.binance.com", "443", "/fapi/v1/depth?symbol=" + symbol + "&limit=1000"};
     }
 
     // `symbol` is supplied by the caller (the request it made), not read

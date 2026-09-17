@@ -217,7 +217,7 @@ class BinanceFuturesFeed {
   - **template 化在 `NextLayer` 上**，不是寫死 SSL：`PlainWebSocketConnection`（`beast::tcp_stream`）給測試用（本地 server，不用處理測試憑證），`TlsWebSocketConnection`（`net::ssl::stream<beast::tcp_stream>`）給正式環境接 `wss://` 用。兩者共用同一份 connect/send/read/close 邏輯，只有 `connect()` 內用 `if constexpr` 判斷 `NextLayer` 是不是 SSL stream 來決定要不要多做 SNI 設定 + TLS handshake。測試涵蓋 connect/send/read/close 的機制本身（用本地 plain TCP echo server），不涵蓋 TLS handshake 這條分支本身（那段是 Asio/OpenSSL 自己的、有廣泛測試覆蓋的邏輯，不是本專案自己的程式碼）。
   - `asio::strand` 的部分尚未加——目前 `WebSocketConnection` 本身不管理 strand，這是 `VenueSession` 建構它的時候要決定的事（見下）。
 - **HTTP snapshot（已實作：`service/http_client.hpp` / `tests/http_client_test.cpp`）**：不需要獨立的「HttpConnection」物件，寫成一次性函式 `http_get<NextLayer>(host, port, target, stream_args...) -> awaitable<expected<string, errc>>` 就夠，因為 REST snapshot 只是偶發的一次性 GET，不是常駐連線。跟 `WebSocketConnection` 同樣的 template 手法（`NextLayer` 決定要不要走 SSL），也跟它共用同一個 `detail::is_ssl_stream_v` trait（抽到 `service/net_traits.hpp`，避免兩邊各自重複定義）。測試涵蓋成功回應、非 200 狀態碼、連線被拒絕三種情況，一樣用本地 plain TCP HTTP server，不用測試憑證。
-- **`VenueSession<Feed, Policy>`**：真正的 orchestrator，生命週期橫跨很多次 `WebSocketConnection`。擁有這條 session 負責的所有 symbol 的 `SymbolSync<Policy>`（`map<SymbolId, SymbolSync<Policy>>`），驅動迴圈：
+- **`VenueSession<Feed, Policy, NextLayer>`（已實作：`service/venue_session.hpp` / `tests/venue_session_test.cpp`）**：真正的 orchestrator，生命週期橫跨很多次 `WebSocketConnection`。擁有這條 session 負責的所有 symbol 的 `SymbolSync<Policy>`（`unordered_map<SymbolId, SymbolSync<Policy>>`），驅動迴圈：
 
 ```
 loop:
@@ -229,21 +229,29 @@ loop:
         parsed = feed.parse_message(text)
         對應 symbol 的 symbol_sync.on_snapshot(...) 或 on_depth_update(...)
         對吐出來的每個 action:
-            RequestSnapshot -> 若 Feed::kSnapshotViaRest 則 co_await http_get(feed.snapshot_request(symbol))，
-                                結果丟進 on_snapshot()；否則 no-op
+            RequestSnapshot -> co_spawn() 一個獨立背景 coroutine 去 http_get(feed.snapshot_request(symbol))，
+                                結果丟進 on_snapshot()；kSnapshotViaRest==false 則整個 no-op
+                                （見下方「co_spawn 而非 co_await」的說明——這不是實作細節，是必要條件）
             ApplySnapshot/ApplyDelta/InvalidateVenue -> 呼叫 SymbolRegistry 查到的 SymbolBook
     // ws 掛了/丟例外，跳出內層迴圈
     for each symbol_sync: symbol_sync.on_disconnected()   // 這條連線負責的每個 symbol 各自 invalidate
     // 回到 loop 開頭
 ```
 
-**`VenueSession`本體只寫一次、venue-agnostic**：per-exchange 差異全部是「模板參數的具體型別」，不是「orchestration 的實作」——`VenueSession<BinanceFuturesFeed, BinanceFuturesSequencePolicy>` 跟未來的 `VenueSession<OkxFeed, OkxSequencePolicy>` 共用同一份類別程式碼。這跟本專案既有風格一致（`BasicFixedPoint<Decimals>`、`aggregator_service.hpp` 裡的 `capture_snapshot_before<Compare>`，都是用 template 參數化差異點，不是繼承/virtual）。
+**`VenueSession`本體只寫一次、venue-agnostic**：per-exchange 差異全部是「模板參數的具體型別」，不是「orchestration 的實作」——`VenueSession<BinanceFuturesFeed, BinanceFuturesSequencePolicy, ...>` 跟未來的 `VenueSession<OkxFeed, OkxSequencePolicy, ...>` 共用同一份類別程式碼。這跟本專案既有風格一致（`BasicFixedPoint<Decimals>`、`aggregator_service.hpp` 裡的 `capture_snapshot_before<Compare>`，都是用 template 參數化差異點，不是繼承/virtual）。第三個 template 參數 `NextLayer` 跟 `WebSocketConnection`/`http_get` 同一招：測試用 `beast::tcp_stream`（本地 server），正式環境用 SSL stream。
 
 真正需要 runtime polymorphism（type erasure）的地方只有最上層——如果之後要有一個 `IngestionRunner` 同時管理多種不同具體型別的 `VenueSession`（Binance 的、OKX 的……），那一層可以留一個很薄的非模板介面（例如 `IVenueConnection { start(); stop(); }`），把 type erasure 限制在生命週期管理這個邊界，`SymbolSync`/`VenueSession` 本體的邏輯完全不用付虛擬呼叫成本。**這層尚未設計，見第 10 節。**
 
-## 8. `SymbolRegistry`
+### 實作時踩到的坑（都是真的踩過，不是紙上談兵）
 
-`std::unordered_map<SymbolId, SymbolBook*>`（或直接用 `AggregatorService::book(symbol)`），啟動時從 `AggregatorService` 建好，不動態增減。沒有特別的設計難度，純查表。
+1. **`RequestSnapshot` 必須用 `co_spawn` 丟到背景、絕對不能 `co_await` 內聯處理。** 這不是效能優化，是正確性的必要條件：如果內聯 `co_await http_get(...)`，`execute_action` 會一路卡住，`run()` 的讀取迴圈整個被 HTTP fetch 卡住，永遠沒機會在等 snapshot 回來的同時繼續讀 WS、把 live event 塞進 buffer——`on_snapshot()` 每次都會發現 buffer 是空的、永遠銜接不上、無限重試。這正是顧問一開始強調「要在發 snapshot 請求之前就先開始緩衝」的具體體現：不是文件寫寫而已，是 coroutine 排程層面真的會卡死。
+2. **傳給 `co_spawn` 的 coroutine，所有參數必須是值傳遞，不能是參考。** `handle_request_snapshot`（處理 `RequestSnapshot` 的那個 coroutine）一開始寫成 `const SymbolId& symbol`，結果是真實的 use-after-free：`co_spawn` 出去之後，呼叫端（`execute_action`）幾乎立刻執行完畢、它所在的 coroutine frame 被銷毀，連帶讓參考指向的 `symbol` 區域變數一起死掉；但 `handle_request_snapshot` 還在等 HTTP fetch（真的要花時間），等它恢復執行、要用 `symbol` 時，參考的東西早就沒了。實際症狀是 SIGTRAP crash（沒有任何例外訊息，直接跳過），花了不少時間才用 lldb + 大量 debug print 定位到。**教訓：任何要交給 `co_spawn`（而非直接 `co_await`）的 coroutine，其所有參數都必須用值傳遞**——因為它的生命週期不再受呼叫端的 frame 保護。`execute_actions`/`execute_action` 目前仍用 `const SymbolId&`，這是安全的，因為它們永遠是被直接 `co_await`（不是 spawn）呼叫，呼叫端的 frame 保證活到它們執行完——但這條規則是脆弱的，之後如果誰把其中一個也改成 spawn，要記得同步把參數改成值傳遞。
+3. **std::visit 的 visitor 如果宣告回傳 `net::awaitable<void>`，函式本體卻完全沒有 `co_await`/`co_return`，會在函式結尾「掉出」而沒有真正產生回傳值。** 這不是空手而回——Clang 會在非 void、非 coroutine 函式掉出結尾的地方插入 trap 指令，一執行到就是 SIGTRAP，是第二個造成同一個 crash 症狀的真實 bug（先修好 bug 2 之後才浮現，之前被 bug 2 的 crash 蓋住了）。修法：如果 visitor 內部完全是同步邏輯（`SymbolBook` 的呼叫都不會 suspend），就老實宣告成回傳 `void` 的一般函式，不要為了「看起來要放進 `co_await std::visit(...)` 這種寫法」硬掛一個 `-> net::awaitable<void>`。
+4. **測試時，假的 WS server 送完一則訊息就讓 coroutine 結束、底層 socket 跟著被解構關閉連線，會被 `VenueSession` 正確判定為斷線，觸發 `on_disconnected()` 把剛緩衝好的事件整個清空。** 這不是 bug，是系統正確的行為，但一開始把它誤判成又一個記憶體損壞 bug、花了好一陣子用 constructor/destructor 追蹤 + 逐點印位址才排除。**教訓：測試裡模擬「連線還活著、資料還沒送完」的假 server，送完 scripted 訊息之後，要故意再掛一個不會結束的 read（或其他方式）撐住連線的生命週期，不能讓 coroutine 提早 return。**
+
+## 8. `SymbolRegistry`（已實作：`service/venue_session.hpp`）
+
+`std::unordered_map<SymbolId, SymbolBook*>`，啟動時用 `add(symbol, service.book(symbol))` 建好，不動態增減。沒有特別的設計難度，純查表。
 
 ## 9. 其他修正記錄摘要
 
@@ -257,14 +265,15 @@ loop:
 
 1. **`SymbolBook::apply_batch`**：一則 `DepthUpdate`（一批 level 變化）目前會變成多次 `apply_delta` 呼叫、多次 seq bump，要不要比照 `apply_snapshot` 做成一次 seq bump，尚未決定。
 2. **`IngestionRunner`/`IVenueConnection` 的 type-erasure 邊界**：多交易所、多 `VenueSession` 具體型別的統一生命週期管理層，尚未設計。
-3. **backoff/jitter 的實際參數**：形狀已定（per-connection，帶 jitter），數值未定。
-4. **多執行緒 `io_context` thread pool 的大小**：先前討論過大方向（parsing 平行、apply 序列化在各自 `SymbolBook` 的 mutex 上），實際執行緒數量策略未定。
+3. **backoff/jitter 的實際參數**：形狀已定（per-connection，帶 jitter：`min(30s, 500ms * 2^attempt)` + 最多 20% 隨機抖動），數值是暫定的，未經真實流量調校。
+4. **多執行緒 `io_context` thread pool 的大小**：先前討論過大方向（parsing 平行、apply 序列化在各自 `SymbolBook` 的 mutex 上），實際執行緒數量策略未定；`VenueSession::run()` 目前也還沒實際跑在多執行緒 `io_context` 上測試過，只驗證過單執行緒 `io_context::run_for()`。
 5. **Binance Spot 的 `SequencePolicy`**：使用者明確表示目前不需要，之後才做。
-6. **REST client 實作**：預期用 Beast 的 HTTP client，尚未寫。
+6. **正式環境的 `net::ssl::context` 建構/憑證驗證設定**：`VenueSession`/`WebSocketConnection`/`http_get` 都已經支援 TLS 這個模板分支，但目前只跑過 `beast::tcp_stream`（plain）這個測試用實例化，`net::ssl::stream<beast::tcp_stream>` 這條路徑（含 SNI、憑證驗證模式）還沒有實際連過任何真實伺服器驗證過。
+7. **`aggregator_main.cpp` 尚未接上 ingestion**：目前 ingestion（`VenueSession` 等）跟 gRPC service（`aggregator_main.cpp`）是兩組分開驗證過的元件，還沒有一個真正的 `main()` 把兩者接在一起、對真實交易所開連線。
 
 ## 11. 下一步
 
-`SymbolSync<SequencePolicy>` + `BinanceFuturesSequencePolicy`（9 個測試）、`BinanceFuturesFeed`（10 個測試，含用官方文件逐字範例當 fixture）都已完成，共 19 個測試全部 0ms、零真實 I/O。下一步是 `VenueSession<Feed, Policy>`（真正接 Beast WebSocket + HTTP client 的 I/O driver），會需要引入 Boost（Beast/Asio），屆時再決定要 vcpkg 還是 FetchContent。
+`SymbolSync<SequencePolicy>` + `BinanceFuturesSequencePolicy`（9 測試）、`BinanceFuturesFeed`（10 測試）、`WebSocketConnection`（1 測試）、`http_get`（3 測試）、`VenueSession<Feed,Policy,NextLayer>` + `SymbolRegistry`（1 個端對端整合測試：假 WS server + 假 HTTP server + 真實 `AggregatorService`/`SymbolBook` + 真實 gRPC 訂閱驗證最終狀態）都已完成並測試通過。整條「WS 讀取 → resync 緩衝 → 背景 snapshot fetch → 銜接 → 套用進真實 book → 真實 gRPC 訂閱者收到正確結果」的路徑，已經有一個端對端測試證明可以動起來。剩下的是第 10 節列的收尾項目——其中 6、7 兩項（TLS 實際連線驗證、`aggregator_main.cpp` 接上 ingestion）是讓這整套東西真正能對接真實交易所上線前必須做的。
 
 ---
 
