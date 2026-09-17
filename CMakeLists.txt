@@ -30,6 +30,7 @@ if(HERMENEUTIC_BUILD_TESTS)
         tests/notional_test.cpp
         tests/volume_bands_test.cpp
         tests/price_bands_test.cpp
+        tests/symbol_sync_test.cpp
     )
     target_link_libraries(hermeneutic_tests PRIVATE hermeneutic GTest::gtest_main)
     gtest_discover_tests(hermeneutic_tests)

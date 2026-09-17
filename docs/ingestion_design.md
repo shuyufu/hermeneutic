@@ -1,6 +1,6 @@
 # 行情 Ingestion 設計文件
 
-狀態：**設計已收斂，尚未動手實作**（除了 `SymbolBook`，已在本 branch 完成並測試過）。下一步是實作 `SymbolSync<SequencePolicy>`。
+狀態：`SymbolBook`、`SymbolSync<SequencePolicy>`（含 `BinanceFuturesSequencePolicy`）已實作並測試過（`include/bobby/hermeneutic/symbol_sync.hpp`、`tests/symbol_sync_test.cpp`，9 個 sans-io 測試，全部 0ms、零 I/O）。下一步是 `BinanceFuturesFeed` 跟 `VenueSession`。
 
 本文件目的：把設計討論過程中反覆修正、目前只存在對話 scrollback 裡的決策跟理由固定下來，避免之後被 context 摘要掉、或被下一個 session 遺忘。**特別保留「曾經想錯、後來怎麼修正」的部分**，不只是最終乾淨版本——因為那些修正本身就是之後容易重蹈覆轍的地方。
 
@@ -40,7 +40,7 @@
 
 `.proto` 的 `SubscribeRequest` 加了 `string symbol = 1`（安全,因為這個 proto 從沒服務過真正的 consumer）。詳細設計理由跟測試涵蓋範圍見 memory `hermeneutic-aggregator-service-design`。
 
-## 4. `SymbolSync<SequencePolicy>`（尚未實作——下一步要做的）
+## 4. `SymbolSync<SequencePolicy>`（已實作：`include/bobby/hermeneutic/symbol_sync.hpp` / `tests/symbol_sync_test.cpp`）
 
 每個 (venue, symbol) 一個實例，管理「buffer → snapshot → drain → 穩態 → 偵測到 gap 就整個重來」這套流程。**完全不碰 socket**，靠 driver 餵事件進來、讀它吐出來的 action 列表去執行實際 I/O。
 
@@ -255,7 +255,7 @@ loop:
 
 ## 11. 下一步
 
-依照先前討論的優先順序（風險最高、測試報酬最大），**先實作 `SymbolSync<SequencePolicy>` 本體 + 完整單元測試**（涵蓋：正常 buffer→snapshot→drain→live 路徑、銜接失敗要重試、穩態 gap 偵測觸發 resync、`on_disconnected` 觸發 invalidate 等 case），`BinanceFuturesFeed`/`VenueSession` 之後再做。
+`SymbolSync<SequencePolicy>` + `BinanceFuturesSequencePolicy` 已完成（9 個測試涵蓋：`on_connected` 只 request 一次、buffering 期間不 apply、正常 buffer→snapshot→drain→live 路徑、銜接失敗要重試且不丟失已 buffer 的事件、drop 邊界嚴格小於、bridge 無 +1 偏移、live 穩態 gap 偵測觸發 resync 且把觸發事件摺進新 buffer、`on_disconnected` 在 Buffering/Live 兩種狀態下都正確 invalidate+reset）。下一步是 `BinanceFuturesFeed`（parse_message/snapshot_request）跟 `VenueSession`。
 
 ---
 
