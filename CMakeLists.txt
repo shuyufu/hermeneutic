@@ -67,6 +67,9 @@ option(HERMENEUTIC_BUILD_SERVICE "Build gRPC service targets (requires vcpkg too
 if(HERMENEUTIC_BUILD_SERVICE)
     find_package(Protobuf CONFIG REQUIRED)
     find_package(gRPC CONFIG REQUIRED)
+    find_package(boost_asio CONFIG REQUIRED)
+    find_package(boost_beast CONFIG REQUIRED)
+    find_package(OpenSSL REQUIRED)
 
     set(HERMENEUTIC_PROTO_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/proto)
     set(HERMENEUTIC_PROTO_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
@@ -124,5 +127,11 @@ if(HERMENEUTIC_BUILD_SERVICE)
             hermeneutic_proto hermeneutic GTest::gtest_main)
         gtest_discover_tests(hermeneutic_aggregator_service_test)
 
+        add_executable(hermeneutic_websocket_connection_test tests/websocket_connection_test.cpp)
+        target_include_directories(hermeneutic_websocket_connection_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/service)
+        target_link_libraries(hermeneutic_websocket_connection_test PRIVATE
+            hermeneutic Boost::asio Boost::beast OpenSSL::SSL OpenSSL::Crypto GTest::gtest_main)
+        gtest_discover_tests(hermeneutic_websocket_connection_test)
     endif()
 endif()
