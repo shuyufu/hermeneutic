@@ -15,27 +15,17 @@
 #include <chrono>
 #include <string>
 #include <string_view>
-#include <type_traits>
 #include <utility>
 
 #include <openssl/ssl.h>
+
+#include "net_traits.hpp"
 
 namespace bobby::hermeneutic::ingestion {
 
 namespace net = boost::asio;
 namespace beast = boost::beast;
 namespace websocket = beast::websocket;
-
-namespace detail {
-
-template <typename T>
-struct is_ssl_stream : std::false_type {};
-template <typename T>
-struct is_ssl_stream<net::ssl::stream<T>> : std::true_type {};
-template <typename T>
-inline constexpr bool is_ssl_stream_v = is_ssl_stream<T>::value;
-
-}  // namespace detail
 
 // Thin, venue-agnostic WebSocket connection: connect/send/read/close only.
 // Knows nothing about symbols, resync, or any particular exchange - see

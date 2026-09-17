@@ -216,7 +216,7 @@ class BinanceFuturesFeed {
 - **`WebSocketConnection`（已實作：`service/websocket_connection.hpp` / `tests/websocket_connection_test.cpp`）**：transport 層，venue-agnostic，薄。一條 WS 連線的生命週期本身（connect/send/read/close），包 `beast::websocket::stream<NextLayer>`。完全不知道 symbol/resync/交易所是什麼。**每次重連 = 新的一個 instance**，`VenueSession` 自己不會斷。
   - **template 化在 `NextLayer` 上**，不是寫死 SSL：`PlainWebSocketConnection`（`beast::tcp_stream`）給測試用（本地 server，不用處理測試憑證），`TlsWebSocketConnection`（`net::ssl::stream<beast::tcp_stream>`）給正式環境接 `wss://` 用。兩者共用同一份 connect/send/read/close 邏輯，只有 `connect()` 內用 `if constexpr` 判斷 `NextLayer` 是不是 SSL stream 來決定要不要多做 SNI 設定 + TLS handshake。測試涵蓋 connect/send/read/close 的機制本身（用本地 plain TCP echo server），不涵蓋 TLS handshake 這條分支本身（那段是 Asio/OpenSSL 自己的、有廣泛測試覆蓋的邏輯，不是本專案自己的程式碼）。
   - `asio::strand` 的部分尚未加——目前 `WebSocketConnection` 本身不管理 strand，這是 `VenueSession` 建構它的時候要決定的事（見下）。
-- **HTTP snapshot**：不需要獨立的「HttpConnection」物件，寫成一次性函式 `http_get(io_context&, HttpRequestSpec) -> awaitable<expected<string, errc>>` 就夠，因為 REST snapshot 只是偶發的一次性 GET，不是常駐連線。
+- **HTTP snapshot（已實作：`service/http_client.hpp` / `tests/http_client_test.cpp`）**：不需要獨立的「HttpConnection」物件，寫成一次性函式 `http_get<NextLayer>(host, port, target, stream_args...) -> awaitable<expected<string, errc>>` 就夠，因為 REST snapshot 只是偶發的一次性 GET，不是常駐連線。跟 `WebSocketConnection` 同樣的 template 手法（`NextLayer` 決定要不要走 SSL），也跟它共用同一個 `detail::is_ssl_stream_v` trait（抽到 `service/net_traits.hpp`，避免兩邊各自重複定義）。測試涵蓋成功回應、非 200 狀態碼、連線被拒絕三種情況，一樣用本地 plain TCP HTTP server，不用測試憑證。
 - **`VenueSession<Feed, Policy>`**：真正的 orchestrator，生命週期橫跨很多次 `WebSocketConnection`。擁有這條 session 負責的所有 symbol 的 `SymbolSync<Policy>`（`map<SymbolId, SymbolSync<Policy>>`），驅動迴圈：
 
 ```
