@@ -1,7 +1,13 @@
 #include <grpc/grpc.h>
 #include <grpcpp/grpcpp.h>
 
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/ssl.hpp>
+#include <boost/beast/core/tcp_stream.hpp>
+
 #include <chrono>
+#include <exception>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -10,8 +16,12 @@
 #include <vector>
 
 #include "aggregator_service.hpp"
+#include "binance_futures_feed.hpp"
+#include "venue_session.hpp"
 
 namespace {
+
+namespace net = boost::asio;
 
 // Splits a comma-separated symbol list ("BTCUSDT,ETHUSDT") into its parts.
 // Empty entries (e.g. a trailing comma) are dropped rather than producing a
@@ -76,10 +86,48 @@ int main(int argc, char** argv) {
     });
     heartbeat_thread.detach();
 
+    // Ingestion: one VenueSession per venue, covering every symbol this
+    // process serves, feeding the same AggregatorService the gRPC server
+    // above exposes. Binance USDS-M Futures only for now (see
+    // docs/ingestion_design.md - Binance Spot and other venues aren't
+    // implemented yet). A real TLS context, not the plain-TCP instantiation
+    // the tests use: this is the first time that path runs against a real
+    // exchange rather than a local test server.
+    net::ssl::context ssl_ctx(net::ssl::context::tlsv12_client);
+    ssl_ctx.set_default_verify_paths();
+    ssl_ctx.set_verify_mode(net::ssl::verify_peer);
+
+    bobby::hermeneutic::ingestion::SymbolRegistry registry;
+    for (const auto& symbol : symbols) registry.add(symbol, service.book(symbol));
+
+    net::io_context io;
+    bobby::hermeneutic::ingestion::VenueSession<bobby::hermeneutic::ingestion::BinanceFuturesFeed,
+                                         bobby::hermeneutic::BinanceFuturesSequencePolicy,
+                                         net::ssl::stream<boost::beast::tcp_stream>>
+        binance_session(bobby::hermeneutic::ingestion::BinanceFuturesFeed{}, "binance_futures", symbols,
+                         std::move(registry), &ssl_ctx);
+    net::co_spawn(io, binance_session.run(), [](std::exception_ptr e) {
+        if (!e) return;
+        try {
+            std::rethrow_exception(e);
+        } catch (const std::exception& ex) {
+            // VenueSession::run() only returns via an uncaught exception in
+            // its own setup (co_await net::this_coro::executor, backoff's
+            // timer, etc.) - a dropped/failed venue connection is already
+            // handled internally (reconnect with backoff), so reaching
+            // here means ingestion for this venue has stopped for good.
+            std::cerr << "binance_futures ingestion session ended: " << ex.what() << '\n';
+        }
+    });
+    std::thread io_thread([&io] { io.run(); });
+
     std::cout << "hermeneutic_aggregator_service listening on " << address << " for "
               << symbols.size() << " symbol(s):";
     for (const auto& symbol : symbols) std::cout << ' ' << symbol;
-    std::cout << std::endl;
+    std::cout << ", ingesting from binance_futures" << std::endl;
     server->Wait();
+
+    io.stop();
+    io_thread.join();
     return 0;
 }

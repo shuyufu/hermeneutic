@@ -268,12 +268,14 @@ loop:
 3. **backoff/jitter 的實際參數**：形狀已定（per-connection，帶 jitter：`min(30s, 500ms * 2^attempt)` + 最多 20% 隨機抖動），數值是暫定的，未經真實流量調校。
 4. **多執行緒 `io_context` thread pool 的大小**：先前討論過大方向（parsing 平行、apply 序列化在各自 `SymbolBook` 的 mutex 上），實際執行緒數量策略未定；`VenueSession::run()` 目前也還沒實際跑在多執行緒 `io_context` 上測試過，只驗證過單執行緒 `io_context::run_for()`。
 5. **Binance Spot 的 `SequencePolicy`**：使用者明確表示目前不需要，之後才做。
-6. **正式環境的 `net::ssl::context` 建構/憑證驗證設定**：`VenueSession`/`WebSocketConnection`/`http_get` 都已經支援 TLS 這個模板分支，但目前只跑過 `beast::tcp_stream`（plain）這個測試用實例化，`net::ssl::stream<beast::tcp_stream>` 這條路徑（含 SNI、憑證驗證模式）還沒有實際連過任何真實伺服器驗證過。
-7. **`aggregator_main.cpp` 尚未接上 ingestion**：目前 ingestion（`VenueSession` 等）跟 gRPC service（`aggregator_main.cpp`）是兩組分開驗證過的元件，還沒有一個真正的 `main()` 把兩者接在一起、對真實交易所開連線。
+6. ~~正式環境的 `net::ssl::context` 建構/憑證驗證設定~~ **已完成並實測**：`aggregator_main.cpp` 接上 ingestion 後第一次真的編譯到 `net::ssl::stream<beast::tcp_stream>` 這個 template 實例化，發現漏了 `#include <boost/beast/websocket/ssl.hpp>`（Beast 對 SSL stream 的 `async_teardown` customization point 是獨立 header，沒 include 的話會在 `boost/beast/websocket/teardown.hpp` 出現 `static_assert(sizeof(Socket)==-1, "Unknown Socket type in async_teardown.")`）。修好後**實際跑起來連上 `wss://fstream.binance.com/ws` + `https://fapi.binance.com`，收到真實 BTCUSDT order book**（snapshot 1928 bids/1854 asks，diff 持續進來）。已在背景丟一個更長時間的穩定性/斷線重連驗證（見下）。
+7. ~~`aggregator_main.cpp` 尚未接上 ingestion~~ **已完成**：見 `service/aggregator_main.cpp`——建構 `AggregatorService` 後，額外建一個 `net::ssl::context`（`tlsv12_client`，`set_default_verify_paths()` + `verify_peer`）、一個 `SymbolRegistry`（從 `service.book(symbol)` 建）、一個 `VenueSession<BinanceFuturesFeed, BinanceFuturesSequencePolicy, net::ssl::stream<beast::tcp_stream>>`，`co_spawn` 上一個獨立的 `io_context`（自己的 thread 跑 `io.run()`），跟原本的 gRPC server／heartbeat thread 並存，`server->Wait()` 回來後 `io.stop()` + join 收尾。目前寫死只接 Binance Futures 一個交易所（因為目前只實作這一個 `Feed`），之後真要多交易所需要走第 10-2 項的 `IngestionRunner`。
 
 ## 11. 下一步
 
-`SymbolSync<SequencePolicy>` + `BinanceFuturesSequencePolicy`（9 測試）、`BinanceFuturesFeed`（10 測試）、`WebSocketConnection`（1 測試）、`http_get`（3 測試）、`VenueSession<Feed,Policy,NextLayer>` + `SymbolRegistry`（1 個端對端整合測試：假 WS server + 假 HTTP server + 真實 `AggregatorService`/`SymbolBook` + 真實 gRPC 訂閱驗證最終狀態）都已完成並測試通過。整條「WS 讀取 → resync 緩衝 → 背景 snapshot fetch → 銜接 → 套用進真實 book → 真實 gRPC 訂閱者收到正確結果」的路徑，已經有一個端對端測試證明可以動起來。剩下的是第 10 節列的收尾項目——其中 6、7 兩項（TLS 實際連線驗證、`aggregator_main.cpp` 接上 ingestion）是讓這整套東西真正能對接真實交易所上線前必須做的。
+`SymbolSync<SequencePolicy>` + `BinanceFuturesSequencePolicy`（9 測試）、`BinanceFuturesFeed`（10 測試）、`WebSocketConnection`（1 測試）、`http_get`（3 測試）、`VenueSession<Feed,Policy,NextLayer>` + `SymbolRegistry`（1 個端對端整合測試）都已完成並測試通過。**`aggregator_main.cpp` 也已經接上 ingestion（第 10 節第 7 項），並且實際對 `wss://fstream.binance.com`/`https://fapi.binance.com` 跑起來過，收到真實 BTCUSDT order book**（第 10 節第 6 項的 TLS 實際連線驗證，也在這次一併完成）。整條「真實 Binance WS/REST → resync → 套用進真實 book → 真實 gRPC 訂閱者收到正確結果」的路徑，已經不只是測試證明可以動，是真的連過真實交易所跑過一次。
+
+剩下的收尾項目（第 10 節）：`SymbolBook::apply_batch`（1，下一步要做）、`IngestionRunner` 的多交易所 type-erasure 邊界（2）、backoff 參數調校（3）、多執行緒 `io_context` 策略（4）、Binance Spot 的 `SequencePolicy`（5，使用者明確表示暫不需要）。
 
 ---
 

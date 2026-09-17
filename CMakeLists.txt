@@ -117,7 +117,8 @@ if(HERMENEUTIC_BUILD_SERVICE)
     target_link_libraries(hermeneutic_proto PUBLIC gRPC::grpc++ protobuf::libprotobuf)
 
     add_executable(hermeneutic_aggregator_service service/aggregator_main.cpp)
-    target_link_libraries(hermeneutic_aggregator_service PRIVATE hermeneutic_proto hermeneutic)
+    target_link_libraries(hermeneutic_aggregator_service PRIVATE
+        hermeneutic_proto hermeneutic simdjson Boost::asio Boost::beast OpenSSL::SSL OpenSSL::Crypto)
 
     if(HERMENEUTIC_BUILD_TESTS)
         add_executable(hermeneutic_aggregator_service_test tests/aggregator_service_test.cpp)
