@@ -159,6 +159,62 @@ class SymbolBook {
         }
     }
 
+    // Applies one batch of delta changes (e.g. everything one upstream
+    // exchange message carried) as a single book revision: one seq bump,
+    // one broadcast - unlike calling apply_delta() once per level, which
+    // would seq-bump and broadcast once per level even though the exchange
+    // meant it as one atomic update. Same per-level negative-size rejection
+    // as apply_delta, checked for every level before any of them is
+    // applied, so a bad level anywhere in the batch leaves the book
+    // untouched rather than partially updated for that reason specifically
+    // (an allocation failure partway through is not rolled back - same
+    // documented limitation as apply_snapshot()).
+    std::expected<void, std::errc> apply_batch(const VenueId& venue,
+                                                std::span<const std::pair<Price, Size>> bids,
+                                                std::span<const std::pair<Price, Size>> asks) {
+        for (const auto& [price, size] : bids) {
+            if (size.raw() < 0) return std::unexpected(std::errc::invalid_argument);
+        }
+        for (const auto& [price, size] : asks) {
+            if (size.raw() < 0) return std::unexpected(std::errc::invalid_argument);
+        }
+
+        std::lock_guard lock(mutex_);
+
+        // Captured before any mutation, keyed in the same order the
+        // aggregate book itself orders this side (descending for bids,
+        // ascending for asks) - same trick as capture_snapshot_before(),
+        // so the eventual diff comes out correctly ordered "for free"
+        // instead of needing a separate sort. try_emplace() also means a
+        // price repeated more than once in one batch (not expected from a
+        // real exchange message, but not assumed against either) only
+        // captures its state from before this whole batch, not an
+        // intermediate value from earlier in the same batch.
+        std::map<Price, Size, std::greater<Price>> before_bids;
+        for (const auto& [price, size] : bids) {
+            before_bids.try_emplace(price, lookup_aggregate(Side::Bid, price));
+        }
+        std::map<Price, Size, std::less<Price>> before_asks;
+        for (const auto& [price, size] : asks) {
+            before_asks.try_emplace(price, lookup_aggregate(Side::Ask, price));
+        }
+
+        for (const auto& [price, size] : bids) {
+            auto result = book_.apply_delta(venue, Side::Bid, price, size);
+            if (!result) return result;
+        }
+        for (const auto& [price, size] : asks) {
+            auto result = book_.apply_delta(venue, Side::Ask, price, size);
+            if (!result) return result;
+        }
+
+        std::vector<Change> changed;
+        for (const auto& [price, before] : before_bids) collect_change(changed, Side::Bid, price, before);
+        for (const auto& [price, before] : before_asks) collect_change(changed, Side::Ask, price, before);
+        publish(changed);
+        return {};
+    }
+
     void invalidate_venue(const VenueId& venue) {
         std::lock_guard lock(mutex_);
 

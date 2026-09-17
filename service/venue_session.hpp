@@ -204,13 +204,13 @@ class VenueSession {
                         book->apply_snapshot(venue_, Side::Ask, a.asks);
                     }
                 } else if constexpr (std::is_same_v<T, ApplyDelta>) {
+                    // One call, not one apply_delta() per level: a.bids/
+                    // a.asks together are everything one upstream exchange
+                    // message carried, and apply_batch() is what keeps that
+                    // one atomic update from becoming several separate seq
+                    // bumps/broadcasts on our own wire protocol.
                     if (auto* book = registry_.book(symbol)) {
-                        for (const auto& [price, size] : a.bids) {
-                            book->apply_delta(venue_, Side::Bid, price, size);
-                        }
-                        for (const auto& [price, size] : a.asks) {
-                            book->apply_delta(venue_, Side::Ask, price, size);
-                        }
+                        book->apply_batch(venue_, a.bids, a.asks);
                     }
                 } else if constexpr (std::is_same_v<T, InvalidateVenue>) {
                     if (auto* book = registry_.book(symbol)) book->invalidate_venue(venue_);

@@ -263,7 +263,7 @@ loop:
 
 ## 10. 尚未定案 / 待做事項
 
-1. **`SymbolBook::apply_batch`**：一則 `DepthUpdate`（一批 level 變化）目前會變成多次 `apply_delta` 呼叫、多次 seq bump，要不要比照 `apply_snapshot` 做成一次 seq bump，尚未決定。
+1. ~~`SymbolBook::apply_batch`~~ **已完成**：一次呼叫套用整批 bid/ask 變化，只 bump 一次 `seq_`、只 broadcast 一次，跟 `apply_snapshot` 一樣的「先驗證全部 level、再套用」模式（負數 size 任一 level 有錯，整批都不套用）。診斷結果的 bids/asks 順序沿用 `capture_snapshot_before` 的做法（用跟 aggregate map 相同的 comparator 建中繼 map），維持「diff 順序跟 snapshot 順序一致」這條既有的協定保證，不是照輸入順序原樣印出。`VenueSession::execute_action` 處理 `ApplyDelta` 這個 action 時已經改成呼叫這個新方法（`service/venue_session.hpp`），不再對 bids/asks 各自逐筆呼叫 `apply_delta`。新增 3 個測試（一次 seq bump、跨 venue 正確加總、負數 size 整批拒絕且不 broadcast）。
 2. **`IngestionRunner`/`IVenueConnection` 的 type-erasure 邊界**：多交易所、多 `VenueSession` 具體型別的統一生命週期管理層，尚未設計。
 3. **backoff/jitter 的實際參數**：形狀已定（per-connection，帶 jitter：`min(30s, 500ms * 2^attempt)` + 最多 20% 隨機抖動），數值是暫定的，未經真實流量調校。
 4. **多執行緒 `io_context` thread pool 的大小**：先前討論過大方向（parsing 平行、apply 序列化在各自 `SymbolBook` 的 mutex 上），實際執行緒數量策略未定；`VenueSession::run()` 目前也還沒實際跑在多執行緒 `io_context` 上測試過，只驗證過單執行緒 `io_context::run_for()`。

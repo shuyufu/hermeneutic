@@ -367,6 +367,82 @@ TEST_F(AggregatorServiceTest, HeartbeatIsDeliveredAndDoesNotAdvanceSeq) {
     EXPECT_EQ(diff_msg.diff().seq(), 1u);
 }
 
+TEST_F(AggregatorServiceTest, ApplyBatchProducesOneSeqBumpForMultipleLevels) {
+    updates_.wait_for(0);  // initial snapshot
+
+    std::array<std::pair<Price, Size>, 2> bids{{
+        {Price(102.0), Size(1.0)},
+        {Price(100.0), Size(2.0)},
+    }};
+    std::array<std::pair<Price, Size>, 1> asks{{
+        {Price(101.0), Size(3.0)},
+    }};
+    ASSERT_TRUE(book().apply_batch("binance", bids, asks).has_value());
+
+    // One message, seq 1 - not three separate diffs the way three
+    // apply_delta() calls for the same levels would have produced.
+    L2Update msg = updates_.wait_for(1);
+    ASSERT_TRUE(msg.has_diff());
+    EXPECT_EQ(msg.diff().seq(), 1u);
+
+    // Bids descending, asks ascending - same ordering guarantee as
+    // apply_snapshot's diffs, not raw input order (bids were given
+    // 102-then-100 above; asks would coincidentally match either way with
+    // only one level, so this is really testing the bids side).
+    ASSERT_EQ(msg.diff().bids_size(), 2);
+    EXPECT_EQ(msg.diff().bids(0).price_raw(), Price(102.0).raw());
+    EXPECT_EQ(msg.diff().bids(0).size_raw(), Size(1.0).raw());
+    EXPECT_EQ(msg.diff().bids(1).price_raw(), Price(100.0).raw());
+    EXPECT_EQ(msg.diff().bids(1).size_raw(), Size(2.0).raw());
+    ASSERT_EQ(msg.diff().asks_size(), 1);
+    EXPECT_EQ(msg.diff().asks(0).price_raw(), Price(101.0).raw());
+    EXPECT_EQ(msg.diff().asks(0).size_raw(), Size(3.0).raw());
+}
+
+TEST_F(AggregatorServiceTest, ApplyBatchAggregatesAcrossVenuesLikeApplyDelta) {
+    updates_.wait_for(0);  // initial snapshot
+
+    ASSERT_TRUE(book().apply_delta("okx", Side::Bid, Price(100.0), Size(5.0)).has_value());
+    updates_.wait_for(1);
+
+    // binance's batch touches the same price okx already holds, plus a
+    // new one - the aggregate must reflect both venues' contributions.
+    std::array<std::pair<Price, Size>, 2> bids{{
+        {Price(100.0), Size(3.0)},
+        {Price(99.0), Size(1.0)},
+    }};
+    ASSERT_TRUE(book().apply_batch("binance", bids, {}).has_value());
+
+    L2Update msg = updates_.wait_for(2);
+    ASSERT_TRUE(msg.has_diff());
+    ASSERT_EQ(msg.diff().bids_size(), 2);
+    EXPECT_EQ(msg.diff().bids(0).price_raw(), Price(100.0).raw());
+    EXPECT_EQ(msg.diff().bids(0).size_raw(), Size(8.0).raw());  // okx's 5 + binance's new 3
+    EXPECT_EQ(msg.diff().bids(1).price_raw(), Price(99.0).raw());
+    EXPECT_EQ(msg.diff().bids(1).size_raw(), Size(1.0).raw());  // binance only
+}
+
+TEST_F(AggregatorServiceTest, ApplyBatchRejectsNegativeSizeWithoutMutatingOrBroadcasting) {
+    updates_.wait_for(0);  // initial snapshot
+
+    std::array<std::pair<Price, Size>, 2> bad_bids{{
+        {Price(100.0), Size(1.0)},
+        {Price(99.0), Size(-1.0)},
+    }};
+    auto bad = book().apply_batch("binance", bad_bids, {});
+    ASSERT_FALSE(bad.has_value());
+    EXPECT_EQ(bad.error(), std::errc::invalid_argument);
+
+    // Neither level from the rejected batch was applied: a good call right
+    // after must be seq 1 / the second message, not seq 2 / the third.
+    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
+    L2Update msg = updates_.wait_for(1);
+    ASSERT_TRUE(msg.has_diff());
+    EXPECT_EQ(msg.diff().seq(), 1u);
+    ASSERT_EQ(msg.diff().bids_size(), 1);
+    EXPECT_EQ(msg.diff().bids(0).price_raw(), Price(100.0).raw());
+}
+
 TEST_F(AggregatorServiceTest, StuckSubscriberDoesNotBlockIngestionOrOtherSubscribers) {
     updates_.wait_for(0);  // initial snapshot for the fixture's own (fast) subscriber
 
