@@ -36,6 +36,32 @@ if(HERMENEUTIC_BUILD_TESTS)
     gtest_discover_tests(hermeneutic_tests)
 endif()
 
+option(HERMENEUTIC_BUILD_INGESTION "Build market-data ingestion feed parsers (needs no vcpkg toolchain)" ON)
+
+if(HERMENEUTIC_BUILD_INGESTION)
+    # Fetched directly (like googletest above), not via vcpkg: simdjson's
+    # vcpkg port requires a system pkg-config, which this project has no
+    # other reason to depend on, and simdjson officially supports being
+    # brought in this way.
+    include(FetchContent)
+    FetchContent_Declare(
+        simdjson
+        GIT_REPOSITORY https://github.com/simdjson/simdjson.git
+        GIT_TAG v4.6.11
+        GIT_SHALLOW TRUE
+    )
+    FetchContent_MakeAvailable(simdjson)
+
+    if(HERMENEUTIC_BUILD_TESTS)
+        add_executable(hermeneutic_binance_futures_feed_test tests/binance_futures_feed_test.cpp)
+        target_include_directories(hermeneutic_binance_futures_feed_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/service)
+        target_link_libraries(hermeneutic_binance_futures_feed_test PRIVATE
+            hermeneutic simdjson GTest::gtest_main)
+        gtest_discover_tests(hermeneutic_binance_futures_feed_test)
+    endif()
+endif()
+
 option(HERMENEUTIC_BUILD_SERVICE "Build gRPC service targets (requires vcpkg toolchain, see README)" OFF)
 
 if(HERMENEUTIC_BUILD_SERVICE)
@@ -97,5 +123,6 @@ if(HERMENEUTIC_BUILD_SERVICE)
         target_link_libraries(hermeneutic_aggregator_service_test PRIVATE
             hermeneutic_proto hermeneutic GTest::gtest_main)
         gtest_discover_tests(hermeneutic_aggregator_service_test)
+
     endif()
 endif()

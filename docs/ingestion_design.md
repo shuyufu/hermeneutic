@@ -1,6 +1,6 @@
 # 行情 Ingestion 設計文件
 
-狀態：`SymbolBook`、`SymbolSync<SequencePolicy>`（含 `BinanceFuturesSequencePolicy`）已實作並測試過（`include/bobby/hermeneutic/symbol_sync.hpp`、`tests/symbol_sync_test.cpp`，9 個 sans-io 測試，全部 0ms、零 I/O）。下一步是 `BinanceFuturesFeed` 跟 `VenueSession`。
+狀態：`SymbolBook`、`SymbolSync<SequencePolicy>`（含 `BinanceFuturesSequencePolicy`）、`BinanceFuturesFeed` 已實作並測試過（`include/bobby/hermeneutic/symbol_sync.hpp`、`service/binance_futures_feed.hpp`、對應測試共 19 個，全部 0ms）。下一步是 `VenueSession`。
 
 本文件目的：把設計討論過程中反覆修正、目前只存在對話 scrollback 裡的決策跟理由固定下來，避免之後被 context 摘要掉、或被下一個 session 遺忘。**特別保留「曾經想錯、後來怎麼修正」的部分**，不只是最終乾淨版本——因為那些修正本身就是之後容易重蹈覆轍的地方。
 
@@ -182,25 +182,32 @@ struct TrustConnectionOrderPolicy {
 
 這種交易所因為單一 WS 連線保證有序送達，「resync」實質上退化成跟「重連」同一件事——不需要囤 buffer 找銜接點。
 
-## 6. `VenueFeed`（per 交易所，parse/encode，跟 `SequencePolicy` 是不同的模板參數）
+## 6. `VenueFeed`（已實作：`service/binance_futures_feed.hpp` / `tests/binance_futures_feed_test.cpp`）
 
 ```cpp
+using ParsedMessage = std::optional<std::variant<SnapshotMessage, DepthUpdate>>;
+
 class BinanceFuturesFeed {
   public:
     static constexpr bool kSnapshotViaRest = true;  // false 的話 RequestSnapshot 對 VenueSession 是 no-op
 
-    std::string subscribe_message(std::span<const SymbolId> symbols) const;  // 純函式，產生要送出的 JSON
-    std::expected<std::variant<SnapshotMessage, DepthUpdate>, std::errc>
-        parse_message(std::string_view text) const;
-    HttpRequestSpec snapshot_request(SymbolId symbol) const;   // GET /fapi/v1/depth?symbol=...&limit=1000
-    std::expected<SnapshotMessage, std::errc> parse_snapshot_response(std::string_view body) const;
+    std::string subscribe_message(std::span<const SymbolId> symbols,
+                                   std::string_view update_speed = "100ms") const;  // 純函式
+    std::expected<ParsedMessage, std::errc> parse_message(std::string_view text) const;
+    HttpRequestSpec snapshot_request(const SymbolId& symbol) const;  // GET /fapi/v1/depth?symbol=...&limit=1000
+    std::expected<SnapshotMessage, std::errc> parse_snapshot_response(SymbolId symbol,
+                                                                        std::string_view body) const;
 };
 ```
 
 **修正記錄**：
 - `ParseError` 一開始是設計骨架裡的佔位型別名稱，還沒決定。確認後**不新增型別**，沿用專案既有的 `std::expected<T, std::errc>` 慣例（`aggregate_order_book.hpp`/`notional.hpp`/`price_bands.hpp` 都是這樣），錯誤值用 `std::errc::bad_message`（對應 POSIX `EBADMSG`，語意上比 `invalid_argument` 更精確地描述「外部餵進來的訊息本身壞掉」）。
-- `parse_message` 回傳型別後來加上 `std::variant<SnapshotMessage, DepthUpdate>`，是為了同一套介面也能吃「WS 自動推 snapshot」那種交易所（driver 依解析結果分派到 `on_snapshot`/`on_depth_update`）。
+- `parse_message` 回傳型別實作時再多包一層 `std::optional`（`ParsedMessage = std::optional<std::variant<SnapshotMessage, DepthUpdate>>`），因為連上後 Binance 會回一個 SUBSCRIBE ack（`{"result":null,"id":1}`，完全沒有 `"e"` 欄位）——這是「有效訊息但跟 book 狀態無關」，用 `std::nullopt` 表示，跟「訊息本身壞掉」（`std::errc::bad_message`）明確分開，不會混在一起。
 - `kSnapshotViaRest` 這個編譯期常數，是為了讓 `RequestSnapshot` 這個 action 的「履行方式」（真的打 HTTP GET vs. 純 no-op 等 WS 自然推送）可以在同一份 `VenueSession` 泛型邏輯裡分岔，不需要為 WS-push-snapshot 的交易所另開一份 `VenueSession`。
+- `parse_snapshot_response` 多一個 `symbol` 參數：REST 回應本身不含 symbol 欄位（`{"lastUpdateId":...,"bids":[...],"asks":[...]}`），只能由呼叫端（知道自己打了哪個 symbol 的請求）補上。
+- **JSON 庫選擇**：使用者選 `simdjson`。原本打算跟 `grpc` 一起走 vcpkg（`find_package(simdjson CONFIG REQUIRED)`），但 simdjson 的 vcpkg port 需要系統裝 `pkg-config`，這台機器沒有 Homebrew 也沒有 pkg-config。與其安裝一整個 Homebrew（較大、較不易復原的系統變更），改用 simdjson 官方支援的 **CMake `FetchContent`**（跟這個專案已經在用的 googletest 同一招），完全不需要 vcpkg/pkg-config。新增 `HERMENEUTIC_BUILD_INGESTION` 選項（預設 `ON`，不需要 vcpkg toolchain），`hermeneutic_binance_futures_feed_test` 掛在這個選項底下，即使沒設定 `HERMENEUTIC_BUILD_SERVICE`/`VCPKG_ROOT` 也能跑。
+- 解析邏輯用 simdjson 的 on-demand API（拋例外的預設模式），在 `parse_message`/`parse_snapshot_response` 外層包 `try/catch (const simdjson::simdjson_error&)`，統一轉成 `std::errc::bad_message`——跟 `aggregate_order_book.hpp` 捕捉 `std::bad_alloc` 轉成錯誤碼是同一種既有模式。
+- Binance 用字串傳 price/quantity（避免 wire format 本身出現浮點數歧義），用 `std::from_chars`（非 locale-dependent、不拋例外）轉成 `double` 再建構 `Price`/`Size`。
 
 ## 7. `VenueSession<Feed, Policy>`（I/O driver，orchestrator，只寫一次）
 
@@ -255,7 +262,7 @@ loop:
 
 ## 11. 下一步
 
-`SymbolSync<SequencePolicy>` + `BinanceFuturesSequencePolicy` 已完成（9 個測試涵蓋：`on_connected` 只 request 一次、buffering 期間不 apply、正常 buffer→snapshot→drain→live 路徑、銜接失敗要重試且不丟失已 buffer 的事件、drop 邊界嚴格小於、bridge 無 +1 偏移、live 穩態 gap 偵測觸發 resync 且把觸發事件摺進新 buffer、`on_disconnected` 在 Buffering/Live 兩種狀態下都正確 invalidate+reset）。下一步是 `BinanceFuturesFeed`（parse_message/snapshot_request）跟 `VenueSession`。
+`SymbolSync<SequencePolicy>` + `BinanceFuturesSequencePolicy`（9 個測試）、`BinanceFuturesFeed`（10 個測試，含用官方文件逐字範例當 fixture）都已完成，共 19 個測試全部 0ms、零真實 I/O。下一步是 `VenueSession<Feed, Policy>`（真正接 Beast WebSocket + HTTP client 的 I/O driver），會需要引入 Boost（Beast/Asio），屆時再決定要 vcpkg 還是 FetchContent。
 
 ---
 
