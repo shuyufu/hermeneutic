@@ -482,6 +482,8 @@ loop:
 
 **用 AddressSanitizer 把 okx_spot、okx_swap 分開各自單獨跑過一次**（不是兩個一起跑）——刻意分開驗證，避免「其中一個 venue 有資料、另一個其實沒有」被另一邊的真實流量掩蓋成看起來兩邊都在動的假象：一份獨立的 `build-asan`（`-fsanitize=address -fno-omit-frame-pointer -g -O1`，跟平常的 `build-vcpkg` 分開，不影響正常建置），`hermeneutic_live_okx_check` 改成吃一個 `argv`（`spot`/`swap`）只接一個 venue。兩次都跑 15 秒：spot 單獨跑收到 48～77 筆真實 BBO（兩次結果不同純粹是市場當下活躍度不同），swap 單獨跑收到 122 筆，兩次 exit code 都是 0、沒有任何 ASan ERROR/SUMMARY。第一次有跳出一個 `container-overflow`（在 `AggregatorService` 建構子的 `std::map::try_emplace` 裡，`std::string` 複製建構時觸發）——加 `ASAN_OPTIONS=detect_container_overflow=0` 後乾淨通過，這是 libc++ container-annotation 已知的誤報類型（vcpkg 預先建置好的 `protobuf`/`grpc` 靜態庫沒有用 ASan 編譯，跟這次特別加了 ASan 的 `hermeneutic_proto`/`hermeneutic` 混在一起連結，兩邊對同一個 `std::string`/容器的 annotation 狀態對不上），不是這個專案自己程式碼的真實 bug——ASan 官方文件本身就提到這個限制。
 
+**同一輪也另外改訂閱 `SubscribeL2Diff`（不是 `SubscribeBbo`）確認真正的 L2 深度更新筆數**，因為 BBO 只反映最佳買賣價變化，不能代表完整深度真的有在動：spot 兩次分別收到 110/135 筆 `L2Diff`（第一筆 `book_seq=1` 是把 OKX 400 檔 snapshot 灌進原本空的 aggregate book，本身就會產生一次 400 檔的 diff，之後才是正常的增量），swap 兩次分別收到 140/145 筆，同樣兩次 exit code 都是 0、沒有 ASan 發現。
+
 剩下的收尾項目（第 10 節）：`SymbolBook::apply_batch`（1，已完成）、`IngestionRunner`/`IVenueSession` 的多交易所 type-erasure 邊界（2，**已完成並測試**——`stop()` 的 cancellation 傳播/孤兒 snapshot 排空/strand 三件事是核心難點，見第 2 項內文）、backoff 參數調校（3）、多執行緒 `io_context` 策略（4）、Binance Spot 的 `SequencePolicy`（5，**已完成**，見上——Bybit linear/spot、OKX spot/swap 則是各自獨立的擴充，見第 6/7/9 節）、Bybit/OKX 共通的 live-gap 恢復機制（8，尚未解決，見第 8/9 項）。
 
 ---
