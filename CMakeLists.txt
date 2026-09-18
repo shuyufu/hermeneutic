@@ -178,34 +178,38 @@ if(HERMENEUTIC_BUILD_SERVICE)
     target_link_libraries(hermeneutic_proto PUBLIC gRPC::grpc++ protobuf::libprotobuf)
     add_library(hermeneutic::proto ALIAS hermeneutic_proto)
 
-    # SymbolBook/AggregatorService (aggregator_service.hpp): the aggregate
-    # book plus its gRPC fan-out - genuinely depends on both book (for
-    # AggregateOrderBook) and the generated proto/gRPC types, not just a
-    # thin gRPC wrapper around ingestion.
-    add_library(hermeneutic_service INTERFACE)
-    target_link_libraries(hermeneutic_service INTERFACE hermeneutic::book hermeneutic::proto)
-    add_library(hermeneutic::service ALIAS hermeneutic_service)
-
     # venue_session.hpp/ingestion_runner.hpp: the I/O driver that feeds a
-    # venue's WebSocket stream into SymbolBook - depends on net (its own
-    # transport) *and* service (venue_session.hpp uses
-    # bobby::hermeneutic::aggregator::SymbolBook directly, a real, not
-    # incidental, dependency - see SymbolBook's grpc::ServerWriter-typed
-    # public API). This is the opposite direction from what the directory
-    # names alone might suggest: ingestion sits above service in the
-    # dependency graph, not below it.
+    # venue's WebSocket stream into a Book (SymbolRegistry<Book>) -
+    # depends on net (its own transport) and book (VenueSession only ever
+    # calls apply_snapshot/apply_batch/invalidate_venue on Book, all three
+    # on AggregateOrderBook's own surface - see venue_session.hpp's
+    # SymbolRegistry comment). No dependency on proto/gRPC at all: unlike
+    # an earlier revision, this header never mentions
+    # aggregator::SymbolBook by name.
     add_library(hermeneutic_ingestion INTERFACE)
-    target_link_libraries(hermeneutic_ingestion INTERFACE hermeneutic::net hermeneutic::service)
+    target_link_libraries(hermeneutic_ingestion INTERFACE hermeneutic::net hermeneutic::book)
     add_library(hermeneutic::ingestion ALIAS hermeneutic_ingestion)
 
+    # apps/aggregator/aggregator_service.hpp (SymbolBook/AggregatorService)
+    # is app-private, not a library header: it lives beside the one binary
+    # that owns it rather than under include/, and nothing under
+    # include/bobby/hermeneutic/ depends on it any more now that
+    # VenueSession is templated on Book instead of hardcoding SymbolBook.
+    # Its few consumers below link hermeneutic::book + hermeneutic::proto
+    # directly and add the repo root as an include directory (so its own
+    # "apps/aggregator/aggregator_service.hpp" spelling resolves) rather
+    # than reintroducing a hermeneutic::service target that would
+    # misleadingly suggest this header is part of the library.
     add_executable(hermeneutic_aggregator_service apps/aggregator/main.cpp)
+    target_include_directories(hermeneutic_aggregator_service PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(hermeneutic_aggregator_service PRIVATE
-        hermeneutic::ingestion hermeneutic::exchange hermeneutic::exchange_policy)
+        hermeneutic::ingestion hermeneutic::exchange hermeneutic::exchange_policy hermeneutic::proto)
 
     if(HERMENEUTIC_BUILD_TESTS)
-        add_executable(hermeneutic_aggregator_service_test tests/service/aggregator_service_test.cpp)
+        add_executable(hermeneutic_aggregator_service_test tests/apps/aggregator/aggregator_service_test.cpp)
+        target_include_directories(hermeneutic_aggregator_service_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(hermeneutic_aggregator_service_test PRIVATE
-            hermeneutic::service GTest::gtest_main)
+            hermeneutic::book hermeneutic::proto GTest::gtest_main)
         gtest_discover_tests(hermeneutic_aggregator_service_test)
 
         add_executable(hermeneutic_websocket_connection_test tests/net/websocket_connection_test.cpp)
@@ -218,11 +222,22 @@ if(HERMENEUTIC_BUILD_SERVICE)
             hermeneutic::net GTest::gtest_main)
         gtest_discover_tests(hermeneutic_http_client_test)
 
+        # Unlike hermeneutic_ingestion itself, this test file deliberately
+        # does reach for aggregator_service.hpp directly - several cases
+        # spin up a real grpc::Server and assert on the L2Update stream a
+        # real SymbolBook actually produces, not just VenueSession's own
+        # mechanics. A test is free to cross tiers like this; the library
+        # header it exercises (venue_session.hpp) no longer has to.
         add_executable(hermeneutic_venue_session_test tests/ingestion/venue_session_test.cpp)
+        target_include_directories(hermeneutic_venue_session_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(hermeneutic_venue_session_test PRIVATE
-            hermeneutic::ingestion hermeneutic::exchange_policy GTest::gtest_main)
+            hermeneutic::ingestion hermeneutic::exchange_policy hermeneutic::proto GTest::gtest_main)
         gtest_discover_tests(hermeneutic_venue_session_test)
 
+        # By contrast, this test never registers a book at all (see
+        # MinimalFakeFeed's comment) - it stays off proto/gRPC entirely by
+        # using plain AggregateOrderBook as its Book, proving the seam
+        # actually decouples IngestionRunner's own plumbing from SymbolBook.
         add_executable(hermeneutic_ingestion_runner_test tests/ingestion/ingestion_runner_test.cpp)
         target_link_libraries(hermeneutic_ingestion_runner_test PRIVATE
             hermeneutic::ingestion hermeneutic::exchange_policy GTest::gtest_main)

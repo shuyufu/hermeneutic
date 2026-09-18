@@ -30,7 +30,7 @@ class IVenueSession {
     virtual void stop() = 0;
 };
 
-template <typename Feed, typename Policy, typename NextLayer>
+template <typename Feed, typename Policy, typename NextLayer, typename Book>
 class VenueSessionAdapter : public IVenueSession {
   public:
     // Constructs the VenueSession in place rather than taking one by
@@ -55,7 +55,7 @@ class VenueSessionAdapter : public IVenueSession {
     void stop() override { session_.stop(); }
 
   private:
-    VenueSession<Feed, Policy, NextLayer> session_;
+    VenueSession<Feed, Policy, NextLayer, Book> session_;
 };
 
 // Owns a group of differently-typed VenueSessions and manages them
@@ -71,9 +71,9 @@ class VenueSessionAdapter : public IVenueSession {
 // See docs/ingestion_design.md 第 10 節第 2 項's 驗收標準.
 class IngestionRunner {
   public:
-    template <typename Feed, typename Policy, typename NextLayer, typename... Args>
+    template <typename Feed, typename Policy, typename NextLayer, typename Book, typename... Args>
     void add(Args&&... args) {
-        sessions_.push_back(std::make_unique<VenueSessionAdapter<Feed, Policy, NextLayer>>(
+        sessions_.push_back(std::make_unique<VenueSessionAdapter<Feed, Policy, NextLayer, Book>>(
             std::forward<Args>(args)...));
     }
 

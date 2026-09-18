@@ -29,17 +29,16 @@
 #include <variant>
 #include <vector>
 
+#include "bobby/hermeneutic/book/aggregate_order_book.hpp"
 #include "bobby/hermeneutic/book/symbol_sync.hpp"
 #include "bobby/hermeneutic/net/http_client.hpp"
 #include "bobby/hermeneutic/net/net_traits.hpp"
 #include "bobby/hermeneutic/net/websocket_connection.hpp"
-#include "bobby/hermeneutic/service/aggregator_service.hpp"
 
 namespace bobby::hermeneutic::ingestion {
 
 using bobby::hermeneutic::Side;
 using bobby::hermeneutic::VenueId;
-using bobby::hermeneutic::aggregator::SymbolBook;
 
 // Logs `e` (if non-null) as "[component] action: <what>" - the shape a
 // background coroutine's completion handler needs when an exception there
@@ -57,20 +56,35 @@ inline void log_exception(std::string_view component, std::string_view action, s
     }
 }
 
-// symbol -> SymbolBook*, built once at startup (e.g. from
+// symbol -> Book*, built once at startup (e.g. from
 // AggregatorService::book(symbol) for every symbol a VenueSession covers)
 // and never modified afterward - no dynamic add/remove.
+//
+// Templated on Book (duck-typed, like Feed/Policy below), not hardcoded to
+// aggregator::SymbolBook: VenueSession only ever calls apply_snapshot/
+// apply_batch/invalidate_venue on it (see execute_action() below), all
+// three of which AggregateOrderBook (book/aggregate_order_book.hpp,
+// zero-dependency) already provides. Hardcoding SymbolBook here would
+// force this header - and every ingestion-tier consumer, real or test -
+// to pull in aggregator_service.hpp's gRPC/protobuf dependency just to
+// route a parsed delta into a book, even though VenueSession itself never
+// touches SymbolBook's actual gRPC surface (subscribe/subscribe_bbo/
+// send_heartbeat). A production binary still supplies SymbolBook here
+// (see apps/aggregator/main.cpp) to get its gRPC fan-out; a test that
+// only cares about VenueSession's own mechanics can supply plain
+// AggregateOrderBook instead and stay off that dependency entirely.
+template <typename Book>
 class SymbolRegistry {
   public:
-    void add(SymbolId symbol, SymbolBook* book) { books_.emplace(std::move(symbol), book); }
+    void add(SymbolId symbol, Book* book) { books_.emplace(std::move(symbol), book); }
 
-    SymbolBook* book(const SymbolId& symbol) const {
+    Book* book(const SymbolId& symbol) const {
         auto it = books_.find(symbol);
         return it != books_.end() ? it->second : nullptr;
     }
 
   private:
-    std::unordered_map<SymbolId, SymbolBook*> books_;
+    std::unordered_map<SymbolId, Book*> books_;
 };
 
 // The I/O driver for one venue connection: owns a SymbolSync<Policy> per
@@ -83,11 +97,13 @@ class SymbolRegistry {
 // Templated the same way WebSocketConnection/http_get are: `NextLayer`
 // picks plain TCP (tests, against a local server) or an SSL stream
 // (production, wss://). `Feed`/`Policy` are per-exchange - see
-// docs/ingestion_design.md.
-template <typename Feed, typename Policy, typename NextLayer>
+// docs/ingestion_design.md. `Book` is the SymbolRegistry element type -
+// see SymbolRegistry's own comment for why this isn't hardcoded to
+// aggregator::SymbolBook.
+template <typename Feed, typename Policy, typename NextLayer, typename Book>
 class VenueSession {
   public:
-    VenueSession(Feed feed, VenueId venue, std::vector<SymbolId> symbols, SymbolRegistry registry,
+    VenueSession(Feed feed, VenueId venue, std::vector<SymbolId> symbols, SymbolRegistry<Book> registry,
                  net::any_io_executor executor, net::ssl::context* ssl_ctx = nullptr)
         : feed_(std::move(feed)),
           venue_(std::move(venue)),
@@ -526,7 +542,7 @@ class VenueSession {
     Feed feed_;
     VenueId venue_;
     std::vector<SymbolId> symbols_;
-    SymbolRegistry registry_;
+    SymbolRegistry<Book> registry_;
     net::ssl::context* ssl_ctx_;
     std::unordered_map<SymbolId, SymbolSync<Policy>> symbol_syncs_;
 

@@ -1,4 +1,4 @@
-#include "bobby/hermeneutic/service/aggregator_service.hpp"
+#include "apps/aggregator/aggregator_service.hpp"
 
 #include <gtest/gtest.h>
 

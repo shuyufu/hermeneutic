@@ -20,6 +20,7 @@
 #include <thread>
 #include <vector>
 
+#include "apps/aggregator/aggregator_service.hpp"
 #include "bobby/hermeneutic/exchange/binance/binance_futures_feed.hpp"
 #include "bobby/hermeneutic/exchange/binance/binance_futures_sequence_policy.hpp"
 #include "bobby/hermeneutic/exchange/binance/binance_spot_feed.hpp"
@@ -30,7 +31,6 @@
 #include "bobby/hermeneutic/exchange/okx/okx_sequence_policy.hpp"
 #include "bobby/hermeneutic/ingestion/ingestion_runner.hpp"
 #include "bobby/hermeneutic/ingestion/venue_session.hpp"
-#include "bobby/hermeneutic/service/aggregator_service.hpp"
 
 namespace {
 
@@ -199,10 +199,11 @@ int main(int argc, char** argv) {
     // takes its registry by value and moves it in, so passing the same
     // moved-from registry to a later add<>() would leave that venue's
     // SymbolRegistry::book() returning nullptr for every symbol.
-    bobby::hermeneutic::ingestion::SymbolRegistry binance_futures_registry;
-    bobby::hermeneutic::ingestion::SymbolRegistry binance_spot_registry;
-    bobby::hermeneutic::ingestion::SymbolRegistry bybit_linear_registry;
-    bobby::hermeneutic::ingestion::SymbolRegistry bybit_spot_registry;
+    using bobby::hermeneutic::aggregator::SymbolBook;
+    bobby::hermeneutic::ingestion::SymbolRegistry<SymbolBook> binance_futures_registry;
+    bobby::hermeneutic::ingestion::SymbolRegistry<SymbolBook> binance_spot_registry;
+    bobby::hermeneutic::ingestion::SymbolRegistry<SymbolBook> bybit_linear_registry;
+    bobby::hermeneutic::ingestion::SymbolRegistry<SymbolBook> bybit_spot_registry;
     for (const auto& symbol : symbols) {
         binance_futures_registry.add(symbol, service.book(symbol + ".PERP"));
         binance_spot_registry.add(symbol, service.book(symbol + ".SPOT"));
@@ -217,8 +218,8 @@ int main(int argc, char** argv) {
     // above (before any resource here existed) that every okx_symbol
     // canonicalizes to one of book_symbols, so service.book() below cannot
     // return nullptr - asserted, not re-checked with another exit path.
-    bobby::hermeneutic::ingestion::SymbolRegistry okx_spot_registry;
-    bobby::hermeneutic::ingestion::SymbolRegistry okx_swap_registry;
+    bobby::hermeneutic::ingestion::SymbolRegistry<SymbolBook> okx_spot_registry;
+    bobby::hermeneutic::ingestion::SymbolRegistry<SymbolBook> okx_swap_registry;
     std::vector<std::string> okx_spot_symbols;
     std::vector<std::string> okx_swap_symbols;
     for (const auto& okx_symbol : okx_symbols) {
@@ -238,30 +239,30 @@ int main(int argc, char** argv) {
     net::io_context io;
     bobby::hermeneutic::ingestion::IngestionRunner runner;
     runner.add<bobby::hermeneutic::ingestion::BinanceFuturesFeed, bobby::hermeneutic::BinanceFuturesSequencePolicy,
-               net::ssl::stream<boost::beast::tcp_stream>>(
+               net::ssl::stream<boost::beast::tcp_stream>, SymbolBook>(
         bobby::hermeneutic::ingestion::BinanceFuturesFeed{}, "binance_futures", symbols,
         std::move(binance_futures_registry), io.get_executor(), &ssl_ctx);
     runner.add<bobby::hermeneutic::ingestion::BinanceSpotFeed, bobby::hermeneutic::BinanceSpotSequencePolicy,
-               net::ssl::stream<boost::beast::tcp_stream>>(
+               net::ssl::stream<boost::beast::tcp_stream>, SymbolBook>(
         bobby::hermeneutic::ingestion::BinanceSpotFeed{}, "binance_spot", symbols,
         std::move(binance_spot_registry), io.get_executor(), &ssl_ctx);
     runner.add<bobby::hermeneutic::ingestion::BybitLinearFeed, bobby::hermeneutic::BybitSequencePolicy,
-               net::ssl::stream<boost::beast::tcp_stream>>(
+               net::ssl::stream<boost::beast::tcp_stream>, SymbolBook>(
         bobby::hermeneutic::ingestion::BybitLinearFeed{}, "bybit_linear", symbols,
         std::move(bybit_linear_registry), io.get_executor(), &ssl_ctx);
     runner.add<bobby::hermeneutic::ingestion::BybitSpotFeed, bobby::hermeneutic::BybitSequencePolicy,
-               net::ssl::stream<boost::beast::tcp_stream>>(
+               net::ssl::stream<boost::beast::tcp_stream>, SymbolBook>(
         bobby::hermeneutic::ingestion::BybitSpotFeed{}, "bybit_spot", symbols, std::move(bybit_spot_registry),
         io.get_executor(), &ssl_ctx);
     if (!okx_spot_symbols.empty()) {
         runner.add<bobby::hermeneutic::ingestion::OkxFeed, bobby::hermeneutic::OkxSequencePolicy,
-                   net::ssl::stream<boost::beast::tcp_stream>>(
+                   net::ssl::stream<boost::beast::tcp_stream>, SymbolBook>(
             bobby::hermeneutic::ingestion::OkxFeed{}, "okx_spot", okx_spot_symbols,
             std::move(okx_spot_registry), io.get_executor(), &ssl_ctx);
     }
     if (!okx_swap_symbols.empty()) {
         runner.add<bobby::hermeneutic::ingestion::OkxFeed, bobby::hermeneutic::OkxSequencePolicy,
-                   net::ssl::stream<boost::beast::tcp_stream>>(
+                   net::ssl::stream<boost::beast::tcp_stream>, SymbolBook>(
             bobby::hermeneutic::ingestion::OkxFeed{}, "okx_swap", okx_swap_symbols,
             std::move(okx_swap_registry), io.get_executor(), &ssl_ctx);
     }

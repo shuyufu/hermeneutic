@@ -85,6 +85,37 @@ class AggregateOrderBook {
         return {};
     }
 
+    // Applies one batch of delta changes (e.g. everything one upstream
+    // exchange message carried) through a single call, rather than one
+    // apply_delta() per level - lets a caller that wants to treat the
+    // whole batch as one atomic revision (one sequence bump, one
+    // broadcast - see aggregator::SymbolBook::apply_batch) hook that
+    // behavior onto exactly one call instead of reimplementing this same
+    // validate-then-apply shape itself. Same per-level negative-size
+    // rejection as apply_delta, checked for every level before any of
+    // them is applied, so a bad level anywhere in the batch leaves the
+    // book untouched rather than partially updated for that reason
+    // specifically (an allocation failure partway through is not rolled
+    // back - same documented limitation as apply_snapshot()).
+    std::expected<void, std::errc> apply_batch(const VenueId& venue,
+                                                std::span<const std::pair<Price, Size>> bids,
+                                                std::span<const std::pair<Price, Size>> asks) noexcept {
+        for (const auto& [price, size] : bids) {
+            if (auto check = require_non_negative_size(size); !check) return check;
+        }
+        for (const auto& [price, size] : asks) {
+            if (auto check = require_non_negative_size(size); !check) return check;
+        }
+
+        for (const auto& [price, size] : bids) {
+            if (auto result = apply_delta(venue, Side::Bid, price, size); !result) return result;
+        }
+        for (const auto& [price, size] : asks) {
+            if (auto result = apply_delta(venue, Side::Ask, price, size); !result) return result;
+        }
+        return {};
+    }
+
     const L2OrderBook& aggregate() const noexcept { return aggregate_; }
     const std::map<VenueId, L2OrderBook>& venues() const noexcept { return venues_; }
 

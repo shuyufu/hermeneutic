@@ -23,6 +23,7 @@
 #include <thread>
 #include <vector>
 
+#include "apps/aggregator/aggregator_service.hpp"
 #include "bobby/hermeneutic/aggregator/aggregator.grpc.pb.h"
 #include "bobby/hermeneutic/exchange/binance/binance_futures_sequence_policy.hpp"
 
@@ -31,6 +32,7 @@ namespace {
 
 using bobby::hermeneutic::aggregator::AggregatorService;
 using bobby::hermeneutic::aggregator::L2Update;
+using bobby::hermeneutic::aggregator::SymbolBook;
 
 std::vector<std::string_view> split(std::string_view text, char delimiter) {
     std::vector<std::string_view> fields;
@@ -280,9 +282,9 @@ TEST(VenueSessionTest, SnapshotFetchOverlapsReadingSoBufferedLiveEventBridgesIt)
                   fail_test_on_exception("http server"));
 
     FakeFeed feed(std::to_string(ws_port), std::to_string(http_port));
-    SymbolRegistry registry;
+    SymbolRegistry<SymbolBook> registry;
     registry.add("BTCUSDT", service.book("BTCUSDT"));
-    VenueSession<FakeFeed, BinanceFuturesSequencePolicy, beast::tcp_stream> session(
+    VenueSession<FakeFeed, BinanceFuturesSequencePolicy, beast::tcp_stream, SymbolBook> session(
         std::move(feed), "fake_venue", symbols, std::move(registry), io.get_executor());
     session.start(fail_test_on_exception("session"));
 
@@ -329,9 +331,9 @@ TEST(VenueSessionTest, StopAbortsBackoffWaitAndDoesNotReconnect) {
     // this test is about the backoff wait, not the snapshot path (see
     // StopDrainsInFlightSnapshotFetch below for that one).
     FakeFeed feed(std::to_string(ws_port), "1");
-    SymbolRegistry registry;
+    SymbolRegistry<SymbolBook> registry;
     registry.add("BTCUSDT", service.book("BTCUSDT"));
-    VenueSession<FakeFeed, BinanceFuturesSequencePolicy, beast::tcp_stream> session(
+    VenueSession<FakeFeed, BinanceFuturesSequencePolicy, beast::tcp_stream, SymbolBook> session(
         std::move(feed), "fake_venue", symbols, std::move(registry), io.get_executor());
 
     std::mutex mutex;
@@ -399,9 +401,9 @@ TEST(VenueSessionTest, StopDrainsInFlightSnapshotFetch) {
                   fail_test_on_exception("http server"));
 
     FakeFeed feed(std::to_string(ws_port), std::to_string(http_port));
-    SymbolRegistry registry;
+    SymbolRegistry<SymbolBook> registry;
     registry.add("BTCUSDT", service.book("BTCUSDT"));
-    VenueSession<FakeFeed, BinanceFuturesSequencePolicy, beast::tcp_stream> session(
+    VenueSession<FakeFeed, BinanceFuturesSequencePolicy, beast::tcp_stream, SymbolBook> session(
         std::move(feed), "fake_venue", symbols, std::move(registry), io.get_executor());
 
     std::mutex mutex;
@@ -469,9 +471,9 @@ TEST(VenueSessionTest, StopWhileConnectedAndReadingReturnsCleanly) {
     // No HTTP server: same reasoning as StopAbortsBackoffWaitAndDoesNotReconnect
     // above - this test is about the read/invalidate path, not snapshots.
     FakeFeed feed(std::to_string(ws_port), "1");
-    SymbolRegistry registry;
+    SymbolRegistry<SymbolBook> registry;
     registry.add("BTCUSDT", service.book("BTCUSDT"));
-    VenueSession<FakeFeed, BinanceFuturesSequencePolicy, beast::tcp_stream> session(
+    VenueSession<FakeFeed, BinanceFuturesSequencePolicy, beast::tcp_stream, SymbolBook> session(
         std::move(feed), "fake_venue", symbols, std::move(registry), io.get_executor());
 
     std::mutex mutex;
@@ -527,9 +529,9 @@ TEST(VenueSessionTest, StopBeforeStartPreventsConnecting) {
                   fail_test_on_exception("flaky ws server"));
 
     FakeFeed feed(std::to_string(ws_port), "1");
-    SymbolRegistry registry;
+    SymbolRegistry<SymbolBook> registry;
     registry.add("BTCUSDT", service.book("BTCUSDT"));
-    VenueSession<FakeFeed, BinanceFuturesSequencePolicy, beast::tcp_stream> session(
+    VenueSession<FakeFeed, BinanceFuturesSequencePolicy, beast::tcp_stream, SymbolBook> session(
         std::move(feed), "fake_venue", symbols, std::move(registry), io.get_executor());
 
     session.stop();  // before start() - this is what's under test

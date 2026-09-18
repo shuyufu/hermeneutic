@@ -18,6 +18,7 @@
 #include <thread>
 #include <vector>
 
+#include "bobby/hermeneutic/book/aggregate_order_book.hpp"
 #include "bobby/hermeneutic/exchange/binance/binance_futures_sequence_policy.hpp"
 
 namespace bobby::hermeneutic::ingestion {
@@ -108,10 +109,12 @@ TEST(IngestionRunnerTest, StopAllLetsIoContextFinishWithoutIoStop) {
     std::vector<std::string> symbols{"BTCUSDT"};
 
     IngestionRunner runner;
-    runner.add<FakeFeedA, BinanceFuturesSequencePolicy, beast::tcp_stream>(
-        FakeFeedA(std::to_string(port_a)), "venue_a", symbols, SymbolRegistry{}, io.get_executor());
-    runner.add<FakeFeedB, BinanceFuturesSequencePolicy, beast::tcp_stream>(
-        FakeFeedB(std::to_string(port_b)), "venue_b", symbols, SymbolRegistry{}, io.get_executor());
+    runner.add<FakeFeedA, BinanceFuturesSequencePolicy, beast::tcp_stream, AggregateOrderBook>(
+        FakeFeedA(std::to_string(port_a)), "venue_a", symbols, SymbolRegistry<AggregateOrderBook>{},
+        io.get_executor());
+    runner.add<FakeFeedB, BinanceFuturesSequencePolicy, beast::tcp_stream, AggregateOrderBook>(
+        FakeFeedB(std::to_string(port_b)), "venue_b", symbols, SymbolRegistry<AggregateOrderBook>{},
+        io.get_executor());
     runner.start_all();
 
     std::thread io_thread([&io] { io.run(); });

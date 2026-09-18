@@ -233,14 +233,13 @@ class SymbolBook {
             before_asks.try_emplace(price, lookup_aggregate(Side::Ask, price));
         }
 
-        for (const auto& [price, size] : bids) {
-            auto result = book_.apply_delta(venue, Side::Bid, price, size);
-            if (!result) return result;
-        }
-        for (const auto& [price, size] : asks) {
-            auto result = book_.apply_delta(venue, Side::Ask, price, size);
-            if (!result) return result;
-        }
+        // Re-validates (already checked above, but book_.apply_batch()
+        // has to hold that guarantee on its own for callers that don't
+        // pre-validate) then applies - both branches already validated
+        // this exact bids/asks above, so this can only fail on
+        // allocation, matching book_.apply_delta()'s own documented
+        // not-rolled-back-partway limitation.
+        if (auto result = book_.apply_batch(venue, bids, asks); !result) return result;
 
         std::vector<Change> changed;
         for (const auto& [price, before] : before_bids) collect_change(changed, Side::Bid, price, before);
