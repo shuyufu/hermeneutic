@@ -70,7 +70,6 @@ if(HERMENEUTIC_BUILD_TESTS)
         tests/book/volume_bands_test.cpp
         tests/book/symbol_sync_test.cpp
         tests/symbol/symbol_test.cpp
-        tests/ingestion/book_subscription_test.cpp
     )
     target_link_libraries(hermeneutic_tests PRIVATE
         hermeneutic::book hermeneutic::exchange_policy hermeneutic::symbol GTest::gtest_main)
@@ -122,6 +121,14 @@ if(HERMENEUTIC_BUILD_INGESTION)
         target_link_libraries(hermeneutic_okx_feed_test PRIVATE
             hermeneutic::exchange GTest::gtest_main)
         gtest_discover_tests(hermeneutic_okx_feed_test)
+
+        # book_subscription.hpp's JSON parsing needs simdjson, so - like the
+        # feed tests above - it's gated on HERMENEUTIC_BUILD_INGESTION rather
+        # than living in the always-built hermeneutic_tests binary.
+        add_executable(hermeneutic_book_subscription_test tests/ingestion/book_subscription_test.cpp)
+        target_link_libraries(hermeneutic_book_subscription_test PRIVATE
+            hermeneutic::exchange hermeneutic::symbol GTest::gtest_main)
+        gtest_discover_tests(hermeneutic_book_subscription_test)
     endif()
 endif()
 

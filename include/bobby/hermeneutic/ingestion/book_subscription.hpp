@@ -1,6 +1,7 @@
 #pragma once
 
-#include <cctype>
+#include <simdjson.h>
+
 #include <expected>
 #include <string>
 #include <string_view>
@@ -27,134 +28,133 @@ struct VenueSubscription {
     std::string native_symbol; // e.g. "BTC-USDT-SWAP" - what this venue's Feed subscribes with
 };
 
-namespace detail {
-
-inline std::string_view trim(std::string_view s) {
-    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.remove_prefix(1);
-    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.remove_suffix(1);
-    return s;
-}
-
-}  // namespace detail
-
-// Parses a ';'-separated list of "BASE_QUOTE.TYPE=[VENUE,VENUE,...]"
-// entries (e.g. "BTC_USDT.SPOT=[BINANCE,OKX,BYBIT];BTC_USDT.PERP=[BINANCE,OKX]")
-// into the flat list of (venue, book) pairs main() should wire up. The
-// "BASE_QUOTE"/TYPE/VENUE vocabulary itself is
-// bobby::hermeneutic::symbol's - this function only owns the CLI grammar
-// around it (the ';'/'='/'['/']'/',' punctuation), not what a symbol or a
-// venue is.
+// Parses a subscription config document, e.g.:
+//   {
+//     "books": [
+//       {"symbol": "BTC_USDT", "type": "SPOT", "venues": ["BINANCE", "OKX", "BYBIT"]},
+//       {"symbol": "BTC_USDT", "type": "PERP", "venues": ["BINANCE", "OKX"]}
+//     ]
+//   }
+// into the flat list of (venue, book) pairs main() should wire up.
+// "symbol" is this project's own "BASE_QUOTE" spelling (see
+// bobby::hermeneutic::symbol::split_base_quote) - splitting a concatenated
+// ticker like "BTCUSDT" back into base/quote is ambiguous without a
+// maintained quote-asset dictionary, so the boundary is still on whoever
+// writes the config, same as before this moved from a CLI string to a file.
 //
-// This is a real system boundary - operator-supplied command-line input -
-// so every mistake fails loud with the offending entry named, rather than
-// silently dropping a venue or guessing at one: an unknown venue token, a
-// malformed entry, a book listed twice (which would violate
-// AggregatorService's own unique-symbols precondition), an empty venue
-// list, or the same venue listed twice for one book are all rejected here
-// rather than left for an operator to notice later as missing liquidity.
+// This is a real system boundary - an operator-maintained config - so
+// every mistake fails loud with enough context to fix it: malformed JSON,
+// a missing/wrong-typed field, an unknown venue or type, a book listed
+// twice (would violate AggregatorService's own unique-symbols
+// precondition), an empty venue list, or the same venue listed twice for
+// one book are all rejected here rather than left for an operator to
+// notice later as missing liquidity.
 //
-// Leading/trailing whitespace around any token is tolerated (operators
-// format these by hand); a trailing ';' (an empty final entry) is dropped
-// the same way split_symbols() already drops a trailing ','. The
-// separators themselves ('_', '.', '=', '[', ']', ',', ';') and the
-// uppercase spelling of TYPE/VENUE are not negotiable - this is a fixed
-// grammar, not a free-form format.
+// Takes the JSON text itself, not a path - see load_book_subscriptions()
+// for the file-reading wrapper - so this stays a pure function callers
+// (tests, in particular) can exercise without touching the filesystem.
 inline std::expected<std::vector<VenueSubscription>, std::string> parse_book_subscriptions(
-    std::string_view config) {
+    std::string_view json_text) {
     std::vector<VenueSubscription> result;
     std::unordered_set<std::string> seen_book_keys;
 
-    std::size_t pos = 0;
-    while (pos <= config.size()) {
-        auto semicolon = config.find(';', pos);
-        std::string_view raw_entry = semicolon == std::string_view::npos
-                                          ? config.substr(pos)
-                                          : config.substr(pos, semicolon - pos);
-        pos = semicolon == std::string_view::npos ? config.size() + 1 : semicolon + 1;
+    try {
+        simdjson::padded_string padded(json_text);
+        simdjson::ondemand::parser parser;
+        simdjson::ondemand::document doc = parser.iterate(padded);
+        simdjson::ondemand::array books = doc["books"].get_array();
 
-        std::string_view entry = detail::trim(raw_entry);
-        if (entry.empty()) continue;
+        for (auto book_value : books) {
+            simdjson::ondemand::object book = book_value.get_object();
 
-        auto eq = entry.find('=');
-        if (eq == std::string_view::npos) {
-            return std::unexpected("malformed subscription entry (missing '='): \"" + std::string(entry) + "\"");
-        }
-
-        std::string_view left = detail::trim(entry.substr(0, eq));
-        std::string_view right = detail::trim(entry.substr(eq + 1));
-
-        auto dot = left.find('.');
-        if (dot == std::string_view::npos || left.find('.', dot + 1) != std::string_view::npos) {
-            return std::unexpected(
-                "malformed book key (expected \"BASE_QUOTE.SPOT\" or \"BASE_QUOTE.PERP\"): \"" +
-                std::string(left) + "\"");
-        }
-        std::string_view symbol_part = left.substr(0, dot);
-        std::string_view type_part = left.substr(dot + 1);
-
-        BookType type;
-        if (type_part == "SPOT") {
-            type = BookType::Spot;
-        } else if (type_part == "PERP") {
-            type = BookType::Perp;
-        } else {
-            return std::unexpected("unknown book type \"" + std::string(type_part) +
-                                    "\" (expected SPOT or PERP) in \"" + std::string(entry) + "\"");
-        }
-
-        auto symbol = bobby::hermeneutic::symbol::split_base_quote(symbol_part);
-        if (!symbol) {
-            return std::unexpected("malformed symbol (expected \"BASE_QUOTE\", e.g. \"BTC_USDT\"): \"" +
-                                    std::string(symbol_part) + "\"");
-        }
-
-        std::string key = bobby::hermeneutic::symbol::book_key(*symbol, type);
-        if (!seen_book_keys.insert(key).second) {
-            return std::unexpected("book \"" + key + "\" is configured more than once");
-        }
-
-        if (right.size() < 2 || right.front() != '[' || right.back() != ']') {
-            return std::unexpected("malformed venue list (expected \"[VENUE,...]\") for \"" + key + "\": \"" +
-                                    std::string(right) + "\"");
-        }
-        std::string_view inner = detail::trim(right.substr(1, right.size() - 2));
-        if (inner.empty()) {
-            return std::unexpected("empty venue list for \"" + key + "\"");
-        }
-
-        std::unordered_set<Venue> seen_venues;
-        std::size_t vpos = 0;
-        while (vpos <= inner.size()) {
-            auto comma = inner.find(',', vpos);
-            std::string_view raw_token = comma == std::string_view::npos ? inner.substr(vpos)
-                                                                          : inner.substr(vpos, comma - vpos);
-            vpos = comma == std::string_view::npos ? inner.size() + 1 : comma + 1;
-
-            std::string_view token = detail::trim(raw_token);
-            if (token.empty()) {
-                return std::unexpected("empty venue token in venue list for \"" + key + "\": \"" +
-                                        std::string(inner) + "\"");
+            std::string_view symbol_field;
+            std::string_view type_field;
+            simdjson::ondemand::array venues_field;
+            try {
+                symbol_field = book["symbol"].get_string();
+                type_field = book["type"].get_string();
+                venues_field = book["venues"].get_array();
+            } catch (const simdjson::simdjson_error&) {
+                return std::unexpected(
+                    "each entry in \"books\" needs a \"symbol\" (string), \"type\" (string), and "
+                    "\"venues\" (array of strings)");
             }
 
-            auto venue = bobby::hermeneutic::symbol::parse_venue(token);
-            if (!venue) {
-                return std::unexpected("unknown venue \"" + std::string(token) + "\" for \"" + key + "\"");
-            }
-            if (!seen_venues.insert(*venue).second) {
-                return std::unexpected("venue " +
-                                        std::string(bobby::hermeneutic::symbol::venue_name(*venue)) +
-                                        " listed twice for \"" + key + "\"");
+            BookType type;
+            if (type_field == "SPOT") {
+                type = BookType::Spot;
+            } else if (type_field == "PERP") {
+                type = BookType::Perp;
+            } else {
+                return std::unexpected("unknown book type \"" + std::string(type_field) +
+                                        "\" (expected SPOT or PERP) for symbol \"" + std::string(symbol_field) +
+                                        "\"");
             }
 
-            result.push_back(VenueSubscription{
-                *venue, type, key, bobby::hermeneutic::symbol::native_symbol(*venue, *symbol, type)});
+            auto symbol = bobby::hermeneutic::symbol::split_base_quote(symbol_field);
+            if (!symbol) {
+                return std::unexpected("malformed symbol (expected \"BASE_QUOTE\", e.g. \"BTC_USDT\"): \"" +
+                                        std::string(symbol_field) + "\"");
+            }
+
+            std::string key = bobby::hermeneutic::symbol::book_key(*symbol, type);
+            if (!seen_book_keys.insert(key).second) {
+                return std::unexpected("book \"" + key + "\" is configured more than once");
+            }
+
+            std::unordered_set<Venue> seen_venues;
+            bool any_venue = false;
+            for (auto venue_value : venues_field) {
+                std::string_view venue_token;
+                try {
+                    venue_token = venue_value.get_string();
+                } catch (const simdjson::simdjson_error&) {
+                    return std::unexpected("\"venues\" for \"" + key + "\" must be an array of strings");
+                }
+
+                auto venue = bobby::hermeneutic::symbol::parse_venue(venue_token);
+                if (!venue) {
+                    return std::unexpected("unknown venue \"" + std::string(venue_token) + "\" for \"" + key +
+                                            "\"");
+                }
+                if (!seen_venues.insert(*venue).second) {
+                    return std::unexpected("venue " + std::string(bobby::hermeneutic::symbol::venue_name(*venue)) +
+                                            " listed twice for \"" + key + "\"");
+                }
+
+                any_venue = true;
+                result.push_back(VenueSubscription{
+                    *venue, type, key, bobby::hermeneutic::symbol::native_symbol(*venue, *symbol, type)});
+            }
+
+            if (!any_venue) {
+                return std::unexpected("empty venue list for \"" + key + "\"");
+            }
         }
+    } catch (const simdjson::simdjson_error& e) {
+        return std::unexpected("malformed subscription config: " + std::string(e.what()));
     }
 
     if (result.empty()) {
         return std::unexpected(std::string("no book subscriptions configured"));
     }
     return result;
+}
+
+// Reads `path` and parses it as a subscription config - see
+// parse_book_subscriptions() above for the document shape and every
+// validation this applies. A missing or unreadable file is reported the
+// same way as any other configuration mistake (startup error naming the
+// path), not a crash or an empty-config fallback.
+inline std::expected<std::vector<VenueSubscription>, std::string> load_book_subscriptions(
+    std::string_view path) {
+    simdjson::padded_string json;
+    auto error = simdjson::padded_string::load(path).get(json);
+    if (error) {
+        return std::unexpected("failed to read subscription config \"" + std::string(path) +
+                                "\": " + std::string(simdjson::error_message(error)));
+    }
+    return parse_book_subscriptions(std::string_view(json));
 }
 
 }  // namespace bobby::hermeneutic::ingestion

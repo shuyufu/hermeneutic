@@ -64,24 +64,24 @@ VenueGroup* find_group(VenueGroups& groups, Venue venue, BookType type) {
 int main(int argc, char** argv) {
     std::string address = argc > 1 ? argv[1] : "0.0.0.0:50051";
 
-    // A ';'-separated list of "BASE_QUOTE.SPOT=[VENUE,...]"/
-    // "BASE_QUOTE.PERP=[VENUE,...]" entries - see
-    // bobby/hermeneutic/ingestion/book_subscription.hpp for the full
-    // grammar. Each book independently names exactly the venues that feed
+    // A required path to a JSON subscription config - see
+    // bobby/hermeneutic/ingestion/book_subscription.hpp for the document
+    // shape (apps/aggregator/subscriptions.example.json has a worked
+    // example). Each book independently names exactly the venues that feed
     // it (SPOT-book venues serve that symbol's spot market, PERP-book
     // venues its perpetual/futures/swap market - book_subscription.hpp's
     // native_symbol() enforces this by construction, there is no way to
-    // wire a venue's derivatives feed into a spot book or vice versa). The
-    // default below is the pre-config equivalent: one symbol, every venue,
-    // both books - not a hardcoded four-or-six-venue loop any more.
-    std::string config =
-        argc > 2 ? argv[2] : std::string("BTC_USDT.SPOT=[BINANCE,BYBIT,OKX];BTC_USDT.PERP=[BINANCE,BYBIT,OKX]");
-
-    auto parsed = bobby::hermeneutic::ingestion::parse_book_subscriptions(config);
+    // wire a venue's derivatives feed into a spot book or vice versa). No
+    // built-in default: unlike the CLI string this replaced, a config file
+    // is meant to be an explicit, operator-owned artifact, not a value baked
+    // into the binary that's easy to forget is even there.
+    if (argc <= 2) {
+        std::cerr << "usage: hermeneutic_aggregator_service [address] <subscription-config.json>\n";
+        return 1;
+    }
+    auto parsed = bobby::hermeneutic::ingestion::load_book_subscriptions(argv[2]);
     if (!parsed) {
-        std::cerr << "invalid subscription config: " << parsed.error()
-                  << "\nusage: hermeneutic_aggregator_service [address] "
-                     "[\"BASE_QUOTE.SPOT=[VENUE,...];BASE_QUOTE.PERP=[VENUE,...];...\"]\n";
+        std::cerr << "invalid subscription config: " << parsed.error() << '\n';
         return 1;
     }
     const std::vector<VenueSubscription>& subscriptions = *parsed;
