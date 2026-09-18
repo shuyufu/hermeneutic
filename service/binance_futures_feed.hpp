@@ -17,6 +17,7 @@
 #include "binance_wire.hpp"
 #include "bobby/hermeneutic/fixed_point.hpp"
 #include "bobby/hermeneutic/symbol_sync.hpp"
+#include "json_wire.hpp"
 
 namespace bobby::hermeneutic::ingestion {
 

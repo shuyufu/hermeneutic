@@ -1,14 +1,8 @@
 #pragma once
 
-#include <simdjson.h>
-
-#include <charconv>
 #include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
 
-#include "bobby/hermeneutic/fixed_point.hpp"
+#include "json_wire.hpp"
 
 namespace bobby::hermeneutic::ingestion {
 
@@ -26,40 +20,14 @@ struct HttpRequestSpec {
     std::string target;  // path + query, e.g. "/fapi/v1/depth?symbol=BTCUSDT&limit=1000"
 };
 
-namespace detail {
-
-// Binance sends price/quantity as JSON strings (not numbers), to avoid any
-// floating-point ambiguity in the wire format itself, on every stream this
-// project ingests (Futures and Spot alike). std::from_chars
-// (locale-independent, no exceptions of its own) parses the decimal text;
-// a malformed string throws simdjson::simdjson_error so every parse
-// failure in the feed header that calls this funnels through the same
-// catch site.
-inline double parse_decimal_string(std::string_view text) {
-    double value = 0.0;
-    auto result = std::from_chars(text.data(), text.data() + text.size(), value);
-    if (result.ec != std::errc{} || result.ptr != text.data() + text.size()) {
-        throw simdjson::simdjson_error(simdjson::NUMBER_ERROR);
-    }
-    return value;
-}
-
-inline std::pair<Price, Size> parse_level(simdjson::ondemand::array level) {
-    auto it = level.begin();
-    std::string_view price_text = (*it).get_string();
-    ++it;
-    std::string_view size_text = (*it).get_string();
-    return {Price(parse_decimal_string(price_text)), Size(parse_decimal_string(size_text))};
-}
-
-inline std::vector<std::pair<Price, Size>> parse_levels(simdjson::ondemand::array levels) {
-    std::vector<std::pair<Price, Size>> result;
-    for (auto level : levels) {
-        result.push_back(parse_level(level.get_array()));
-    }
-    return result;
-}
-
-}  // namespace detail
+// detail::parse_decimal_string/parse_level/parse_levels used to live here,
+// duplicating the identical helpers Bybit's ingestion needed (both venues
+// happen to send price/quantity as JSON strings) - two copies in the same
+// `bobby::hermeneutic::ingestion::detail` namespace, pulled into the same
+// translation unit (aggregator_main.cpp includes every Feed header), is an
+// ODR violation. Moved to the venue-neutral service/json_wire.hpp; this
+// file now only holds what's genuinely Binance-specific (HttpRequestSpec,
+// for its REST snapshot endpoint - Bybit has no REST snapshot at all, see
+// BybitLinearFeed/BybitSpotFeed's kSnapshotViaRest == false).
 
 }  // namespace bobby::hermeneutic::ingestion

@@ -135,6 +135,24 @@ TEST(SymbolSyncTest, BridgeHasNoPlusOneOffsetUnlikeSpot) {
     EXPECT_EQ(kinds_of(actions), (std::vector{Kind::RequestSnapshot}));
 }
 
+TEST(SymbolSyncTest, SnapshotWithEmptyBufferStillRetriesUnderFuturesPolicy) {
+    // kTrustsConnectionOrder == false for Futures (its snapshot is a
+    // separate REST call raced against the diff stream): an empty buffer
+    // at snapshot time is a real "nothing to bridge yet" case, not the
+    // special "this venue's snapshot IS the first message" case
+    // BybitSequencePolicy's kTrustsConnectionOrder == true handles.
+    // Must stay in Buffering and retry, exactly as before that flag
+    // existed - proves adding it didn't change Futures' behavior.
+    Sync sync;
+    sync.on_connected();
+
+    auto actions = sync.on_snapshot(make_snapshot(160));
+    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::RequestSnapshot}));
+
+    // Still Buffering: a depth update now must buffer, not apply directly.
+    EXPECT_TRUE(sync.on_depth_update(make_update(161, 165, 160)).empty());
+}
+
 TEST(SymbolSyncTest, LiveGapInvalidatesAndReBuffersTheTriggeringEvent) {
     Sync sync;
     sync.on_connected();
@@ -239,6 +257,148 @@ TEST(SymbolSyncSpotTest, ContinuityIgnoresPrevFinalIdAndUsesFirstIdInstead) {
 }
 
 }  // namespace spot
+
+// Bybit-specific tests: each one exercises a rule that differs from
+// BinanceFuturesSequencePolicy (see the mirrored Futures test named in each
+// comment) - a policy copy-pasted from Futures without actually
+// implementing Bybit's own (verified) single-update-id rules would fail
+// these. make_update()'s first_id/final_id are always equal here, matching
+// what BybitLinearFeed::parse_message actually produces (see
+// BybitSequencePolicy's doc comment).
+namespace bybit {
+
+using BybitSync = SymbolSync<BybitSequencePolicy>;
+
+TEST(SymbolSyncBybitTest, SnapshotArrivingBeforeAnyBufferedEventGoesLiveDirectly) {
+    // This is Bybit's actual message order, not a hypothetical: the
+    // snapshot is the first message VenueSession ever reads for a topic -
+    // on_depth_update() has never been called at all when on_snapshot()
+    // runs, so buffer_ is empty. Without kTrustsConnectionOrder's
+    // empty-buffer branch, this fell into the "no bridge, retry" path
+    // forever (RequestSnapshot is a no-op for a kSnapshotViaRest == false
+    // Feed - nothing would ever re-request), leaving the venue stuck in
+    // Buffering permanently. Every other SymbolSyncBybitTest in this file
+    // calls on_depth_update() before on_snapshot() (Binance's REST-race
+    // order) and so never exercised this - this is the one that would have
+    // caught it.
+    BybitSync sync;
+    sync.on_connected();
+
+    auto actions = sync.on_snapshot(make_snapshot(160));
+    ASSERT_EQ(kinds_of(actions), (std::vector{Kind::ApplySnapshot}));
+    EXPECT_TRUE(std::get<ApplySnapshot>(actions[0]).bids.empty());
+
+    // Now live with last_final_id_ == snapshot.last_update_id (160): the
+    // very next delta, exactly the shape Bybit actually sends (u == 161),
+    // must apply directly, not buffer.
+    auto live_actions =
+        sync.on_depth_update(make_update(161, 161, /*prev_final_id=*/0, {{Price(2.0), Size(2.0)}}));
+    ASSERT_EQ(kinds_of(live_actions), (std::vector{Kind::ApplyDelta}));
+    EXPECT_EQ(std::get<ApplyDelta>(live_actions[0]).bids,
+              (std::vector<std::pair<Price, Size>>{{Price(2.0), Size(2.0)}}));
+}
+
+TEST(SymbolSyncBybitTest, NonEmptyBufferThatDoesNotBridgeStillRetriesDespiteTrustingConnectionOrder) {
+    // The empty-buffer branch is deliberately narrow: a *non-empty* buffer
+    // that still doesn't bridge is not silently trusted just because this
+    // policy sets kTrustsConnectionOrder - that would mean some event
+    // arrived before the snapshot despite Bybit's ordering guarantee,
+    // which is unexpected enough to fall back to the ordinary retry path
+    // rather than being papered over.
+    BybitSync sync;
+    sync.on_connected();
+    sync.on_depth_update(make_update(165, 165, /*prev_final_id=*/0));
+
+    auto actions = sync.on_snapshot(make_snapshot(160));
+    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::RequestSnapshot}));
+}
+
+TEST(SymbolSyncBybitTest, PostGapBufferedEventIsNotDiscardedByTheEmptyBufferShortcut) {
+    // buffer_ has two push sites: the Buffering branch of on_depth_update()
+    // AND the live-gap branch (which reset()s state_/buffer_ back to
+    // Buffering, then re-buffers the very event that triggered the gap).
+    // A version of the empty-buffer shortcut that checked buffer_.empty()
+    // *after* should_drop_buffered() - or that only tracked "was anything
+    // buffered" from the first push site - would still be fooled here: it
+    // has no way to tell "genuinely nothing buffered yet" apart from "the
+    // one buffered event just hasn't been observed by this check yet",
+    // and would go live from the fresher snapshot while silently dropping
+    // the still-buffered post-gap event instead of retrying with it intact.
+    BybitSync sync;
+    sync.on_connected();
+    ASSERT_EQ(kinds_of(sync.on_snapshot(make_snapshot(100))).size(), 1u);  // live, last_final_id_ == 100
+
+    // A gap: 105 != 100+1. Resets to Buffering, re-buffers this event.
+    auto gap_actions = sync.on_depth_update(make_update(105, 105, /*prev_final_id=*/0));
+    EXPECT_EQ(kinds_of(gap_actions), (std::vector{Kind::InvalidateVenue}));
+
+    // A fresher snapshot arrives whose u+1 (161) doesn't match the
+    // buffered event's u (105) - a real gap the buffered event doesn't
+    // bridge, not the "first message ever" case. Must retry, not apply.
+    auto actions = sync.on_snapshot(make_snapshot(160));
+    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::RequestSnapshot}));
+}
+
+TEST(SymbolSyncBybitTest, DropBoundaryIsNonStrictLessThanOrEqualUnlikeFutures) {
+    // Mirrors SymbolSyncTest.DropBoundaryIsStrictLessThan, inverted: Bybit
+    // drops final_id == last_update_id (non-strict <=); Futures keeps it.
+    BybitSync sync;
+    sync.on_connected();
+    sync.on_depth_update(make_update(160, 160, /*prev_final_id=*/0));
+
+    // final_id (160) == last_update_id (160): dropped under Bybit's rule,
+    // so nothing survives to bridge - must retry, not apply.
+    auto actions = sync.on_snapshot(make_snapshot(160));
+    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::RequestSnapshot}));
+}
+
+TEST(SymbolSyncBybitTest, BridgeIsExactUPlusOneNotARange) {
+    // Unlike Futures' first_id<=last_update_id<=final_id range check, Bybit
+    // has only one id per message, so bridging is an exact u == snapshot.u+1
+    // equality - a later, non-adjacent event does not bridge even though it
+    // would satisfy Futures' range-based condition.
+    BybitSync sync;
+    sync.on_connected();
+    sync.on_depth_update(make_update(165, 165, /*prev_final_id=*/0));
+
+    // Not a match: snapshot.last_update_id+1 (161) != this event's u (165).
+    auto actions = sync.on_snapshot(make_snapshot(160));
+    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::RequestSnapshot}));
+}
+
+TEST(SymbolSyncBybitTest, ExactUPlusOneBridgesAndContinuityUsesFinalIdEquality) {
+    BybitSync sync;
+    sync.on_connected();
+    sync.on_depth_update(make_update(161, 161, /*prev_final_id=*/0, {{Price(2.0), Size(2.0)}}));
+
+    auto actions = sync.on_snapshot(make_snapshot(160));
+    ASSERT_EQ(kinds_of(actions), (std::vector{Kind::ApplySnapshot, Kind::ApplyDelta}));
+
+    // Now live with last_final_id_ == 161: the next event's u must be
+    // exactly 162 (last_applied_final_id + 1), not merely "greater than".
+    auto live_actions = sync.on_depth_update(make_update(163, 163, /*prev_final_id=*/0));
+    EXPECT_EQ(kinds_of(live_actions), (std::vector{Kind::InvalidateVenue}));  // 163 != 162: a gap
+}
+
+TEST(SymbolSyncBybitTest, ContinuityIgnoresPrevFinalIdAndFirstIdEntirely) {
+    // Proves the policy never reads prev_final_id or first_id: a live-state
+    // event whose first_id/prev_final_id are garbage must still apply,
+    // because Bybit's continuity check is final_id == last_applied+1 only -
+    // BybitLinearFeed::parse_message never sets them to anything meaningful
+    // in the first place (see its comment).
+    BybitSync sync;
+    sync.on_connected();
+    sync.on_depth_update(make_update(100, 100, /*prev_final_id=*/0));
+    ASSERT_EQ(kinds_of(sync.on_snapshot(make_snapshot(99))).size(), 2u);  // now Live, last_final_id_ == 100
+
+    constexpr std::uint64_t kGarbageFirstId = 1;
+    constexpr std::uint64_t kGarbagePrevFinalId = 999'999;
+    auto actions = sync.on_depth_update(
+        make_update(kGarbageFirstId, 101, kGarbagePrevFinalId, {{Price(9.0), Size(9.0)}}));
+    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::ApplyDelta}));
+}
+
+}  // namespace bybit
 
 }  // namespace
 }  // namespace bobby::hermeneutic

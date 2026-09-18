@@ -1,12 +1,12 @@
 # 行情 Ingestion 設計文件
 
-狀態：`SymbolBook`、`SymbolSync<SequencePolicy>`（含 `BinanceFuturesSequencePolicy`）、`BinanceFuturesFeed` 已實作並測試過（`include/bobby/hermeneutic/symbol_sync.hpp`、`service/binance_futures_feed.hpp`、對應測試共 19 個，全部 0ms）。下一步是 `VenueSession`。
+狀態：見第 11 節「下一步」的最新狀態摘要，這裡不重複維護一份會漂移的計數。
 
 本文件目的：把設計討論過程中反覆修正、目前只存在對話 scrollback 裡的決策跟理由固定下來，避免之後被 context 摘要掉、或被下一個 session 遺忘。**特別保留「曾經想錯、後來怎麼修正」的部分**，不只是最終乾淨版本——因為那些修正本身就是之後容易重蹈覆轍的地方。
 
 ## 1. 目標與範圍
 
-從多個交易所（目前做 Binance USDⓈ-M Futures + Binance Spot）訂閱多個 symbol 的 L2 order book diff，維護正確的本地 order book 狀態，餵進已經存在的 `SymbolBook`（`service/aggregator_service.hpp`，`AggregatorService::book(symbol)`）。目標是非同步、多執行緒（Boost.Asio + Beast），且核心邏輯採 **sans-io** 設計：resync/序號校驗這類最容易出錯的邏輯完全不碰 socket，可以純用假資料序列做單元測試。
+從多個交易所（目前做 Binance USDⓈ-M Futures + Binance Spot + Bybit linear/spot）訂閱多個 symbol 的 L2 order book diff，維護正確的本地 order book 狀態，餵進已經存在的 `SymbolBook`（`service/aggregator_service.hpp`，`AggregatorService::book(symbol)`）。目標是非同步、多執行緒（Boost.Asio + Beast），且核心邏輯採 **sans-io** 設計：resync/序號校驗這類最容易出錯的邏輯完全不碰 socket，可以純用假資料序列做單元測試。
 
 ## 2. 分層總覽
 
@@ -140,6 +140,11 @@ on_disconnected():
 
 ```cpp
 struct SequencePolicyConcept {
+    // true：Feed 把自己的 snapshot 當成同一條已排序 WS 連線上的第一則訊息推送
+    // （實務上等同 kSnapshotViaRest == false）；false：snapshot 走獨立 REST
+    // 呼叫，跟已經在推的 diff 串流競速。見 SymbolSync::on_snapshot() 的
+    // empty-buffer 分支——這個旗標為什麼非有不可，見第 10 節第 8 項。
+    static constexpr bool kTrustsConnectionOrder;
     static bool should_drop_buffered(const DepthUpdate&, const SnapshotMessage&);
     static bool bridges_snapshot(const DepthUpdate&, const SnapshotMessage&);
     static bool is_contiguous(const DepthUpdate&, std::uint64_t last_applied_final_id);
@@ -152,6 +157,7 @@ struct SequencePolicyConcept {
 
 ```cpp
 struct BinanceFuturesSequencePolicy {
+    static constexpr bool kTrustsConnectionOrder = false;  // snapshot 走 REST，跟 diff 串流競速
     static bool should_drop_buffered(const DepthUpdate& e, const SnapshotMessage& s) {
         return e.final_id < s.last_update_id;                                    // 步驟4：嚴格 <
     }
@@ -166,16 +172,56 @@ struct BinanceFuturesSequencePolicy {
 
 **修正記錄**：一開始套用的是 Binance **Spot** 的公式（`U == last_u+1` 連續性、`u <= lastUpdateId` 丟棄、銜接條件 `U <= lastUpdateId+1 <= u`），跟 Futures 官方文件實際內容不同——Futures 用顯式的 `pu` back-pointer 做穩態校驗、銜接條件**沒有** +1 偏移、丟棄條件是**嚴格小於**。已經用 WebFetch 直接抓官方頁面逐字核對過，見文末 Sources。**Spot 的 policy 目前不需要**（使用者明確說「目前處理U本位的就好」），之後真的要接 Spot 才需要另外設計一個 `BinanceSpotSequencePolicy`。
 
+### `BybitSequencePolicy`（Bybit linear + spot，已實作，兩個市場共用同一個 policy）
+
+Bybit v5 public orderbook stream（`bybit-exchange.github.io/docs/v5/websocket/public/orderbook`）跟連上就自動推 snapshot 這一類交易所（見下方 `TrustConnectionOrderPolicy` 草案）同樣是「連上同一條 WS 就自動推第一筆 snapshot，之後全是 diff」的模式，但**沒有直接套用那個 trivial 版本**——Bybit 實際上每則訊息都帶一個真正的序號欄位 `u`，直接丟棄這個保護等於自願放棄偵測掉包的能力。驗證分兩步，不只憑文件字面，且 linear 跟 spot 分別各驗證一次（不假設兩個市場共通）：
+
+- **文件查證**：官方文件本身**沒有寫明**顯式的缺口偵測規則，只提到「訊息中途收到 `u=1`」代表伺服器端重啟、要求前端整本重建。
+- **即時探測**：
+  - linear（2026-09-18，`wss://stream.bybit.com/v5/public/linear`，`orderbook.50.BTCUSDT`）：連續 30 則訊息裡，snapshot 之後每一則 delta 的 `u` 精確地 `+1` 遞增，完全沒有跳號；`seq`（cross sequence）則跳號幅度不固定（同一段樣本裡從 39 跳到 873），證實它是跨深度層級/topic 的新鮮度比較用欄位，不是本 topic 的連續性保證。
+  - spot（2026-09-18，`wss://stream.bybit.com/v5/public/spot`，`orderbook.50.BTCUSDT`）：同樣連續 25 則訊息，`u` 一樣精確 `+1` 遞增，`seq` 一樣跳號幅度不定（2 到 20 都有）——跟 linear 完全同一套行為，於是 `BybitSequencePolicy` 直接共用，不需要一個 `BybitSpotSequencePolicy`。這是**驗證出來的結論，不是假設**：Bybit 官方文件沒有把這個行為當成跨產品的正式保證來寫，inverse/option 完全沒驗證過，不能直接套用同一個 policy。
+
+因此選擇比文件字面更嚴格的做法，實際拿 `u` 做連續性校驗：
+
+```cpp
+struct BybitSequencePolicy {
+    static constexpr bool kTrustsConnectionOrder = true;  // 見下方修正記錄
+    static bool should_drop_buffered(const DepthUpdate& e, const SnapshotMessage& s) {
+        return e.final_id <= s.last_update_id;        // 非嚴格 <=
+    }
+    static bool bridges_snapshot(const DepthUpdate& e, const SnapshotMessage& s) {
+        return e.final_id == s.last_update_id + 1;     // 精確 +1，不是範圍
+    }
+    static bool is_contiguous(const DepthUpdate& e, std::uint64_t last_applied_final_id) {
+        return e.final_id == last_applied_final_id + 1;
+    }
+};
+```
+
+- Bybit 一則訊息只有一個 `u`，沒有 Binance 那種 `first_id`/`final_id` 範圍 + `pu` 反向指標——`DepthUpdate::first_id`/`::final_id` 兩個欄位都塞同一個 `u`（`bybit_wire.hpp::parse_bybit_orderbook_message` 明確設定），`::prev_final_id` 沒有對應欄位，明確設成 `0`，不留給未初始化狀態。
+- 文件提到的「`u=1` 代表重啟」不需要特殊處理：一旦本地已經是 live 狀態，`u=1` 不可能等於 `last_applied_final_id+1`，天然就會落到既有的 gap 處理路徑（`InvalidateVenue` + 重新 buffer），不需要另開一個分支。
+
+**修正記錄（一個真的擋掉資料流的 bug，不是紙上談兵）**：`SymbolSync::on_snapshot()` 原本的設計（第 4 節）隱含假設呼叫時 `buffer_` 一定已經有內容——這個假設對 Binance 成立（snapshot 走獨立 REST，在它抵達前，diff 串流已經先在推、已經囤了幾筆），但對 Bybit **完全不成立**：Bybit 的 snapshot 本身就是連線後讀到的第一則訊息，`on_snapshot()` 執行當下 `buffer_` 是空的。`std::find_if` 在空 range 上永遠回傳 `end()`，於是永遠落到「沒有 bridge、retry」那條路徑，回傳 `RequestSnapshot`——但這個 action 對 `kSnapshotViaRest == false` 的 Feed 是 no-op（見第 6 節），沒有人會再發一次請求，`state_` 因此永遠卡在 `Buffering`，之後每一則 delta 都被塞進 `buffer_`、不斷增長、永遠不會真的套用進 book。**Bybit venue 會安靜地對聚合 book 貢獻零筆資料**，不會有任何錯誤訊息。
+
+寫在框架設計階段的每一個 `SymbolSync`/`SymbolSyncBybitTest` 測試都是照 Binance 的 REST-race 順序（`on_depth_update()` 先於 `on_snapshot()`）驅動事件，沒有一個真的模擬過 Bybit 的實際訊息順序，所以完全沒抓到——是接上真實 `aggregator_main.cpp` 之後由一次程式碼審查（advisor）用手動追蹤程式碼流程抓出來的，不是任何自動化測試先發現的。修法是幫 `SequencePolicy` 加一個新的必要成員 `kTrustsConnectionOrder`（`BinanceFuturesSequencePolicy` 設 `false`，行為不變；`BybitSequencePolicy` 設 `true`），`on_snapshot()` 在「沒有 bridge」分支裡多一個 `if constexpr` 短路：`kTrustsConnectionOrder == true` 且**從一開始就沒有任何事件被 buffer 過**（不是「buffer 現在剛好是空的」——這兩者不同，見下一段）時，直接把 snapshot 當成起點進入 Live 狀態，不再要求先有一個 bridge 事件。
+
+**修正這個修正時又踩到的兩個坑**（都被 advisor 在寫完第一版後的複查抓到，不是一次到位）：
+1. 一開始的條件判斷式直接檢查 `buffer_.empty()`（在 `should_drop_buffered` 的 `erase_if` **之後**），沒辦法分辨「本來就沒 buffer 過任何東西」跟「buffer 過，但全部被判定成過期而丟光了」——後者是真正的 gap（有事件在 snapshot 抵達前就到了，違反 Bybit 的排序保證），不該被這個捷徑吃掉，卻會被誤判成前者而直接去套用一個丟棄了真實 buffered 事件的 snapshot。修法：在 `erase_if` **之前**先捕捉一次 `buffer_.empty()`，用這個「進入函式當下」的快照值做判斷，不是事後的值。
+2. 上面這個修法本身還有第二個漏洞：live 狀態下的 gap 分支（`on_depth_update` 裡 `is_contiguous` 失敗那條路）也會 `reset()` 後把觸發 gap 的事件塞回 `buffer_`——這是 `buffer_` 的第二個寫入點，不只 Buffering 狀態那一個。如果誤判邏輯只在意「進入函式當下 `buffer_` 是否空」，這個路徑塞進去的事件一樣會在下一次 `on_snapshot()` 被正確納入判斷（因為那時候 `buffer_` 真的非空），所以捕捉時機本身（函式入口）已經同時涵蓋兩個寫入點，不需要額外用一個獨立的 bool flag 去追蹤「Buffering 分支有沒有真的塞過東西」——若真的改用一個只在 Buffering 分支裡設定的 flag，反而會漏掉這條 live-gap 路徑，重新踩進同一個坑。三個對應的判別測試：`SnapshotArrivingBeforeAnyBufferedEventGoesLiveDirectly`（驗證修好的那個真實 bug）、`NonEmptyBufferThatDoesNotBridgeStillRetriesDespiteTrustingConnectionOrder`（驗證捷徑不會亂吃真正的 gap）、`PostGapBufferedEventIsNotDiscardedByTheEmptyBufferShortcut`（驗證第二個寫入點沒被漏掉）——都在 `tests/symbol_sync_test.cpp`。
+
+**尚未解決、刻意不在這次範圍內處理的相關限制**：live 狀態下發生 gap 時，`on_depth_update()` 只回傳 `InvalidateVenue`，並不會主動要求重新連線或重新拿 snapshot——`VenueSession::run()` 的讀取迴圈會繼續在同一條連線上等下一則訊息，但沒有任何機制會讓這個 symbol 離開 `Buffering` 狀態，除非連線真的斷線重連（重新觸發 `on_connected()`）。這是共用元件既有的限制，Binance 跟 Bybit 都受影響，不是這次改動造成的新問題——但實務嚴重程度不對稱：Binance 的 REST snapshot 理論上可以隨時再打一次（只是目前的程式碼路徑沒有這樣做），而 Bybit 文件明講「訊息中途收到 `u=1`」是伺服器端重啟的正常訊號，代表 Bybit 這邊 mid-stream 的 desync 是**預期會發生**的事件，不是罕見邊界情況，這個限制對 Bybit 的實際影響因此比對 Binance 更大。列在第 10 節第 8 項，留給之後處理。
+
 ### WS 自動推 snapshot 的交易所（例如某些非 Binance 交易所：連上就自動推第一筆 snapshot，之後全是 diff）
 
 不需要另一套骨架，`SequencePolicy` 可以是近乎 trivial 的版本：
 
 ```cpp
 struct TrustConnectionOrderPolicy {
+    static constexpr bool kTrustsConnectionOrder = true;
     static bool should_drop_buffered(const DepthUpdate&, const SnapshotMessage&) { return false; }
     static bool bridges_snapshot(const DepthUpdate&, const SnapshotMessage&) { return true; }  // 傳輸層保證順序
     static bool is_contiguous(const DepthUpdate& e, std::uint64_t last) {
-        return true;  // 或如果交易所有自己的序號欄位，比對那個
+        return true;  // 或如果交易所有自己的序號欄位，比對那個（Bybit 就是這種——見 BybitSequencePolicy）
     }
 };
 ```
@@ -208,6 +254,42 @@ class BinanceFuturesFeed {
 - **JSON 庫選擇**：使用者選 `simdjson`。原本打算跟 `grpc` 一起走 vcpkg（`find_package(simdjson CONFIG REQUIRED)`），但 simdjson 的 vcpkg port 需要系統裝 `pkg-config`，這台機器沒有 Homebrew 也沒有 pkg-config。與其安裝一整個 Homebrew（較大、較不易復原的系統變更），改用 simdjson 官方支援的 **CMake `FetchContent`**（跟這個專案已經在用的 googletest 同一招），完全不需要 vcpkg/pkg-config。新增 `HERMENEUTIC_BUILD_INGESTION` 選項（預設 `ON`，不需要 vcpkg toolchain），`hermeneutic_binance_futures_feed_test` 掛在這個選項底下，即使沒設定 `HERMENEUTIC_BUILD_SERVICE`/`VCPKG_ROOT` 也能跑。
 - 解析邏輯用 simdjson 的 on-demand API（拋例外的預設模式），在 `parse_message`/`parse_snapshot_response` 外層包 `try/catch (const simdjson::simdjson_error&)`，統一轉成 `std::errc::bad_message`——跟 `aggregate_order_book.hpp` 捕捉 `std::bad_alloc` 轉成錯誤碼是同一種既有模式。
 - Binance 用字串傳 price/quantity（避免 wire format 本身出現浮點數歧義），用 `std::from_chars`（非 locale-dependent、不拋例外）轉成 `double` 再建構 `Price`/`Size`。
+
+### `BybitLinearFeed` / `BybitSpotFeed`（已實作：`service/bybit_linear_feed.hpp`、`service/bybit_spot_feed.hpp`、共用解析邏輯在 `service/bybit_wire.hpp`）
+
+```cpp
+class BybitLinearFeed {
+  public:
+    static constexpr bool kSnapshotViaRest = false;  // snapshot 由 WS 自己推，RequestSnapshot 是 no-op
+    std::string_view ws_target() const { return "/v5/public/linear"; }
+    std::string subscribe_message(std::span<const SymbolId> symbols, int depth = 50) const;  // orderbook.{depth}.{symbol}
+    std::expected<ParsedMessage, std::errc> parse_message(std::string_view text) const;
+    // 沒有 snapshot_request()/parse_snapshot_response()：kSnapshotViaRest==false 時
+    // VenueSession 的 handle_request_snapshot() 走 if constexpr 的另一支，這兩個方法
+    // 根本不會被實例化，Feed 也就不需要提供
+};
+
+class BybitSpotFeed {
+  public:
+    static constexpr bool kSnapshotViaRest = false;
+    std::string_view ws_target() const { return "/v5/public/spot"; }  // 唯一跟 BybitLinearFeed 不同的地方
+    // subscribe_message()/parse_message() 都直接轉發給 bybit_wire.hpp 的共用函式
+};
+```
+
+**修正記錄**：
+- **wire host/port/target**：`wss://stream.bybit.com/v5/public/{linear,spot}`，訂閱格式 `{"op":"subscribe","args":["orderbook.{depth}.{symbol}"]}`（`depth` 對 linear/spot 合法值都是 1/50/200/1000，未在程式碼裡驗證，呼叫端自己保證）。
+- **`kSnapshotViaRest = false` 是這兩個 Feed 跟 Binance 系列最大的結構差異**：Bybit 把 snapshot 當成訂閱後同一條已排序 WS 連線上的第一則訊息推送，不像 Binance 得另外發一個 REST 請求去跟已經在推的 diff 串流競速。`VenueSession::handle_request_snapshot()`（`service/venue_session.hpp`）本來就用 `if constexpr (!Feed::kSnapshotViaRest)` 讓這支路徑對這種交易所直接是 no-op——這個分支之前只有 `docs/ingestion_design.md` 的 `TrustConnectionOrderPolicy` 草案提過構想，這是第一次真的用到它的 Feed（但光是這個分支 no-op 本身，還不足以讓這種 Feed 真正能動——見上一節 `BybitSequencePolicy` 的修正記錄，那才是真正卡住資料流的地方）。
+- **`parse_message` 的「有效但不相關」訊息判斷**：Bybit 的 subscribe ack（`{"success":true,"ret_msg":"","conn_id":"...","req_id":"","op":"subscribe"}`）完全沒有 `"topic"` 欄位，同一個判斷式也順便涵蓋了任何缺少 `"topic"` 的控制訊息（例如未來可能出現的 pong）；有 `"topic"` 但 `"type"` 不是 `"snapshot"`/`"delta"` 的訊息一樣回傳 `std::nullopt`（forward-compatible，不當成壞資料）。
+  - **踩到的坑**：simdjson on-demand API 是 lazy 的——`root["topic"].get_string();` 這樣把回傳值直接丟棄的寫法，實際上**不會**觸發欄位查找、也就永遠不會拋出 `NO_SUCH_FIELD`，等於這個「有沒有 topic 欄位」的判斷完全是死代碼，會一路往下走到需要 `"type"`/`"data"` 欄位存在的分支才在那裡才真正拋錯（於是原本該回 `std::nullopt` 的 subscribe ack 變成回 `std::errc::bad_message`）。修法是把回傳值實際指定給一個變數（`std::string_view topic = root["topic"].get_string();`）強制求值——這是被一個測試（`SubscribeAckHasNoTopicFieldAndIsIgnored`）抓到的，不是紙上推導出來的；Binance 的 `BinanceFuturesFeed::parse_message` 剛好一開始就是用賦值寫法（`event_type = root["e"].get_string();`），沒有踩過這個坑，純屬巧合，不是刻意的防禦。
+  - **spot 的訊息欄位順序跟 linear 不同**：spot 是 `topic`/`ts`/`type`/`data`/`cts`（`ts` 在 `type` 前面），linear 是 `topic`/`type`/`ts`/`data`/`cts`。因為用的是 simdjson 的 `operator[]`（支援跳著找、不要求依照 JSON 出現順序存取），這個差異不需要任何程式碼分支，但兩個市場都各自拿真實 payload 驗證過，不是只驗證 linear 就假設 spot 一樣能過。
+- **`DepthUpdate` 欄位映射**：Bybit 一則 delta 只有一個 `u`（沒有 Binance 的 `first_id`/`final_id` 範圍 + `pu`），`parse_bybit_orderbook_message` 把同一個值同時填進 `first_id`/`final_id`，`prev_final_id` 明確設成 `0`（理由同 `BybitSequencePolicy` 那節：不留給未初始化狀態）。
+- **`json_wire.hpp`（`service/json_wire.hpp`）**：`detail::parse_decimal_string`/`parse_level`/`parse_levels`（JSON 字串轉 `Price`/`Size`，Binance 跟 Bybit 剛好用同一套「price/quantity 用字串傳」慣例）本來要抽出來時，這個分支已經有自己的 `bybit_linear_feed.hpp` 私有定義，還不知道 Binance Spot 那次已經先在 main 上建了 `service/binance_wire.hpp` 放同一組 helper（連同 `HttpRequestSpec`）。兩邊各自獨立踩進同一個 ODR 問題、各自解了一次——rebase 到 main 上的 `binance_wire.hpp` 時才發現這個重複，兩份 `namespace ...::ingestion::detail { parse_decimal_string/... }` 進到 `aggregator_main.cpp` 同一個翻譯單元一樣會 ODR 衝突，只是這次是「我方案」跟「main 方案」互撞，不是「Binance feed」跟「Bybit feed」互撞。**合併方式**：把這組 helper 留在新的、跟交易所無關的 `service/json_wire.hpp`（`namespace ...::ingestion::detail`），`binance_wire.hpp` 瘦身成只剩 `HttpRequestSpec`（Binance 真正專屬的部分——Bybit 沒有 REST snapshot，用不到）並改成 include `json_wire.hpp`；`bybit_wire.hpp` 也直接 include `json_wire.hpp`。三個 Feed header（`binance_futures_feed.hpp`/`binance_spot_feed.hpp` 透過 `binance_wire.hpp` 間接拿到，`bybit_linear_feed.hpp`/`bybit_spot_feed.hpp` 直接 include）現在共用同一份解析邏輯，不再各自維護一份。
+- **`bybit_wire.hpp`（`service/bybit_wire.hpp`）**：加 `BybitSpotFeed` 時發現 linear/spot 的 `parse_message`/`subscribe_message` 邏輯是**逐位元組相同**（實測驗證過，不是猜的——見上一節），唯一真正不同的是 `ws_target()`。與其像 Binance Futures/Spot 那樣整份複製一份幾乎一樣的 class（那邊有 `pu` 欄位、REST 端點、limit 上限等真的不同的地方，值得分開），這裡直接把 `parse_bybit_orderbook_message`/`bybit_orderbook_subscribe_message` 兩個函式抽到 `bybit_wire.hpp`，`BybitLinearFeed`/`BybitSpotFeed` 都只剩端點常數 + 轉發呼叫，不重複維護同一段解析邏輯兩次。
+- **即時驗證**：linear 跟 spot 各自獨立驗證，過程中發現並修正了 `SymbolSync` 的真實 bug（見上一節），所以驗證分兩輪：
+  - 第一輪（`SymbolSync` bug 修好之前）：接上 `aggregator_main.cpp` 後同時跑 Binance Futures + Bybit linear 兩個 venue，訂閱 `SubscribeBbo` 收到持續變動的 book_seq/bid/ask，**但這輪其實只證明了 Binance 那條路徑在動**——兩個 venue 同時掛著時，`SubscribeBbo` 沒辦法分辨某一筆 BBO 是哪個 venue 貢獻的，而當時 Bybit 那條路徑因為 bug 實際上貢獻的是零筆資料，這輪驗證完全沒發現。這是 advisor 指出的錯誤結論，原始記錄已經改正，教訓記在這裡：**多 venue 同時掛著跑的驗證，證明不了任何單一 venue 真的有在貢獻**，要證明某個 venue 有效，必須讓它是當時唯一掛著的 venue。
+  - 第二輪（`SymbolSync` bug 修好之後，正式驗證）：`BybitLinearFeed` 跟 `BybitSpotFeed` 分別單獨掛（不接 Binance，也不同時掛兩個 Bybit 市場）跑過一次臨時的單一 venue 版本 `hermeneutic_aggregator_service`（`service/live_bybit_spot_only_server_main.cpp` 等，驗證完已刪除，不留在 repo），對 BTCUSDT 訂閱 `SubscribeBbo`，兩輪都收到 8 筆真實、持續變動的 book_seq/bid/ask（例：linear `book_seq=175 bid=77711.9@1.839 ask=77712@3.359`；spot `book_seq=217 bid=77779@1.00672 ask=77779.1@0.130993`），過程中 server log 都沒有任何 error/disconnect。這才是真正證明「這個 venue 自己的路徑真的能把資料送進聚合 book、透過真正的 gRPC 路徑送到訂閱者」的驗證。
+  - 三個 venue 同時掛著（`aggregator_main.cpp` 實際部署的樣子）沒有另外再做一次端對端驗證——三條路徑各自都已經單獨驗證過，`SymbolBook::apply_batch`/`invalidate_venue` 的 per-`VenueId` 隔離也已經在第 10 節第 2 項驗證過，沒有理由三個一起跑會表現不同，但這是一個尚未實測的假設，不是已驗證的事實，記在這裡。
 
 ## 7. `VenueSession<Feed, Policy>`（I/O driver，orchestrator，只寫一次）
 
@@ -380,20 +462,22 @@ loop:
 
    **`aggregator_main.cpp` 已接上兩個 venue**：每個 symbol 同時建 `IngestionRunner::add<BinanceFuturesFeed, BinanceFuturesSequencePolicy, ...>` 跟 `add<BinanceSpotFeed, BinanceSpotSequencePolicy, ...>`，各自一份獨立的 `SymbolRegistry`（不能共用同一份再 `std::move` 兩次——第一次 `add()` 會把 registry 整個搬空，第二個 venue 拿到的會是 moved-from 的空 map，`registry_.book(symbol)` 永遠回傳 `nullptr`）。同一個 `SymbolBook` 因此會同時收到 spot 跟 perp 兩個 `VenueId` 的貢獻，聚合後的 aggregate book 是兩個市場流動性的合併——`SymbolBook::apply_batch`/`invalidate_venue` 本來就是 per-`VenueId`、有自己的 mutex（第 10 節第 2 項已經記過這個保證），不是這次改動才需要驗證的新東西，但值得在這裡明講：現在跑起來，同一個 symbol 訂閱者看到的書面是 spot+期貨的合併結果，不是分開的兩本書。
 6. ~~正式環境的 `net::ssl::context` 建構/憑證驗證設定~~ **已完成並實測**：`aggregator_main.cpp` 接上 ingestion 後第一次真的編譯到 `net::ssl::stream<beast::tcp_stream>` 這個 template 實例化，發現漏了 `#include <boost/beast/websocket/ssl.hpp>`（Beast 對 SSL stream 的 `async_teardown` customization point 是獨立 header，沒 include 的話會在 `boost/beast/websocket/teardown.hpp` 出現 `static_assert(sizeof(Socket)==-1, "Unknown Socket type in async_teardown.")`）。修好後**實際跑起來連上 `wss://fstream.binance.com/ws` + `https://fapi.binance.com`，收到真實 BTCUSDT order book**（snapshot 1928 bids/1854 asks，diff 持續進來）。另外完成一次約 19 分鐘的即時雙 symbol（BTCUSDT、ETHUSDT，同一個 `hermeneutic_aggregator_service` process）穩定性驗證：全程只建立 1 次連線（無斷線重連），雙邊都收到真實 snapshot 並持續套用 diff（各自 diff_count 達 7500+ 才手動停止，不是自然結束），heartbeat 全程以預期節奏送達，驗證用的 log 裡沒有任何 error/disconnect 紀錄。（負責跑這個驗證的背景 agent 自己中途就停在一則「等 15 分鐘再回報」的訊息、沒有真的送出最終報告或清掉留下的兩個 process；這份紀錄是事後直接讀它留下的 log、確認狀態正常後，手動收尾補上的。）
-7. ~~`aggregator_main.cpp` 尚未接上 ingestion~~ **已完成**：見 `service/aggregator_main.cpp`——建構 `AggregatorService` 後，額外建一個 `net::ssl::context`（`tlsv12_client`，`set_default_verify_paths()` + `verify_peer`）、一個 `SymbolRegistry`（從 `service.book(symbol)` 建）、一個 `VenueSession<BinanceFuturesFeed, BinanceFuturesSequencePolicy, net::ssl::stream<beast::tcp_stream>>`，`co_spawn` 上一個獨立的 `io_context`（自己的 thread 跑 `io.run()`），跟原本的 gRPC server／heartbeat thread 並存，`server->Wait()` 回來後 `io.stop()` + join 收尾。目前寫死只接 Binance Futures 一個交易所（因為目前只實作這一個 `Feed`），之後真要多交易所需要走第 10-2 項的 `IngestionRunner`。
+7. ~~`aggregator_main.cpp` 尚未接上 ingestion~~ **已完成，現在接四個 venue**：見 `service/aggregator_main.cpp`——建構 `AggregatorService` 後，額外建一個 `net::ssl::context`（`tlsv12_client`，`set_default_verify_paths()` + `verify_peer`），透過 `IngestionRunner::add<Feed,Policy,NextLayer>()` 接上 `BinanceFuturesFeed`/`BinanceFuturesSequencePolicy`（VenueId `"binance_futures"`）、`BinanceSpotFeed`/`BinanceSpotSequencePolicy`（VenueId `"binance_spot"`）、`BybitLinearFeed`/`BybitSequencePolicy`（VenueId `"bybit_linear"`）、`BybitSpotFeed`/`BybitSequencePolicy`（VenueId `"bybit_spot"`）四個 venue，`co_spawn` 上一個獨立的 `io_context`（自己的 thread 跑 `io.run()`），跟原本的 gRPC server／heartbeat thread 並存，`server->Wait()` 回來後 `runner.stop_all()` + join 收尾。**四個獨立的 `SymbolRegistry`，不是共用一份再 `std::move` 四次**：`VenueSession` 的建構子把 `registry` 整個按值搬進去，同一份 registry 傳給後面的 `add<>()` 只會拿到 moved-from 的空 map，`registry_.book(symbol)` 永遠回 `nullptr`——每個 symbol 同時 `add()` 進四份各自獨立的 registry，都指向同一批 `service.book(symbol)`，同一個 `SymbolBook` 因此同時收四個 venue 的貢獻，聚合後是四邊流動性的合併（`SymbolBook::apply_batch`/`invalidate_venue` 本來就是 per-`VenueId`，見第 10 節第 2 項），不是分開的四本書。之後真要再加第五個交易所，一樣走 `IngestionRunner::add<>()`，不需要再動這層邏輯。
+8. **`SymbolSync` 的 live-gap 恢復機制，對 `kTrustsConnectionOrder == true` 的 venue（目前是 Bybit）比對 Binance 更需要處理**：見上方 `BybitSequencePolicy` 修正記錄的最後一段——live 狀態下發生 gap，`on_depth_update()` 只回傳 `InvalidateVenue`，並沒有機制讓這個 symbol 真正離開 `Buffering`（不像剛連線時有 `kTrustsConnectionOrder` 的捷徑可以直接從下一筆 snapshot 起步——這個捷徑生效的前提是「進入函式當下 buffer 完全沒被寫過」，live-gap 重新進入 Buffering 之後這個前提已經不成立，捷徑不會、也不該對這種情況生效，見 `PostGapBufferedEventIsNotDiscardedByTheEmptyBufferShortcut` 那個測試），除非連線真的斷線重連。Binance 的 REST 模型下這同樣是個限制，但理論上隨時可以再補一個「gap 時主動重新 `RequestSnapshot`」的機制；Bybit 文件明講「訊息中途收到 `u=1`」是伺服器端重啟的正常訊號，代表這種 mid-stream desync 對 Bybit 是**預期會發生**的事件，不是邊界情況——這個尚未解決的限制對 Bybit 的實際嚴重程度因此比對 Binance 高。尚未設計具體修法（可能方向：gap 時如果 `kTrustsConnectionOrder`，主動觸發整條連線重連，而不是留在同一條連線上乾等）。
 
 ## 11. 下一步
 
-`SymbolSync<SequencePolicy>` + `BinanceFuturesSequencePolicy`/`BinanceSpotSequencePolicy`（12 測試）、`BinanceFuturesFeed`（11 測試）、`BinanceSpotFeed`（12 測試）、`WebSocketConnection`（1 測試）、`http_get`（3 測試）、`VenueSession<Feed,Policy,NextLayer>` + `SymbolRegistry`（1 個端對端整合測試）都已完成並測試通過。**`aggregator_main.cpp` 已經接上 ingestion（第 10 節第 7 項），並且實際對 Futures（`wss://fstream.binance.com`/`https://fapi.binance.com`）跟 Spot（`wss://stream.binance.com:9443`/`https://api.binance.com`）都跑起來過，各自收到真實 BTCUSDT order book**（第 10 節第 6 項的 TLS 實際連線驗證，也在這次一併完成）。整條「真實 Binance WS/REST → resync → 套用進真實 book → 真實 gRPC 訂閱者收到正確結果」的路徑，兩個 venue 都不只是測試證明可以動，是真的連過真實交易所跑過一次。
+`SymbolSync<SequencePolicy>` + `BinanceFuturesSequencePolicy`/`BinanceSpotSequencePolicy`/`BybitSequencePolicy`（20 測試）、`BinanceFuturesFeed`（11 測試）、`BinanceSpotFeed`（12 測試）、`BybitLinearFeed`（10 測試）、`BybitSpotFeed`（8 測試）、`WebSocketConnection`（1 測試）、`http_get`（3 測試）、`VenueSession<Feed,Policy,NextLayer>` + `SymbolRegistry`（整合測試）都已完成並測試通過。**`aggregator_main.cpp` 已經接上 ingestion（第 10 節第 7 項），並且分別對 Binance Futures（`wss://fstream.binance.com`/`https://fapi.binance.com`）、Binance Spot（`wss://stream.binance.com:9443`/`https://api.binance.com`）、Bybit linear（`wss://stream.bybit.com/v5/public/linear`）、Bybit spot（`.../v5/public/spot`）各自單獨跑起來過，各自收到真實 BTCUSDT order book，Bybit 兩個 venue 也各自透過真正的 `SubscribeBbo` gRPC 路徑確認過能把資料送到訂閱者**（第 10 節第 6/7 項的 TLS/端對端驗證；四個 venue 同時掛著跑則還沒有另外驗證過，見第 6 節「即時驗證」小節最後一段的說明）。整條「真實交易所 WS/REST → resync → 套用進真實 book → 真實 gRPC 訂閱者收到正確結果」的路徑，四個 venue 都不只是測試證明可以動，是真的連過真實交易所跑過一次——但 Bybit 這兩個 venue 第一輪的「驗證」其實是無效的（見第 6 節），因為當時 `SymbolSync` 有一個會讓 Bybit 安靜貢獻零筆資料的真實 bug（見第 5 節 `BybitSequencePolicy` 的修正記錄），第二輪單獨掛 Bybit venue 重跑才是真正證明有效的那次。
 
-剩下的收尾項目（第 10 節）：`SymbolBook::apply_batch`（1，已完成）、`IngestionRunner`/`IVenueSession` 的多交易所 type-erasure 邊界（2，**已完成並測試**——`stop()` 的 cancellation 傳播/孤兒 snapshot 排空/strand 三件事是核心難點，見第 2 項內文）、backoff 參數調校（3）、多執行緒 `io_context` 策略（4）、Binance Spot 的 `SequencePolicy`（5，**已完成**，見上）。
+剩下的收尾項目（第 10 節）：`SymbolBook::apply_batch`（1，已完成）、`IngestionRunner`/`IVenueSession` 的多交易所 type-erasure 邊界（2，**已完成並測試**——`stop()` 的 cancellation 傳播/孤兒 snapshot 排空/strand 三件事是核心難點，見第 2 項內文）、backoff 參數調校（3）、多執行緒 `io_context` 策略（4）、Binance Spot 的 `SequencePolicy`（5，**已完成**，見上——Bybit linear/spot 則是另一次獨立的擴充，見第 6 節/第 7 節）、Bybit 的 live-gap 恢復機制（8，尚未解決，見第 8 項）。
 
 ---
 
-**Sources**（Binance 官方文件）：
-- [Order Book (REST /fapi/v1/depth)](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data#order-book)（2026-09-16 查證）
-- [Diff. Book Depth Streams](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public#diff-book-depth-streams)（2026-09-16 查證）
-- [How to manage a local order book correctly (USDⓈ-M Futures)](https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/How-to-manage-a-local-order-book-correctly)（2026-09-16 查證）
-- [How to manage a local order book correctly (Spot)](https://developers.binance.com/en/docs/products/spot/web-socket-streams#how-to-manage-a-local-order-book-correctly)（2026-09-18 查證）
-- [Diff. Book Depth Streams (Spot)](https://developers.binance.com/en/docs/catalog/core-trading-spot-trading/api/ws-streams/~#diff-book-depth)（2026-09-18 查證）
-- [Order Book (REST /api/v3/depth, Spot)](https://developers.binance.com/docs/binance-spot-api-docs/rest-api/market-data-endpoints)（2026-09-18 查證）
+**Sources**：
+- [Order Book (REST /fapi/v1/depth)](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data#order-book)（Binance，2026-09-16 查證）
+- [Diff. Book Depth Streams](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public#diff-book-depth-streams)（Binance，2026-09-16 查證）
+- [How to manage a local order book correctly (USDⓈ-M Futures)](https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/How-to-manage-a-local-order-book-correctly)（Binance，2026-09-16 查證）
+- [How to manage a local order book correctly (Spot)](https://developers.binance.com/en/docs/products/spot/web-socket-streams#how-to-manage-a-local-order-book-correctly)（Binance，2026-09-18 查證）
+- [Diff. Book Depth Streams (Spot)](https://developers.binance.com/en/docs/catalog/core-trading-spot-trading/api/ws-streams/~#diff-book-depth)（Binance，2026-09-18 查證）
+- [Order Book (REST /api/v3/depth, Spot)](https://developers.binance.com/docs/binance-spot-api-docs/rest-api/market-data-endpoints)（Binance，2026-09-18 查證）
+- [Orderbook (WebSocket, v5 public)](https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook)（Bybit，2026-09-18 查證，涵蓋 linear 跟 spot 兩個市場；含 WebFetch 逐字擷取跟對兩個市場各自的即時 probe，見第 5 節 `BybitSequencePolicy`）

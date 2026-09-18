@@ -66,6 +66,20 @@ if(HERMENEUTIC_BUILD_INGESTION)
         target_link_libraries(hermeneutic_binance_spot_feed_test PRIVATE
             hermeneutic simdjson GTest::gtest_main)
         gtest_discover_tests(hermeneutic_binance_spot_feed_test)
+
+        add_executable(hermeneutic_bybit_linear_feed_test tests/bybit_linear_feed_test.cpp)
+        target_include_directories(hermeneutic_bybit_linear_feed_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/service)
+        target_link_libraries(hermeneutic_bybit_linear_feed_test PRIVATE
+            hermeneutic simdjson GTest::gtest_main)
+        gtest_discover_tests(hermeneutic_bybit_linear_feed_test)
+
+        add_executable(hermeneutic_bybit_spot_feed_test tests/bybit_spot_feed_test.cpp)
+        target_include_directories(hermeneutic_bybit_spot_feed_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/service)
+        target_link_libraries(hermeneutic_bybit_spot_feed_test PRIVATE
+            hermeneutic simdjson GTest::gtest_main)
+        gtest_discover_tests(hermeneutic_bybit_spot_feed_test)
     endif()
 endif()
 

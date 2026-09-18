@@ -65,11 +65,18 @@ using SyncAction = std::variant<RequestSnapshot, ApplySnapshot, ApplyDelta, Inva
 // what makes it fully unit-testable with a scripted event sequence and no
 // real I/O.
 //
-// `SequencePolicy` supplies three static predicates that are the only
-// venue-specific part of this algorithm:
+// `SequencePolicy` supplies three static predicates plus one compile-time
+// flag - the only venue-specific part of this algorithm:
 //   - should_drop_buffered(const DepthUpdate&, const SnapshotMessage&) -> bool
 //   - bridges_snapshot(const DepthUpdate&, const SnapshotMessage&) -> bool
 //   - is_contiguous(const DepthUpdate&, std::uint64_t last_applied_final_id) -> bool
+//   - kTrustsConnectionOrder: true for a venue whose Feed pushes its own
+//     snapshot as the first message on an ordered WS connection, ahead of
+//     every diff (kSnapshotViaRest == false in practice - see
+//     venue_session.hpp); false for a venue whose snapshot arrives via a
+//     separate REST call raced against the already-flowing diff stream.
+//     Governs on_snapshot()'s empty-buffer branch below - see there for why
+//     this needs to exist at all.
 // Everything else here is venue-agnostic; see BinanceFuturesSequencePolicy
 // for the concrete USDS-M Futures predicates this was designed against.
 template <typename SequencePolicy>
@@ -109,6 +116,16 @@ class SymbolSync {
     }
 
     std::vector<SyncAction> on_snapshot(SnapshotMessage snapshot) {
+        // Captured *before* should_drop_buffered() can empty buffer_ out -
+        // "nothing was ever buffered" (this really is the first message
+        // ever seen for this symbol) and "something was buffered but every
+        // event in it got dropped as stale" both leave buffer_ empty
+        // afterward, but only the former is safe for
+        // kTrustsConnectionOrder's shortcut below to treat as "go live
+        // directly" - the latter is a real gap (something arrived despite
+        // this venue's ordering guarantee) that must still retry.
+        bool nothing_was_ever_buffered = buffer_.empty();
+
         std::erase_if(buffer_, [&snapshot](const DepthUpdate& event) {
             return SequencePolicy::should_drop_buffered(event, snapshot);
         });
@@ -118,6 +135,36 @@ class SymbolSync {
         });
 
         if (bridge == buffer_.end()) {
+            // For a venue whose Feed pushes its own snapshot as the first
+            // message on an ordered connection (SequencePolicy::
+            // kTrustsConnectionOrder), an *empty* buffer here isn't a gap -
+            // it's the expected, common case: the snapshot IS the first
+            // thing this symbol has ever seen, so there was never anything
+            // to buffer in the first place. Trust transport order and go
+            // live directly from the snapshot. A *non-empty* buffer that
+            // still doesn't bridge is still treated as a real gap below
+            // (some event arrived despite the snapshot supposedly being
+            // first - genuinely unexpected for this kind of venue, not
+            // something to silently paper over).
+            //
+            // Without this branch, a venue like this would never leave
+            // Buffering at all: kSnapshotViaRest is false for these venues
+            // (see venue_session.hpp), so the RequestSnapshot this would
+            // otherwise return is a no-op - nothing would ever re-request,
+            // and every subsequent depth update would buffer forever
+            // instead of applying. Caught by a test
+            // (SnapshotArrivingBeforeAnyBufferedEventGoesLiveDirectly) that
+            // fails without this, not found by inspection - every existing
+            // SymbolSync test drove events in Binance's REST-race order
+            // (on_depth_update() before on_snapshot()), which never
+            // exercises an empty buffer at snapshot time.
+            if constexpr (SequencePolicy::kTrustsConnectionOrder) {
+                if (nothing_was_ever_buffered) {
+                    last_final_id_ = snapshot.last_update_id;
+                    state_ = State::Live;
+                    return {ApplySnapshot{std::move(snapshot.bids), std::move(snapshot.asks)}};
+                }
+            }
             // No buffered event bridges this snapshot - either nothing
             // survived the drop filter, or everything that did starts
             // after a gap this snapshot doesn't cover. Retry: stay in
@@ -178,6 +225,13 @@ class SymbolSync {
 //   - steady state validates via the explicit `pu` back-pointer, not an
 //     assumed U == last_u+1 continuity
 struct BinanceFuturesSequencePolicy {
+    // Snapshot comes from a separate REST call raced against the
+    // already-flowing WS diff stream (kSnapshotViaRest == true) - the
+    // buffer accumulated before that REST response lands is exactly what
+    // on_snapshot()'s bridge search is for, so an empty buffer there is a
+    // real "nothing to bridge yet" case, not something to special-case.
+    static constexpr bool kTrustsConnectionOrder = false;
+
     static bool should_drop_buffered(const DepthUpdate& event, const SnapshotMessage& snapshot) {
         return event.final_id < snapshot.last_update_id;
     }
@@ -213,6 +267,12 @@ struct BinanceFuturesSequencePolicy {
 // (it would require the exchange delivering events out of order), so not
 // modeled; noted here so this isn't mistaken for an oversight.
 struct BinanceSpotSequencePolicy {
+    // Same reasoning as BinanceFuturesSequencePolicy: Spot's snapshot is
+    // also a separate REST call racing the diff stream, not pushed as the
+    // first WS message - see BybitSequencePolicy below for the venue this
+    // flag was actually added for.
+    static constexpr bool kTrustsConnectionOrder = false;
+
     static bool should_drop_buffered(const DepthUpdate& event, const SnapshotMessage& snapshot) {
         return event.final_id <= snapshot.last_update_id;
     }
@@ -223,6 +283,64 @@ struct BinanceSpotSequencePolicy {
 
     static bool is_contiguous(const DepthUpdate& event, std::uint64_t last_applied_final_id) {
         return event.first_id == last_applied_final_id + 1;
+    }
+};
+
+// Bybit v5 public orderbook stream
+// (bybit-exchange.github.io/docs/v5/websocket/public/orderbook), verified
+// two ways rather than assumed from the doc text alone: the doc itself does
+// not spell out an explicit gap-detection rule (only that receiving `u=1`
+// mid-stream signals a server-side restart, requiring a fresh local book),
+// so this project also ran a live probe against
+// wss://stream.bybit.com/v5/public/linear (orderbook.50.BTCUSDT,
+// 2026-09-18): 30 consecutive messages showed `u` incrementing by exactly 1
+// on every delta following the snapshot, with no gaps. This project chose
+// to actually enforce that stricter invariant rather than the doc's more
+// permissive framing ("transport order can be trusted") - see
+// docs/ingestion_design.md 第 5 節's TrustConnectionOrderPolicy sketch for
+// the fully-trivial version (unconditionally-true predicates) this
+// deliberately isn't, now that a real venue with its own sequence field is
+// actually being implemented:
+//   - Bybit gives one update id per message (`u`), not Binance's
+//     first_id/final_id range + `pu` back-pointer - DepthUpdate::first_id
+//     and ::final_id both carry Bybit's `u` (BybitLinearFeed::parse_message
+//     sets both), so either field reads the same value; ::prev_final_id is
+//     unused (set to 0, not left default).
+//   - `seq` ("cross sequence") is *not* a per-topic gap signal - Bybit's
+//     docs describe it as comparing freshness across different depth
+//     subscriptions of the same symbol, and it jumps by an arbitrary amount
+//     between consecutive messages on a single topic (confirmed live: jumps
+//     from 39 to 873 within the same 30-message sample) - it plays no role
+//     in this policy.
+//   - The documented "u=1 mid-stream = forced resnapshot" case needs no
+//     special-casing: once a real book is live, u=1 can never equal
+//     last_applied_final_id+1, so it already fails is_contiguous() and
+//     triggers the same InvalidateVenue + resync path as any other gap.
+//   - kTrustsConnectionOrder = true: Bybit pushes its own snapshot as the
+//     first message on this same ordered WS connection (kSnapshotViaRest ==
+//     false), so the buffer is empty when on_snapshot() first runs for a
+//     symbol - see SymbolSync::on_snapshot()'s empty-buffer branch for why
+//     this flag has to exist. Caught by a real bug, not designed in from
+//     the start: every existing SymbolSync test drove events in Binance's
+//     REST-race order (a depth update buffered before the snapshot
+//     arrives), which never exercises Bybit's actual message order and so
+//     never exposed that on_snapshot() would otherwise stay in Buffering
+//     forever - RequestSnapshot is a no-op for a kSnapshotViaRest == false
+//     Feed, so nothing would ever re-request, and the Bybit venue would
+//     silently contribute zero levels to the book.
+struct BybitSequencePolicy {
+    static constexpr bool kTrustsConnectionOrder = true;
+
+    static bool should_drop_buffered(const DepthUpdate& event, const SnapshotMessage& snapshot) {
+        return event.final_id <= snapshot.last_update_id;
+    }
+
+    static bool bridges_snapshot(const DepthUpdate& event, const SnapshotMessage& snapshot) {
+        return event.final_id == snapshot.last_update_id + 1;
+    }
+
+    static bool is_contiguous(const DepthUpdate& event, std::uint64_t last_applied_final_id) {
+        return event.final_id == last_applied_final_id + 1;
     }
 };
 

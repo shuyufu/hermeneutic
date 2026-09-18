@@ -21,6 +21,8 @@
 #include "aggregator_service.hpp"
 #include "binance_futures_feed.hpp"
 #include "binance_spot_feed.hpp"
+#include "bybit_linear_feed.hpp"
+#include "bybit_spot_feed.hpp"
 #include "ingestion_runner.hpp"
 #include "venue_session.hpp"
 
@@ -102,28 +104,34 @@ int main(int argc, char** argv) {
 
     // Ingestion: one VenueSession per venue, covering every symbol this
     // process serves, feeding the same AggregatorService the gRPC server
-    // above exposes. Binance USDS-M Futures and Binance Spot for now (see
+    // above exposes. Binance USDS-M Futures, Binance Spot, Bybit linear
+    // (USDT perpetuals), and Bybit spot for now (see
     // docs/ingestion_design.md - IngestionRunner is what any further venue
     // would go through too - see 第 10 節第 2 項). Every symbol is wired to
-    // both venues, so a given SymbolBook aggregates spot + perp liquidity
-    // under two distinct VenueIds (SymbolBook::apply_batch/invalidate_venue
-    // are per-VenueId, so this is safe - see 第 10 節第 2 項's note on
-    // multiple sessions writing the same SymbolBook*). A real TLS context,
-    // not the plain-TCP instantiation the tests use: this is the path that
-    // runs against real exchanges rather than a local test server.
+    // all four venues, so a given SymbolBook aggregates all four venues'
+    // liquidity under four distinct VenueIds
+    // (SymbolBook::apply_batch/invalidate_venue are per-VenueId, so this is
+    // safe - see 第 10 節第 2 項's note on multiple sessions writing the
+    // same SymbolBook*). A real TLS context, not the plain-TCP
+    // instantiation the tests use: this is the path that runs against real
+    // exchanges rather than a local test server.
     net::ssl::context ssl_ctx(net::ssl::context::tlsv12_client);
     ssl_ctx.set_default_verify_paths();
     ssl_ctx.set_verify_mode(net::ssl::verify_peer);
 
-    // Two independent registries, not one shared/moved: each VenueSession
+    // Four independent registries, not one shared/moved: each VenueSession
     // takes its registry by value and moves it in, so passing the same
-    // moved-from registry to a second add<>() would leave that venue's
+    // moved-from registry to a later add<>() would leave that venue's
     // SymbolRegistry::book() returning nullptr for every symbol.
-    bobby::hermeneutic::ingestion::SymbolRegistry futures_registry;
-    bobby::hermeneutic::ingestion::SymbolRegistry spot_registry;
+    bobby::hermeneutic::ingestion::SymbolRegistry binance_futures_registry;
+    bobby::hermeneutic::ingestion::SymbolRegistry binance_spot_registry;
+    bobby::hermeneutic::ingestion::SymbolRegistry bybit_linear_registry;
+    bobby::hermeneutic::ingestion::SymbolRegistry bybit_spot_registry;
     for (const auto& symbol : symbols) {
-        futures_registry.add(symbol, service.book(symbol));
-        spot_registry.add(symbol, service.book(symbol));
+        binance_futures_registry.add(symbol, service.book(symbol));
+        binance_spot_registry.add(symbol, service.book(symbol));
+        bybit_linear_registry.add(symbol, service.book(symbol));
+        bybit_spot_registry.add(symbol, service.book(symbol));
     }
 
     net::io_context io;
@@ -131,10 +139,18 @@ int main(int argc, char** argv) {
     runner.add<bobby::hermeneutic::ingestion::BinanceFuturesFeed, bobby::hermeneutic::BinanceFuturesSequencePolicy,
                net::ssl::stream<boost::beast::tcp_stream>>(
         bobby::hermeneutic::ingestion::BinanceFuturesFeed{}, "binance_futures", symbols,
-        std::move(futures_registry), io.get_executor(), &ssl_ctx);
+        std::move(binance_futures_registry), io.get_executor(), &ssl_ctx);
     runner.add<bobby::hermeneutic::ingestion::BinanceSpotFeed, bobby::hermeneutic::BinanceSpotSequencePolicy,
                net::ssl::stream<boost::beast::tcp_stream>>(
-        bobby::hermeneutic::ingestion::BinanceSpotFeed{}, "binance_spot", symbols, std::move(spot_registry),
+        bobby::hermeneutic::ingestion::BinanceSpotFeed{}, "binance_spot", symbols,
+        std::move(binance_spot_registry), io.get_executor(), &ssl_ctx);
+    runner.add<bobby::hermeneutic::ingestion::BybitLinearFeed, bobby::hermeneutic::BybitSequencePolicy,
+               net::ssl::stream<boost::beast::tcp_stream>>(
+        bobby::hermeneutic::ingestion::BybitLinearFeed{}, "bybit_linear", symbols,
+        std::move(bybit_linear_registry), io.get_executor(), &ssl_ctx);
+    runner.add<bobby::hermeneutic::ingestion::BybitSpotFeed, bobby::hermeneutic::BybitSequencePolicy,
+               net::ssl::stream<boost::beast::tcp_stream>>(
+        bobby::hermeneutic::ingestion::BybitSpotFeed{}, "bybit_spot", symbols, std::move(bybit_spot_registry),
         io.get_executor(), &ssl_ctx);
     runner.start_all();
     std::thread io_thread([&io] { io.run(); });
@@ -142,7 +158,7 @@ int main(int argc, char** argv) {
     std::cout << "hermeneutic_aggregator_service listening on " << address << " for "
               << symbols.size() << " symbol(s):";
     for (const auto& symbol : symbols) std::cout << ' ' << symbol;
-    std::cout << ", ingesting from binance_futures + binance_spot" << std::endl;
+    std::cout << ", ingesting from binance_futures + binance_spot + bybit_linear + bybit_spot" << std::endl;
     server->Wait();
 
     // No io.stop() as the primary shutdown mechanism: stop_all() aborts
