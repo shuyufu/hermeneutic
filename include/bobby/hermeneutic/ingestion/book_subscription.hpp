@@ -2,122 +2,24 @@
 
 #include <cctype>
 #include <expected>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_set>
 #include <vector>
 
+#include "bobby/hermeneutic/symbol/symbol.hpp"
+
 namespace bobby::hermeneutic::ingestion {
 
-// Which market a book covers - the suffix on a canonical book key
-// ("BTCUSDT.SPOT"/"BTCUSDT.PERP") and, transitively, which of a venue's
-// feeds native_symbol() below resolves to.
-enum class BookType { Spot, Perp };
-
-// Exchanges this project can source liquidity from. Deliberately just an
-// enum, never a Feed type: this header (and the subscription config it
-// parses) stays usable - and unit-testable - without linking simdjson or
-// gRPC at all. Adding a venue means adding a case to native_symbol()/
-// venue_id()/parse_venue() below, and separately wiring its Feed/Policy
-// into apps/aggregator/main.cpp's own dispatch.
-enum class Venue { Binance, Bybit, Okx };
-
-inline std::optional<Venue> parse_venue(std::string_view token) {
-    if (token == "BINANCE") return Venue::Binance;
-    if (token == "BYBIT") return Venue::Bybit;
-    if (token == "OKX") return Venue::Okx;
-    return std::nullopt;
-}
-
-inline std::string_view venue_name(Venue venue) {
-    switch (venue) {
-        case Venue::Binance: return "BINANCE";
-        case Venue::Bybit: return "BYBIT";
-        case Venue::Okx: return "OKX";
-    }
-    return "";  // unreachable - silences -Wreturn-type on an exhaustive switch
-}
-
-// A base/quote pair split out of the subscription config's own "BASE_QUOTE"
-// spelling - e.g. "BTC_USDT" -> {"BTC", "USDT"}. This underscore is this
-// project's own naming rule, used only by the subscription config below
-// (never by the book key it produces - see book_key()): splitting a
-// concatenated ticker like "BTCUSDT" back into base/quote is fundamentally
-// ambiguous without a maintained quote-asset dictionary (okx_feed.hpp's
-// okx_canonical() hits exactly this wall going the other direction and
-// deliberately declines to guess), so this pushes that boundary onto
-// whoever writes the config instead of guessing at it.
-struct BaseQuote {
-    std::string base;
-    std::string quote;
-};
-
-// nullopt unless `token` is exactly one non-empty base and one non-empty
-// quote separated by a single '_'.
-inline std::optional<BaseQuote> split_base_quote(std::string_view token) {
-    auto underscore = token.find('_');
-    if (underscore == std::string_view::npos || token.find('_', underscore + 1) != std::string_view::npos) {
-        return std::nullopt;
-    }
-    std::string_view base = token.substr(0, underscore);
-    std::string_view quote = token.substr(underscore + 1);
-    if (base.empty() || quote.empty()) return std::nullopt;
-    return BaseQuote{std::string(base), std::string(quote)};
-}
-
-// The canonical, venue-neutral SymbolBook key: concatenated, no
-// underscore, exactly what AggregatorService::book()/apps/aggregator/
-// main.cpp's book_symbols have always used ("BTCUSDT.SPOT"/"BTCUSDT.PERP" -
-// see okx_canonical()'s doc comment for the existing convention this
-// matches). Unaffected by this file's own "BASE_QUOTE" input spelling: a
-// gRPC client already subscribed to "BTCUSDT.PERP" keeps working with it
-// unchanged regardless of how the subscription config below is written.
-inline std::string book_key(const BaseQuote& symbol, BookType type) {
-    return symbol.base + symbol.quote + (type == BookType::Spot ? ".SPOT" : ".PERP");
-}
-
-// The VenueId string a wired-up VenueSession is tagged with - venue-native
-// vocabulary ("futures"/"linear"/"swap", each exchange's own term for its
-// derivatives market), not the venue-neutral "SPOT"/"PERP" book_key() uses.
-// Deliberately not unified with book_key()'s vocabulary: a log line or
-// SymbolBook::apply_batch's per-VenueId bookkeeping should still read the
-// way each exchange's own docs do, and book_key() only gets to stay
-// venue-agnostic because it doesn't have to pick one exchange's term as
-// "the" answer.
-inline std::string venue_id(Venue venue, BookType type) {
-    switch (venue) {
-        case Venue::Binance: return type == BookType::Spot ? "binance_spot" : "binance_futures";
-        case Venue::Bybit: return type == BookType::Spot ? "bybit_spot" : "bybit_linear";
-        case Venue::Okx: return type == BookType::Spot ? "okx_spot" : "okx_swap";
-    }
-    return "";  // unreachable - silences -Wreturn-type on an exhaustive switch
-}
-
-// The wire-format symbol a venue's own Feed subscribes with. Binance/Bybit
-// use the same concatenated spelling for both spot and their derivatives
-// market ("BTCUSDT" either way - see apps/aggregator/main.cpp's existing
-// registry-building loop, which already relies on this); OKX separates
-// base/quote with its own dash and tags a swap with "-SWAP" (see
-// okx_feed.hpp's is_swap()/okx_canonical()). This is that OKX mapping's
-// other direction, made unambiguous by construction - `symbol` already
-// carries the base/quote boundary the config token supplied, rather than
-// this having to recover it from a concatenated string the way
-// okx_canonical() explicitly declines to.
-inline std::string native_symbol(Venue venue, const BaseQuote& symbol, BookType type) {
-    switch (venue) {
-        case Venue::Binance:
-        case Venue::Bybit:
-            return symbol.base + symbol.quote;
-        case Venue::Okx:
-            return symbol.base + "-" + symbol.quote + (type == BookType::Perp ? "-SWAP" : "");
-    }
-    return "";  // unreachable - silences -Wreturn-type on an exhaustive switch
-}
+using bobby::hermeneutic::symbol::BookType;
+using bobby::hermeneutic::symbol::Venue;
 
 // One venue's contribution to one book: everything apps/aggregator/main.cpp
 // needs to add this (venue, symbol, type) triple to the right
-// SymbolRegistry and, grouped by (venue, type), to IngestionRunner.
+// SymbolRegistry and, grouped by (venue, type), to IngestionRunner. This is
+// a parsing *result*, not part of the symbol domain model itself (see
+// bobby/hermeneutic/symbol/symbol.hpp) - it exists because this ingestion
+// config, specifically, resolves a venue list into concrete subscriptions.
 struct VenueSubscription {
     Venue venue;
     BookType type;
@@ -137,7 +39,11 @@ inline std::string_view trim(std::string_view s) {
 
 // Parses a ';'-separated list of "BASE_QUOTE.TYPE=[VENUE,VENUE,...]"
 // entries (e.g. "BTC_USDT.SPOT=[BINANCE,OKX,BYBIT];BTC_USDT.PERP=[BINANCE,OKX]")
-// into the flat list of (venue, book) pairs main() should wire up.
+// into the flat list of (venue, book) pairs main() should wire up. The
+// "BASE_QUOTE"/TYPE/VENUE vocabulary itself is
+// bobby::hermeneutic::symbol's - this function only owns the CLI grammar
+// around it (the ';'/'='/'['/']'/',' punctuation), not what a symbol or a
+// venue is.
 //
 // This is a real system boundary - operator-supplied command-line input -
 // so every mistake fails loud with the offending entry named, rather than
@@ -196,13 +102,13 @@ inline std::expected<std::vector<VenueSubscription>, std::string> parse_book_sub
                                     "\" (expected SPOT or PERP) in \"" + std::string(entry) + "\"");
         }
 
-        auto symbol = split_base_quote(symbol_part);
+        auto symbol = bobby::hermeneutic::symbol::split_base_quote(symbol_part);
         if (!symbol) {
             return std::unexpected("malformed symbol (expected \"BASE_QUOTE\", e.g. \"BTC_USDT\"): \"" +
                                     std::string(symbol_part) + "\"");
         }
 
-        std::string key = book_key(*symbol, type);
+        std::string key = bobby::hermeneutic::symbol::book_key(*symbol, type);
         if (!seen_book_keys.insert(key).second) {
             return std::unexpected("book \"" + key + "\" is configured more than once");
         }
@@ -230,17 +136,18 @@ inline std::expected<std::vector<VenueSubscription>, std::string> parse_book_sub
                                         std::string(inner) + "\"");
             }
 
-            auto venue = parse_venue(token);
+            auto venue = bobby::hermeneutic::symbol::parse_venue(token);
             if (!venue) {
                 return std::unexpected("unknown venue \"" + std::string(token) + "\" for \"" + key + "\"");
             }
             if (!seen_venues.insert(*venue).second) {
-                return std::unexpected("venue " + std::string(venue_name(*venue)) + " listed twice for \"" + key +
-                                        "\"");
+                return std::unexpected("venue " +
+                                        std::string(bobby::hermeneutic::symbol::venue_name(*venue)) +
+                                        " listed twice for \"" + key + "\"");
             }
 
-            result.push_back(
-                VenueSubscription{*venue, type, key, native_symbol(*venue, *symbol, type)});
+            result.push_back(VenueSubscription{
+                *venue, type, key, bobby::hermeneutic::symbol::native_symbol(*venue, *symbol, type)});
         }
     }
 

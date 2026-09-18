@@ -32,15 +32,16 @@
 #include "bobby/hermeneutic/ingestion/book_subscription.hpp"
 #include "bobby/hermeneutic/ingestion/ingestion_runner.hpp"
 #include "bobby/hermeneutic/ingestion/venue_session.hpp"
+#include "bobby/hermeneutic/symbol/symbol.hpp"
 
 namespace {
 
 namespace net = boost::asio;
 
 using bobby::hermeneutic::aggregator::SymbolBook;
-using bobby::hermeneutic::ingestion::BookType;
-using bobby::hermeneutic::ingestion::Venue;
 using bobby::hermeneutic::ingestion::VenueSubscription;
+using bobby::hermeneutic::symbol::BookType;
+using bobby::hermeneutic::symbol::Venue;
 
 // Every (venue, book type) pair's contribution, gathered from the flat
 // VenueSubscription list into what IngestionRunner::add() actually wants:
@@ -176,28 +177,28 @@ int main(int argc, char** argv) {
     std::vector<std::string> wired_venues;
 
     if (auto* group = find_group(groups, Venue::Binance, BookType::Spot)) {
-        wired_venues.push_back(bobby::hermeneutic::ingestion::venue_id(Venue::Binance, BookType::Spot));
+        wired_venues.push_back(bobby::hermeneutic::symbol::venue_id(Venue::Binance, BookType::Spot));
         runner.add<bobby::hermeneutic::ingestion::BinanceSpotFeed, bobby::hermeneutic::BinanceSpotSequencePolicy,
                    net::ssl::stream<boost::beast::tcp_stream>, SymbolBook>(
             bobby::hermeneutic::ingestion::BinanceSpotFeed{}, wired_venues.back(), group->native_symbols,
             std::move(group->registry), io.get_executor(), &ssl_ctx);
     }
     if (auto* group = find_group(groups, Venue::Binance, BookType::Perp)) {
-        wired_venues.push_back(bobby::hermeneutic::ingestion::venue_id(Venue::Binance, BookType::Perp));
+        wired_venues.push_back(bobby::hermeneutic::symbol::venue_id(Venue::Binance, BookType::Perp));
         runner.add<bobby::hermeneutic::ingestion::BinanceFuturesFeed,
                    bobby::hermeneutic::BinanceFuturesSequencePolicy, net::ssl::stream<boost::beast::tcp_stream>,
                    SymbolBook>(bobby::hermeneutic::ingestion::BinanceFuturesFeed{}, wired_venues.back(),
                                group->native_symbols, std::move(group->registry), io.get_executor(), &ssl_ctx);
     }
     if (auto* group = find_group(groups, Venue::Bybit, BookType::Spot)) {
-        wired_venues.push_back(bobby::hermeneutic::ingestion::venue_id(Venue::Bybit, BookType::Spot));
+        wired_venues.push_back(bobby::hermeneutic::symbol::venue_id(Venue::Bybit, BookType::Spot));
         runner.add<bobby::hermeneutic::ingestion::BybitSpotFeed, bobby::hermeneutic::BybitSequencePolicy,
                    net::ssl::stream<boost::beast::tcp_stream>, SymbolBook>(
             bobby::hermeneutic::ingestion::BybitSpotFeed{}, wired_venues.back(), group->native_symbols,
             std::move(group->registry), io.get_executor(), &ssl_ctx);
     }
     if (auto* group = find_group(groups, Venue::Bybit, BookType::Perp)) {
-        wired_venues.push_back(bobby::hermeneutic::ingestion::venue_id(Venue::Bybit, BookType::Perp));
+        wired_venues.push_back(bobby::hermeneutic::symbol::venue_id(Venue::Bybit, BookType::Perp));
         runner.add<bobby::hermeneutic::ingestion::BybitLinearFeed, bobby::hermeneutic::BybitSequencePolicy,
                    net::ssl::stream<boost::beast::tcp_stream>, SymbolBook>(
             bobby::hermeneutic::ingestion::BybitLinearFeed{}, wired_venues.back(), group->native_symbols,
@@ -209,14 +210,14 @@ int main(int argc, char** argv) {
     // VenueSessions of that same Feed type, one per book type, matching
     // every other venue's shape here.
     if (auto* group = find_group(groups, Venue::Okx, BookType::Spot)) {
-        wired_venues.push_back(bobby::hermeneutic::ingestion::venue_id(Venue::Okx, BookType::Spot));
+        wired_venues.push_back(bobby::hermeneutic::symbol::venue_id(Venue::Okx, BookType::Spot));
         runner.add<bobby::hermeneutic::ingestion::OkxFeed, bobby::hermeneutic::OkxSequencePolicy,
                    net::ssl::stream<boost::beast::tcp_stream>, SymbolBook>(
             bobby::hermeneutic::ingestion::OkxFeed{}, wired_venues.back(), group->native_symbols,
             std::move(group->registry), io.get_executor(), &ssl_ctx);
     }
     if (auto* group = find_group(groups, Venue::Okx, BookType::Perp)) {
-        wired_venues.push_back(bobby::hermeneutic::ingestion::venue_id(Venue::Okx, BookType::Perp));
+        wired_venues.push_back(bobby::hermeneutic::symbol::venue_id(Venue::Okx, BookType::Perp));
         runner.add<bobby::hermeneutic::ingestion::OkxFeed, bobby::hermeneutic::OkxSequencePolicy,
                    net::ssl::stream<boost::beast::tcp_stream>, SymbolBook>(
             bobby::hermeneutic::ingestion::OkxFeed{}, wired_venues.back(), group->native_symbols,

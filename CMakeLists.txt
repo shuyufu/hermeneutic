@@ -24,6 +24,17 @@ add_library(hermeneutic_book INTERFACE)
 target_link_libraries(hermeneutic_book INTERFACE hermeneutic::core)
 add_library(hermeneutic::book ALIAS hermeneutic_book)
 
+# This project's own symbol/venue naming rules (BASE_QUOTE splitting, book
+# keys, per-venue native symbol formats - see symbol.hpp's own class
+# comment): zero dependency beyond the standard library, so any future
+# consumer beyond apps/aggregator/main.cpp's ingestion config - a client
+# config, a REST surface - can depend on this alone. Links hermeneutic::core
+# purely for the include/ root, the same as hermeneutic_net does below -
+# not a real dependency on anything core actually defines.
+add_library(hermeneutic_symbol INTERFACE)
+target_link_libraries(hermeneutic_symbol INTERFACE hermeneutic::core)
+add_library(hermeneutic::symbol ALIAS hermeneutic_symbol)
+
 # The per-venue *SequencePolicy structs (exchange/<venue>/*_sequence_policy.hpp)
 # are deliberately split out from their venue's Feed header: a Policy only
 # needs SymbolSync's own DepthUpdate/SnapshotMessage types, never simdjson,
@@ -58,10 +69,11 @@ if(HERMENEUTIC_BUILD_TESTS)
         tests/book/price_bands_test.cpp
         tests/book/volume_bands_test.cpp
         tests/book/symbol_sync_test.cpp
+        tests/symbol/symbol_test.cpp
         tests/ingestion/book_subscription_test.cpp
     )
     target_link_libraries(hermeneutic_tests PRIVATE
-        hermeneutic::book hermeneutic::exchange_policy GTest::gtest_main)
+        hermeneutic::book hermeneutic::exchange_policy hermeneutic::symbol GTest::gtest_main)
     gtest_discover_tests(hermeneutic_tests)
 endif()
 
@@ -204,7 +216,8 @@ if(HERMENEUTIC_BUILD_SERVICE)
     add_executable(hermeneutic_aggregator_service apps/aggregator/main.cpp)
     target_include_directories(hermeneutic_aggregator_service PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(hermeneutic_aggregator_service PRIVATE
-        hermeneutic::ingestion hermeneutic::exchange hermeneutic::exchange_policy hermeneutic::proto)
+        hermeneutic::ingestion hermeneutic::exchange hermeneutic::exchange_policy hermeneutic::symbol
+        hermeneutic::proto)
 
     if(HERMENEUTIC_BUILD_TESTS)
         add_executable(hermeneutic_aggregator_service_test tests/apps/aggregator/aggregator_service_test.cpp)
