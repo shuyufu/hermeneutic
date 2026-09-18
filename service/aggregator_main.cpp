@@ -55,7 +55,20 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    bobby::hermeneutic::aggregator::AggregatorService service(symbols);
+    // AggregatorService's book set is keyed by ".PERP"/".SPOT"-suffixed
+    // canonical symbols, not the bare "BTCUSDT" `symbols` themselves -
+    // perp and spot liquidity for the same base pair are kept in two
+    // independent SymbolBooks, not merged into one keyed by the bare
+    // symbol the way an earlier revision of this file did. A client that
+    // wants BTCUSDT's perpetual book now subscribes to "BTCUSDT.PERP", not
+    // "BTCUSDT" - see docs/ingestion_design.md's OKX section for the reasoning.
+    std::vector<std::string> book_symbols;
+    book_symbols.reserve(symbols.size() * 2);
+    for (const auto& symbol : symbols) {
+        book_symbols.push_back(symbol + ".PERP");
+        book_symbols.push_back(symbol + ".SPOT");
+    }
+    bobby::hermeneutic::aggregator::AggregatorService service(book_symbols);
 
     grpc::ServerBuilder builder;
     builder.AddListeningPort(address, grpc::InsecureServerCredentials());
@@ -107,14 +120,16 @@ int main(int argc, char** argv) {
     // above exposes. Binance USDS-M Futures, Binance Spot, Bybit linear
     // (USDT perpetuals), and Bybit spot for now (see
     // docs/ingestion_design.md - IngestionRunner is what any further venue
-    // would go through too - see 第 10 節第 2 項). Every symbol is wired to
-    // all four venues, so a given SymbolBook aggregates all four venues'
-    // liquidity under four distinct VenueIds
+    // would go through too - see 第 10 節第 2 項). The two perp/futures
+    // venues write into the ".PERP" book, the two spot venues into the
+    // ".SPOT" book - two independent SymbolBooks per base symbol, each
+    // aggregating two venues' liquidity under distinct VenueIds
     // (SymbolBook::apply_batch/invalidate_venue are per-VenueId, so this is
     // safe - see 第 10 節第 2 項's note on multiple sessions writing the
-    // same SymbolBook*). A real TLS context, not the plain-TCP
-    // instantiation the tests use: this is the path that runs against real
-    // exchanges rather than a local test server.
+    // same SymbolBook*), not all four venues sharing one book the way an
+    // earlier revision of this file did. A real TLS context, not the
+    // plain-TCP instantiation the tests use: this is the path that runs
+    // against real exchanges rather than a local test server.
     net::ssl::context ssl_ctx(net::ssl::context::tlsv12_client);
     ssl_ctx.set_default_verify_paths();
     ssl_ctx.set_verify_mode(net::ssl::verify_peer);
@@ -128,10 +143,10 @@ int main(int argc, char** argv) {
     bobby::hermeneutic::ingestion::SymbolRegistry bybit_linear_registry;
     bobby::hermeneutic::ingestion::SymbolRegistry bybit_spot_registry;
     for (const auto& symbol : symbols) {
-        binance_futures_registry.add(symbol, service.book(symbol));
-        binance_spot_registry.add(symbol, service.book(symbol));
-        bybit_linear_registry.add(symbol, service.book(symbol));
-        bybit_spot_registry.add(symbol, service.book(symbol));
+        binance_futures_registry.add(symbol, service.book(symbol + ".PERP"));
+        binance_spot_registry.add(symbol, service.book(symbol + ".SPOT"));
+        bybit_linear_registry.add(symbol, service.book(symbol + ".PERP"));
+        bybit_spot_registry.add(symbol, service.book(symbol + ".SPOT"));
     }
 
     net::io_context io;
