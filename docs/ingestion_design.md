@@ -264,9 +264,107 @@ loop:
 ## 10. 尚未定案 / 待做事項
 
 1. ~~`SymbolBook::apply_batch`~~ **已完成**：一次呼叫套用整批 bid/ask 變化，只 bump 一次 `seq_`、只 broadcast 一次，跟 `apply_snapshot` 一樣的「先驗證全部 level、再套用」模式（負數 size 任一 level 有錯，整批都不套用）。診斷結果的 bids/asks 順序沿用 `capture_snapshot_before` 的做法（用跟 aggregate map 相同的 comparator 建中繼 map），維持「diff 順序跟 snapshot 順序一致」這條既有的協定保證，不是照輸入順序原樣印出。`VenueSession::execute_action` 處理 `ApplyDelta` 這個 action 時已經改成呼叫這個新方法（`service/venue_session.hpp`），不再對 bids/asks 各自逐筆呼叫 `apply_delta`。新增 3 個測試（一次 seq bump、跨 venue 正確加總、負數 size 整批拒絕且不 broadcast）。
-2. **`IngestionRunner`/`IVenueConnection` 的 type-erasure 邊界**：多交易所、多 `VenueSession` 具體型別的統一生命週期管理層，尚未設計。
+2. ~~`IngestionRunner`/`IVenueSession` 的 type-erasure 邊界~~ **已完成**：`service/ingestion_runner.hpp`（`IVenueSession`、`VenueSessionAdapter<Feed,Policy,NextLayer>`、`IngestionRunner`）+ `VenueSession` 本身加上 strand/cancellation/`stop()`（`service/venue_session.hpp`）。測試：`tests/venue_session_test.cpp` 的 `StopAbortsBackoffWaitAndDoesNotReconnect`/`StopDrainsInFlightSnapshotFetch`，`tests/ingestion_runner_test.cpp` 的 `StopAllLetsIoContextFinishWithoutIoStop`。`aggregator_main.cpp` 已改用 `IngestionRunner`。細節與過程中修正記錄如下。
+
+   **命名**：介面叫 `IVenueSession`，不是 `IVenueConnection`——第 7 節已經把 `VenueConnection` 改名成 `VenueSession`，理由是「connection 容易誤會成 transport 層」，同一個理由適用在這裡。
+
+   **type erasure 的邊界為什麼很薄**：`VenueSession<Feed,Policy,NextLayer>::start()`/`stop()` 不管 `Feed`/`Policy`/`NextLayer` 是什麼組合，簽名永遠一樣（都是 `void`，不帶 template 參數）。所以完全不需要抹掉 `Feed`/`Policy` 本身（`SymbolSync`/`VenueFeed` 那層邏輯繼續是純 template，不付虛擬呼叫成本）——只需要抹掉「持有一個 `VenueSession<...>` 並呼叫它 `start()`/`stop()`」這件事：
+
+   ```cpp
+   class IVenueSession {
+     public:
+       virtual ~IVenueSession() = default;
+       virtual void start() = 0;  // VenueSession::start() 的轉發；executor 已經在建構時定案（見下），這裡不用再傳
+       virtual void stop() = 0;   // VenueSession::stop() 的轉發
+   };
+
+   template <typename Feed, typename Policy, typename NextLayer>
+   class VenueSessionAdapter : public IVenueSession {
+     public:
+       template <typename... Args>
+       explicit VenueSessionAdapter(Args&&... args) : session_(std::forward<Args>(args)...) {}
+       void start() override { session_.start(/* 記錄 venue label 的 lambda，見 ingestion_runner.hpp */); }
+       void stop() override { session_.stop(); }
+     private:
+       VenueSession<Feed, Policy, NextLayer> session_;
+   };
+   ```
+
+   **跟提案時的差異：`sig_`/`stopping_`/`pending_snapshots_` 都留在 `VenueSession` 上，不是 adapter**。提案階段本來想放在 adapter，實作時發現這些狀態（尤其是 cancellation signal）本來就得跟 `run()`/`handle_request_snapshot()` 的 spawn 點放在一起才管用，硬放在 adapter 只會多一層轉發。`IVenueSession::start()` 因此也不帶 `net::any_io_executor` 參數——`VenueSession` 建構時就需要一個 executor 來建 `strand_`（見下），所以乾脆讓建構子收下它，`start()`/`stop()` 都不用再傳。
+
+   **考慮過但否決：用 `std::variant<VenueSessionAdapter<Binance...>, VenueSessionAdapter<Okx...>, ...>` 或手刻 function-pointer vtable 取代 `virtual`**。否決理由：`start()`/`stop()` 一個 process 生命週期裡每個 venue 只各呼叫一次（五個 venue 就是十次 virtual call，一次性成本），真正的高頻路徑（`parse_message` → `SymbolSync` → `apply_batch`）完全不經過 `IVenueSession`，還是在 `VenueSession<Feed,Policy,NextLayer>` 內部單型化，虛擬呼叫成本從沒發生在這條路徑上——第 7 節講的「`SymbolSync`/`VenueSession` 本體不付虛擬呼叫成本」原則,守住的正是這裡,不是「全專案禁用 virtual」。`std::variant` 版本還會直接違背這一項自己定的 factory seam（把具體 template 參數留在該交易所自己的 `.cpp`、不外洩到 `aggregator_main.cpp`）——variant 宣告本身就得列出每個 venue 的具體 `Feed`/`Policy`/`NextLayer`，等於逼 `aggregator_main.cpp` 看到所有 venue 的 Beast/simdjson template 實例化。手刻 vtable 則是編譯器已經幫 virtual 做的事，自己重做一遍、還得手動管生命週期（自訂 deleter），拿不到任何好處。維持 `virtual`。
+
+   **儲存方式：`vector<unique_ptr<IVenueSession>>`，adapter 內就地建構 `session_`，不是 `vector<Adapter>`**。`run()` 的 coroutine frame 會捕捉 `this`，一旦 spawn 出去，`session_` 就再也不能被搬動——`vector<Adapter>` 重新配置會讓已經在跑的 coroutine 手上的 `this` 直接懸空。用 `unique_ptr` 讓 adapter 物件位址穩定即可，完全不需要在意 `VenueSession<Feed,Policy,NextLayer>` 本身是否 movable（已查證過它是安全 implicitly movable，但這裡刻意選一個不依賴這件事的設計）。
+
+   **`stop()` 是這一項真正要解決的問題，不是裝飾**。`run()` 原本是 `while(true)` 迴圈、完全沒有取消機制；`aggregator_main.cpp` 原本靠 `io.stop()` 把整個 `io_context` 連同所有 pending handler 一起粗暴丟掉，不是優雅關閉。做到「呼叫 `stop()` 之後乾淨結束、不留 in-flight 的 HTTP fetch/WS 讀取」，靠的是下面四件事，缺一個都不算數：
+
+   1. **`net::cancellation_signal run_sig_` + `stopping_` flag，兩個都要，因為取消不會回溯**。單純 emit 一個 signal 還不夠：`stop()` emit 之後，正在等的 `connection.read()` 會丟 `operation_aborted`，被 `run()` 既有的 `catch (const std::exception&)` 當成普通斷線吞掉 → `disconnected = true` → invalidate 全部 symbol → `co_await backoff(1)`——這個 timer 如果沒被同一次 emit 波及，會乖乖等滿一輪 backoff 再重連。修法：`stopping_` 在 catch 區塊之後、`backoff` 之前檢查一次，是的話直接跳出迴圈；`backoff()` 本身也包一層 `try/catch`，因為 stop 剛好落在 backoff 等待期間時，是這個 timer（不是 read）被取消，若不接住會直接逃出 `run()`、跳過後面的 snapshot 排空。兩個檢查點（disconnected 處理後、backoff 之後）各一次，涵蓋所有回到迴圈頂端的路徑。
+      另外，`stop()` 不能從呼叫端執行緒直接 `run_sig_.emit(...)`——`run()` 跑在 io thread 上，`cancellation_signal::emit` 對它正在取消的操作不是執行緒安全的。要 `net::post(strand_, [this]{ stopping_ = true; run_sig_.emit(net::cancellation_type::terminal); ... })`，這樣也不需要把 `stopping_` 弄成 `std::atomic`。
+      **已用 spike 驗證（`clang++ -std=c++20`，直接連 vcpkg 裝的 Boost 1.92 標頭，不經過專案的 CMake）**：`beast::websocket::stream::async_read`／`steady_timer::async_wait` 確實支援 per-op cancellation，`net::post` 到執行 io_context 那個執行緒後再 `emit(terminal)`，兩者都如預期拋出 `operation_aborted`。
+
+   2. **孤兒 `handle_request_snapshot` 的生命週期**：`net::co_spawn` 出去的這個 coroutine，恢復執行時會摸 `symbol_syncs_`、呼叫 `execute_actions`——一旦 runner 可以銷毀 session，關閉當下如果剛好有一個 snapshot fetch 還在飛，這就是第 7 節坑 2 記錄過的同一種 use-after-free，只是換一個時機重演。修法：每次 spawn 把一個 `net::cancellation_signal` 插進 `snapshot_sigs_`（`std::list<net::cancellation_signal>`），`run()` 收尾前用 `drain_pending_snapshots()` 等 `snapshot_sigs_.empty()` 才真正 `co_return`——沒有另外配一個計數器，`std::list` 的 empty() 本身就是唯一真相；一開始確實加了一個 `pending_snapshots_` int 跟著 spawn/completion handler 各自 `+1`/`-1`，程式碼審查點出這是跟 `snapshot_sigs_` 在同兩個地方同步變化的重複狀態，拿掉了。
+      **實作時發現、提案階段沒設計到的坑**：每個 in-flight 的 snapshot fetch 要有**自己的** `net::cancellation_signal`，不能共用 `run_sig_`——一個 `cancellation_slot` 只會轉發給最近一次綁定的操作，如果多個 fetch（不同 symbol 各自 gap 一次）都綁同一個 signal 的 slot，後綁的會偷走先綁的登記，等於讓 `run()` 自己的 cancellation 註冊被悄悄頂替掉。改成 `std::list<net::cancellation_signal> snapshot_sigs_`（`std::list` 保證插入/刪除其他元素時既有的 iterator/reference 不失效，用來讓每個 fetch 的 completion handler 捕捉自己的 iterator、完成時自行 `erase` 自己），每次 spawn 各配一個。
+      **`stop()` 對 `snapshot_sigs_` 逐一 `emit()` 時，遍歷期間不能讓任何節點被刪掉**：`emit()` 可能同步地直接把被取消的操作 resume 到完成（WS read/timer 已實測是這樣，`http_get` 這條 resolve/connect/read 的鏈沒特別驗證過，但不能排除），如果某個 fetch 剛好在 `emit()` 呼叫當下就跑完、它的 completion handler 把自己那個節點從 `snapshot_sigs_` 裡 `erase` 掉，用 range-for 的話，內部藏著的 iterator 這時候就指向一個剛被刪掉的節點，再往後走是未定義行為。第一版修法是手寫迴圈、`emit()` 之前先把 `std::next(it)` 存起來——但 `next` 指向的是**另一個**節點，如果 reentrant 地被刪掉的剛好是 `next` 指向的那個（例如兩個 symbol 同時 gap、各自的 fetch 都在飛），存起來的 `next` 一樣是懸空的，這個修法只擋住了「當前節點被刪」，沒擋住「任何節點被刪」。`cancellation_signal` 不能複製也不能搬移，沒辦法把它從 list 裡先搬出來避開這個問題，所以真正的修法是換一個角度：讓 completion handler 的 `snapshot_sigs_.erase(sig_it)` 改成 `net::post(strand_, [this, sig_it]{ snapshot_sigs_.erase(sig_it); })`——反正這個 handler 本來就跑在 `strand_` 上，把 erase 這件事延後到「目前這個 strand task 完全跑完之後」執行，`stop()` 的迴圈（本身也是一個 strand task）進行期間，`snapshot_sigs_` 就保證不會被任何 reentrant 的完成事件動到，range-for 因此又是安全的。
+      **實作時發現、同樣沒預料到、比預期更棘手的坑：`run()` 呼叫 `drain_pending_snapshots()` 這件事本身就會被自己的 `run_sig_` 卡死**——`run()` 進到收尾這段時，`run_sig_` 早就已經 `emit(terminal)` 過了（不然不會走到這裡），而這個「已取消」狀態是**這個 coroutine 之後任何 `co_await` 都會立刻撞到的殘留狀態，不是只影響剛好被取消的那一個操作**。第一版修法只在 `drain_pending_snapshots()` 內部的 timer wait 上加 `net::redirect_error`，結果實測（`hermeneutic_venue_session_test` 的 `StopAbortsBackoffWaitAndDoesNotReconnect` 一開始就是這樣失敗的，訊息是 `co_await: Operation canceled`）發現：連 `co_await drain_pending_snapshots();` 這個呼叫本身——即使當下沒有任何 in-flight fetch、迴圈本體一次都沒真的執行——都會立刻拋出，因為「已取消」的狀態不是綁在某個具體的 I/O 物件上，而是整個 coroutine 鏈往下傳的環境狀態，任何後續 `co_await`（包括呼叫進另一個 coroutine 這件事本身）都會被判定為「已經被取消了」。真正的修法：在呼叫 `drain_pending_snapshots()` **之前**，先 `co_await net::this_coro::reset_cancellation_state();`，把這個環境狀態重置乾淨（仍然連著同一個 `run_sig_` 的 slot，只是清掉「已經 emit 過」這個殘留記錄），之後的 `co_await` 才會恢復正常行為。`drain_pending_snapshots()` 內部的 `net::redirect_error` 保留下來當第二層防護（萬一收尾途中又有新的 emit 落在這個迴圈執行期間），但真正解決問題的是這個 reset。
+      **同一個坑的第二個發生位置，code review 實測 5/5 重現、比上面那個更嚴重，已修好並已跑過「刪掉修法會失敗、加回來會過」的驗證**：`reset_cancellation_state()` 一開始只加在 `drain_pending_snapshots()` 前面，但 `run()` 裡另一個完全不受保護的 `co_await` 是 `on_disconnected()` 的 invalidate 呼叫（緊接在 catch 區塊之後）。如果 `stop()` 是在連線還活著、卡在 `connection.read()` 的時候被呼叫——這其實是最常見的正式環境收尾情境，不是只有「stop 剛好落在 backoff 期間」這種邊角案例——那麼 read 本身被 cancellation 中止、留下同一種「已取消」的殘留狀態，緊接著的 invalidate 這個 `co_await` 就會立刻拋出、逃出 `run()`，連 `stopping_` 都還沒檢查到，`reset_cancellation_state()`/`drain_pending_snapshots()` 也永遠不會執行到。
+      修法：在 `run()` 裡多加一次 `co_await net::this_coro::reset_cancellation_state();`（catch 之後、`invalidate_all()` 之前）。
+
+      **這裡踩到第二層坑，值得記下來避免以後重蹈覆轍：曾經嘗試把 reset 移進被呼叫的 coroutine 本身，讓「cleanup 不會繼承殘留取消狀態」變成函式定義的性質而不是呼叫端要記住的紀律——這個方向實測是錯的，會導致 `StopAbortsBackoffWaitAndDoesNotReconnect` 這種原本正常的路徑也開始失敗。** 原因：`co_await SomeCoroutine()` 這個動作本身——也就是「進入」一個被 co_await 的 coroutine 這件事——如果呼叫端當下的環境取消狀態已經是「已取消」，會在**進入當下**就立刻拋出，被呼叫的 coroutine 本體（包括它自己開頭寫的 reset）根本沒有機會執行到。所以 reset 一定要發生在**呼叫端自己的 frame 裡、緊接在那次 `co_await` 呼叫之前**，不能委託給被呼叫的 coroutine 自己開頭做——委託給被呼叫方的版本，症狀跟一開始沒加 reset時一模一樣（因為呼叫本身在 reset 執行之前就已經先炸了）。最終定案：`invalidate_all()`／`drain_pending_snapshots()` 維持乾淨的、不知道 cancellation 這回事的普通 coroutine（純粹描述「要做什麼」），`run()` 自己在呼叫它們之前各自明確 `co_await net::this_coro::reset_cancellation_state();` 一次——兩個呼叫點都在 `run()` 本體裡，寫成註解提醒而不是包裝成看似「結構上保證」但實際上不成立的抽象。教訓：「呼叫進 cleanup 之前要 reset」這件事只在**每一個**可能接在一次取消後面的呼叫點做才算數，而且必須做在呼叫端，不是被呼叫端；之後如果在 `run()` 裡新增第三個這樣的呼叫點，需要同樣手動加這一行，沒有更省事的結構化寫法可以繞過去。
+      補一個直接測試這個情境的迴歸測試（`stop()` 落在連線活著、卡在 `read()` 的時候，不是落在 backoff 期間）；原本 `StopDrainsInFlightSnapshotFetch` 的 `on_done` handler 沒檢查 `exception_ptr`，這個 bug 在既有測試裡是綠的，看不出來。
+
+   3. **strand——第 10 節第 4 項「尚未決定」在這裡先接住了**：`VenueSession` 建構時用 `net::make_strand(executor)` 建一個 `net::strand<net::any_io_executor>`，`run()` 跟每個 `handle_request_snapshot` 的 spawn 都跑在這個 strand 上，`stop()` 本身也是 `net::post(strand_, ...)`——`symbol_syncs_`/`snapshot_sigs_`/`stopping_` 因此完全不需要額外的鎖，之後真的要調 `io_context` thread pool 大小（第 10 節第 4 項）不會再牽動這層。
+
+   **`IngestionRunner`**：輸入是「per-venue 設定」，不是裸的 `VenueSession`——每個交易所可能只掛一部分 symbol，所以每個 `VenueSession` 要有自己那份 subset 建出來的 `SymbolRegistry`，不是共用一份全 symbol 的 registry。多個 venue 寫進同一個 `SymbolBook` 本來就是安全的（`apply_batch`/`invalidate_venue` 是 per-`VenueId`、且有自己的 mutex），這點值得在這裡明講，免得之後有人看到多個 session 碰同一個 `SymbolBook*` 就緊張。
+
+   ```cpp
+   class IngestionRunner {
+     public:
+       template <typename Feed, typename Policy, typename NextLayer, typename... Args>
+       void add(Args&&... args) {  // 就地建構進 VenueSessionAdapter<Feed,Policy,NextLayer>
+           sessions_.push_back(std::make_unique<VenueSessionAdapter<Feed, Policy, NextLayer>>(
+               std::forward<Args>(args)...));
+       }
+       void start_all() { for (auto& s : sessions_) s->start(); }  // executor 已經在 add() 傳進去的 VenueSession 建構參數裡定案
+       void stop_all() { for (auto& s : sessions_) s->stop(); }
+     private:
+       std::vector<std::unique_ptr<IVenueSession>> sessions_;
+   };
+   ```
+
+   `aggregator_main.cpp` 原本手寫的「建一個 Binance `VenueSession` + `co_spawn` + 錯誤 log lambda」整段，已經換成 `runner.add<BinanceFuturesFeed, BinanceFuturesSequencePolicy, ssl_stream>(..., io.get_executor(), &ssl_ctx)` + `runner.start_all()`；之後加 OKX 只是再一行 `add<...>`。錯誤 log 的 per-venue 標籤收進 `VenueSessionAdapter::start()` 內建的 completion handler 裡（用 `session_.venue()` 當前綴），不用每個 venue 各自複製一份。per-venue factory 函式（例如 `make_binance_futures_session(...)`，把具體 template 參數留在該交易所自己的 `.cpp`）目前還沒做，只有一個交易所時還不需要，等真的加第二個 venue 時再看要不要加這層。
+
+   **驗收標準（已用 `IngestionRunnerTest.StopAllLetsIoContextFinishWithoutIoStop` 驗證）**：`runner.stop_all()` 之後，`io_thread.join()`（main.cpp 現有的收尾）**不需要**額外呼叫 `io.stop()` 就能返回——測試裡用一個 3 秒的 watchdog 執行緒當安全網（避免真的卡死時整個測試 binary 掛住），並斷言這個 watchdog **沒有**被觸發過，這才是真正在驗證「不需要 `io.stop()` 兜底」，而不是「反正呼叫了 `io.stop()` 所以測試會結束」。`aggregator_main.cpp` 也已經按這個驗收標準改寫（見第 7 項）。
+
+   **已知限制，刻意不做**：`aggregator_main.cpp` 今天沒有任何訊號處理（`SIGTERM`/`SIGINT`），`server->Wait()` 只會在有人呼叫 `server->Shutdown()` 時返回——而目前沒有任何程式碼會呼叫它。也就是說 `runner.stop_all()` 這條優雅收尾路徑，今天在正式環境裡實際上**還沒有任何觸發點**會走到。這不是這次改動造成的退步——改動前的 `io.stop()` 收尾路徑一樣沒有觸發點——但值得明講，避免以為「stop() 做完了，正式環境就會優雅關閉」。要接訊號處理是後續獨立的事，不在這次範圍內。
+
+   **已對真實 Binance Futures 實測（用完即刪的臨時程式，不在 repo 裡）**：原本只在 fake WS/HTTP test double 上測過 `stop()`，沒驗證過真正的 `net::ssl::stream<beast::tcp_stream>`（正式環境用的 NextLayer）底下取消/收尾是否一樣正常——fake server 用的是 `beast::tcp_stream`，沒有 TLS handshake/teardown 這一段。寫了一個臨時的 `service/live_binance_stop_check_main.cpp`（跟 `aggregator_main.cpp` 幾乎一樣，差別只是跑完後主動呼叫 `stop_all()` 並量時間），實際跑起來連上 `wss://fstream.binance.com`、訂閱 BTCUSDT，15 秒內收到 1 個真實 snapshot + 142 個真實 diff，接著呼叫 `stop_all()`：`io_thread.join()` 在 **3ms** 內返回,不需要 `io.stop()`。跟 fake test double 的結果一致，把「http_get/SSL stream 這條沒特別驗證過」的殘留風險（見上面第 2 點）從真實環境角度補上了一次驗證。驗證完後這個臨時檔案跟對應的 CMake target 已經刪掉，沒有留在 repo 裡（跑真實交易所需要網路、不適合放進 CI）。
+
+   **Code review 第二輪抓到、已修好的兩點**：
+   - **`stop()` 在 `start()` 從沒跑過之前被呼叫，會被靜默、永久地丟掉**：`stop()` 只需要 `strand_` 存在（建構時就有了）就能成功 `net::post`、把 `stopping_` 設成 `true`；`run()` 原本要到第一次斷線/backoff 循環之後才會檢查 `stopping_`，所以一個「還沒 start 就被 stop」的 session 理論上會照樣連線、照樣讀真實交易所的資料。
+      **第一版修法（`run()` 的 `while(true)` 迴圈最上面加 `if (stopping_) co_return;`）實測是不夠的，而且原因跟 §5 那個「latching」坑是同一個家族但更極端**：`net::co_spawn(strand_, run(), net::bind_cancellation_slot(run_sig_.slot(), on_done))` 這行呼叫本身，會在呼叫當下（不管 `run()` 的 coroutine 有沒有機會真的執行過一行）就把 `run_sig_` 的 slot 綁定到這個 coroutine。如果 `stop()` 早就 emit 過（`start()` 都還沒被呼叫），那麼一旦 `start()` 真的呼叫 `co_spawn` 完成綁定，`run_sig_` 上那次 emit 會回溯地命中這個剛綁好、一行都還沒執行過的 coroutine——整個 `co_spawn` 出來的 operation 會直接以 `operation_aborted` 結束，`run()` 的函式本體（包括我加在最上面的那個 `stopping_` 檢查）**完全沒有機會執行到**（用一系列 debug print 實測過：一個都沒印出來）。也就是說，先前那個「連線讀真實資料」的擔心沒有發生，實際發生的是另一件事：`on_done` 收到一個 `operation_aborted` 例外，而不是乾淨的 `nullptr`——`VenueSessionAdapter::start()` 因此會把一次完全正常、預期內的「還沒開始就被要求停止」記成一次「ingestion session ended: Operation canceled」的錯誤 log。
+      **真正的修法在 `start()`，不是 `run()`**：把 `start()` 原本「直接呼叫 `co_spawn`」改成先 `net::post(strand_, ...)` 把「檢查 `stopping_`、視情況才 `co_spawn`」這件事本身也丟進 strand 排隊，跟 `stop()` 的 post 用同一個佇列排序。如果 `stop()` 先被排進去、先執行（設好 `stopping_ = true`，這時候 `run_sig_.emit()` 因為還沒有任何 coroutine 綁定它，是真正無害的 no-op），那麼 `start()` 排進去的檢查邏輯之後執行時就會看到 `stopping_ == true`，直接 `on_done(nullptr)`、完全不呼叫 `co_spawn`——`run_sig_` 的 slot 永遠不會被綁到一個已經沒有意義的 coroutine 上，也就不會有例外被製造出來。`run()` 迴圈最上面那個 `if (stopping_) co_return;` 保留下來當第二層防護（涵蓋 coroutine 已經綁定、但真的開始執行前那個更窄的時間窗，如果真的存在的話），但真正解決問題的是 `start()` 這一層。新增 `StopBeforeStartPreventsConnecting` 測試直接驗證：先 `stop()` 再 `start()`，斷言完全沒有嘗試連線、`on_done` 乾淨地帶 `nullptr` 觸發。
+   - **`aggregator_main.cpp` 拿掉 `io.stop()` 之後，收尾沒有 bounded-time 的兜底**：原本粗暴的 `io.stop()` 順便也是「不管三七二十一，時間到了就返回」的保證；改成純 `runner.stop_all()` 之後，如果 `drain_pending_snapshots()` 真的卡住不收斂（例如某個未來場景下 cancellation 沒能讓某個 async 操作真的中止），`io_thread.join()` 會無限期卡住，正式環境的 process 就真的關不掉。修法：仿照 `IngestionRunnerTest` 裡的 3 秒 watchdog 手法，在 `aggregator_main.cpp` 加一個 `kShutdownTimeout`（10 秒）的 watchdog 執行緒——正常情況下（已經實測，見上面「已對真實 Binance Futures 實測」，`join()` 3ms 內就返回）watchdog 完全不會被觸發；真的卡住的話，才強制 `io.stop()` 兜底，並且印一行 log 說明發生了什麼，不再是無聲卡死。
+
+   **Code review 第二輪提過、確認過但暫不處理的幾點**：
+   - `run()` 最外層的 `catch` 只接 `const std::exception&`——這是既有行為，不是這次改動加的，但這次新加的 `stop()`/`net::post(strand_, ...)` 讓後果多了一種：如果哪次真的丟出非 `std::exception` 的例外，`run()` 會直接以未捕捉例外結束，之後任何 `stop()` 呼叫 post 到 `strand_` 的工作就沒人執行、也沒有任何 log。維持現狀，因為擴大這個 catch 的範圍是另一個獨立的決定，不屬於這次的範圍。這個既有的殘留風險現在多牽動一件事：`execute_action()` 裡 snapshot fetch 完成後那個 deferred 的 `snapshot_sigs_.erase(sig_it)`（見上面第 2 點）也是靠 `net::post(strand_, ...)` 排隊執行的——如果 `run()` 真的因為這條路徑以未捕捉例外結束（跳過 `drain_pending_snapshots()`），這個 session 之後被銷毀時，那個排隊中、還沒執行的 erase lambda 就會對著一個已經解構的 session 呼叫 `snapshot_sigs_.erase(...)`。前提跟這條本來就記錄的殘留風險是同一個，不是新的獨立問題。新加的 `kShutdownTimeout` watchdog 對這個場景沒有幫助——它保證的是「`io_thread.join()` 不會無限期卡住」，不是「`run()` 一定會正常收尾」，兩者是不同的保證。
+   - `IngestionRunner::stop_all()` 本身不回報「全部真的收尾完了」——「`on_done` 觸發後才能安全銷毀 session」這個承諾，目前是靠唯一的呼叫端（`aggregator_main.cpp` 在 `stop_all()` 後面接著 `io_thread.join()`）湊巧做對，`IngestionRunner`/`IVenueSession` 本身沒有把這個承諾做成 API 的一部分。之後如果出現第二種呼叫端（例如不是靠 join 一個專屬 `io_context` 的方式），需要重新設計一個「等全部 session 真的 drain 完」的介面，不是現在就加。
+   - `drain_pending_snapshots()` 用 5ms 一次的 busy poll，不是事件驅動——這是設計時就承認的取捨（見上面的函式註解），沒有新資訊顯示它現在有問題，維持原樣。
+   - 測試檔案裡 `fail_test_on_exception()` 這個 helper 在 `tests/` 目錄下重複了第四次（`websocket_connection_test.cpp`/`http_client_test.cpp`/`venue_session_test.cpp` 都各自有一份，`ingestion_runner_test.cpp` 又複製一次）。這個重複在這次改動之前就存在，`ingestion_runner_test.cpp` 只是照抄既有慣例；要抽成共用的 test-utils header 得動到其他三個既有測試檔案，超出這次改動的範圍，不在這裡處理。
+
+   **Code review 第三輪抓到、已修好的四點**：
+   - **`on_disconnected()` 的 invalidate 呼叫（現在叫 `invalidate_all()`）在 `run()` 裡沒包 try/catch**：如果它拋例外（`registry_.book(symbol)->apply_snapshot`/`apply_batch`/`invalidate_venue` 理論上只操作記憶體內的狀態，正常不該拋，但例如 `bad_alloc` 這種資源耗盡的情況並非不可能），會直接逃出 `run()`，跳過 `stopping_` 檢查跟 `drain_pending_snapshots()`——正是這一整套機制想避免的 use-after-free，只是換一個觸發點。修法：`co_await invalidate_all();` 包一層 `try/catch (const std::exception&)`，即使 invalidate 失敗，收尾邏輯（`stopping_` 檢查、drain）還是會執行到。順便把 `disconnected` 這個布林值拿掉——內層 `while(true)` 讀取迴圈完全沒有 `break`/`return`，唯一離開外層 `try` 的方式就是丟例外，所以 `disconnected` 在檢查點上永遠是 `true`，是一個死掉的條件，拿掉之後 `invalidate_all()` 直接無條件呼叫，程式碼更誠實地反映實際行為。
+   - **`handle_request_snapshot()` 沒有在套用結果前檢查 `stopping_`**：`stop()` 會對每個 in-flight fetch 自己的 `cancellation_signal` 各別 `emit()`，但 fetch 走的 resolve/connect/read 這條鏈（`http_get`）的 per-op cancellation 沒有像 WS read/timer 那樣被明確驗證過——如果取消沒有即時生效、回應還是正常送達，這個 fetch 的完成處理（`execute_actions` → `ApplySnapshot`/`ApplyDelta`）就會在 `invalidate_all()` 已經因為這次收尾而 invalidate 過這個 venue 之後，重新把資料寫回去，等於悄悄復活一個「已經被宣告失效」的 venue 貢獻。修法：`handle_request_snapshot()` 在 `fetch()` 拿到回應之後、真正套用之前，多一個 `if (stopping_) co_return;`——不管底層的 cancellation 有沒有即時生效，只要已經進入收尾，這個結果就不該被套用。
+   - **`heartbeat_thread` 用 `.detach()`，正式環境的 shutdown 路徑一旦真的走到底會 use-after-free**：`aggregator_main.cpp` 目前沒有訊號處理，`server->Wait()` 實際上永遠不會返回（見上面「已知限制」），所以這個 UAF 今天不會真的發生——但這是既有程式碼（這次改動之前就有），而這次改動剛好是在替「`server->Wait()` 真的返回之後」這條路徑做收尾的正確性工程，放著這顆地雷不管、等哪天真的接了訊號處理才爆炸並不合理。`main()` 結尾 `return 0;` 那一刻會解構區域變數 `service`；如果 `heartbeat_thread` 這時候還活著（睡到一半），下一輪醒來會對著已經解構（或正在解構）的 `service` 呼叫 `send_heartbeat()`。修法：拿掉 `.detach()`，改成一個 `std::atomic<bool> heartbeat_stop`，`main()` 收尾時設成 `true` 並 `join()`，跟這次新加的 ingestion 收尾邏輯一樣，在 `service` 真的被解構之前就確保這個執行緒已經停了。
+   - **`kShutdownTimeout`（10 秒）比 `WebSocketConnection::connect()` 自己的 30 秒 connect/TLS-handshake timeout 還短**：如果 `stop()` 剛好落在一次還在走、但沒有卡死、只是正常地要花將近 30 秒的 connect/handshake（例如網路狀況不好），這個 watchdog 會在真正的優雅收尾有機會完成之前就先開槍，強制走回粗暴的 `io.stop()`——等於讓「10 秒內沒收尾完就當作卡死」這個假設，把「正常但慢」跟「真的卡死」混為一談。修法：把 `kShutdownTimeout` 拉到 35 秒（比 30 秒的 connect timeout 留一點餘裕），註解裡明講這個數字為什麼要比已知最長的單一操作 timeout 還長。即使如此，`tcp::resolver` 底層的 `getaddrinfo()` 是在背景執行緒上跑到 OS 呼叫真的返回為止，不受 awaitable 層級的 cancellation 影響——一個真的卡死/被黑洞掉的 DNS 解析仍然可能讓 process teardown 拖過這個 timeout，這是 Boost.Asio/OS 層級的限制，不是拉長 timeout 數字能解決的問題，註解裡也明講了。
+
+   **Code review 第三輪提過、確認過但暫不處理的兩點**：
+   - `VenueSession::start()` 沒有防止被呼叫兩次的執行期防護——第二次呼叫會用一個新的 `bind_cancellation_slot` 蓋掉 `run_sig_` 原本的綁定（跟「每個 snapshot fetch 要有自己的 signal」是同一個「slot 只轉發給最近一次綁定」的道理），讓第一個 `run()` 變成孤兒、`stop()` 之後只會抓到第二個。目前唯一的呼叫端（`IngestionRunner::add()`）就結構上只會呼叫一次，不會踩到；已經在 `start()` 的文件註解裡把這個當作明確的前置條件寫清楚（只能呼叫一次），沒有加執行期的 assert/guard——現在沒有任何呼叫端會誤用，加防護是為了一個假設性的未來呼叫端先寫代碼，不是這次範圍要做的事。
+   - `backoff()` 的 `catch (const std::exception&)` 會接住所有 `std::exception`，不只是 `stop()` 造成的取消——但這跟 `run()` 最外層那個 catch 是同一套刻意的設計哲學（見第 1 點的既有 catch 註解：「stop()'s terminal cancellation surfaces exactly the same way... which is why it's stopping_ - not a separate exception type - that tells the two apart」），不是疏漏。改成只接特定的 cancellation 例外型別，會讓這個檔案裡兩個原本一致的 catch 語意產生分歧，不在這裡動。
+
+   **考慮過但否決：把 `VenueSession` 從 coroutine 改寫成 callback 風格，換取「更簡單」**。否決理由：上面幾個問題（cancellation 時序、孤兒非同步操作的生命週期、共享狀態要不要鎖）在 callback 風格下同樣存在，只是換一種說法——不是「`cancellation_signal` + `stopping_` flag」，而是「`shared_ptr<this>` keep-alive + 讓 `close()` 逼所有 pending callback 帶錯誤回來」。callback 風格對「孤兒 snapshot fetch」這種生命週期問題確實有更現成的慣用手法（引用計數天然處理），但代價是把 `run()` 現在線性的「connect → subscribe → read loop → backoff → 重來」拆成一堆各自存 member 狀態的 handler 函式——這正是第 7 節記錄的兩個真實 bug（`co_spawn` 內聯卡死讀取迴圈、參考參數在 spawn 後懸空）已經在這層邏輯本身踩過的坑，coroutine 版本讓這兩個坑至少在字面上更容易看見。維持 coroutine。
+   另外，若之後有人參考通用 C++20 coroutine runtime 文章想套用 `std::stop_source`/`std::stop_token`：**這在 Asio 裡不夠**，`stop_token` 只是被動旗標，本身叫不醒一個正在 `co_await` 卡住的 `async_read`/`async_wait`；真正能中斷 pending I/O 的是 Asio 的 `cancellation_signal`/`cancellation_slot`（即上面第 1 點），兩者不能互相替代。
 3. **backoff/jitter 的實際參數**：形狀已定（per-connection，帶 jitter：`min(30s, 500ms * 2^attempt)` + 最多 20% 隨機抖動），數值是暫定的，未經真實流量調校。
-4. **多執行緒 `io_context` thread pool 的大小**：先前討論過大方向（parsing 平行、apply 序列化在各自 `SymbolBook` 的 mutex 上），實際執行緒數量策略未定；`VenueSession::run()` 目前也還沒實際跑在多執行緒 `io_context` 上測試過，只驗證過單執行緒 `io_context::run_for()`。
+4. **多執行緒 `io_context` thread pool 的大小**：先前討論過大方向（parsing 平行、apply 序列化在各自 `SymbolBook` 的 mutex 上），實際執行緒數量策略未定；`VenueSession::run()` 目前也還沒實際跑在多執行緒 `io_context` 上測試過，只驗證過單執行緒 `io_context::run_for()`。**strand 這半步已經在第 2 項（`IngestionRunner`/`IVenueSession`）裡先接住**：`VenueSession` 拿一個 `net::strand`，`run()` 跟 `handle_request_snapshot` 的 spawn 都掛在同一個 strand 上，這裡才不會被之後真的上多執行緒的決定回頭咬。
 5. **Binance Spot 的 `SequencePolicy`**：使用者明確表示目前不需要，之後才做。
 6. ~~正式環境的 `net::ssl::context` 建構/憑證驗證設定~~ **已完成並實測**：`aggregator_main.cpp` 接上 ingestion 後第一次真的編譯到 `net::ssl::stream<beast::tcp_stream>` 這個 template 實例化，發現漏了 `#include <boost/beast/websocket/ssl.hpp>`（Beast 對 SSL stream 的 `async_teardown` customization point 是獨立 header，沒 include 的話會在 `boost/beast/websocket/teardown.hpp` 出現 `static_assert(sizeof(Socket)==-1, "Unknown Socket type in async_teardown.")`）。修好後**實際跑起來連上 `wss://fstream.binance.com/ws` + `https://fapi.binance.com`，收到真實 BTCUSDT order book**（snapshot 1928 bids/1854 asks，diff 持續進來）。另外完成一次約 19 分鐘的即時雙 symbol（BTCUSDT、ETHUSDT，同一個 `hermeneutic_aggregator_service` process）穩定性驗證：全程只建立 1 次連線（無斷線重連），雙邊都收到真實 snapshot 並持續套用 diff（各自 diff_count 達 7500+ 才手動停止，不是自然結束），heartbeat 全程以預期節奏送達，驗證用的 log 裡沒有任何 error/disconnect 紀錄。（負責跑這個驗證的背景 agent 自己中途就停在一則「等 15 分鐘再回報」的訊息、沒有真的送出最終報告或清掉留下的兩個 process；這份紀錄是事後直接讀它留下的 log、確認狀態正常後，手動收尾補上的。）
 7. ~~`aggregator_main.cpp` 尚未接上 ingestion~~ **已完成**：見 `service/aggregator_main.cpp`——建構 `AggregatorService` 後，額外建一個 `net::ssl::context`（`tlsv12_client`，`set_default_verify_paths()` + `verify_peer`）、一個 `SymbolRegistry`（從 `service.book(symbol)` 建）、一個 `VenueSession<BinanceFuturesFeed, BinanceFuturesSequencePolicy, net::ssl::stream<beast::tcp_stream>>`，`co_spawn` 上一個獨立的 `io_context`（自己的 thread 跑 `io.run()`），跟原本的 gRPC server／heartbeat thread 並存，`server->Wait()` 回來後 `io.stop()` + join 收尾。目前寫死只接 Binance Futures 一個交易所（因為目前只實作這一個 `Feed`），之後真要多交易所需要走第 10-2 項的 `IngestionRunner`。
@@ -275,7 +373,7 @@ loop:
 
 `SymbolSync<SequencePolicy>` + `BinanceFuturesSequencePolicy`（9 測試）、`BinanceFuturesFeed`（10 測試）、`WebSocketConnection`（1 測試）、`http_get`（3 測試）、`VenueSession<Feed,Policy,NextLayer>` + `SymbolRegistry`（1 個端對端整合測試）都已完成並測試通過。**`aggregator_main.cpp` 也已經接上 ingestion（第 10 節第 7 項），並且實際對 `wss://fstream.binance.com`/`https://fapi.binance.com` 跑起來過，收到真實 BTCUSDT order book**（第 10 節第 6 項的 TLS 實際連線驗證，也在這次一併完成）。整條「真實 Binance WS/REST → resync → 套用進真實 book → 真實 gRPC 訂閱者收到正確結果」的路徑，已經不只是測試證明可以動，是真的連過真實交易所跑過一次。
 
-剩下的收尾項目（第 10 節）：`SymbolBook::apply_batch`（1，下一步要做）、`IngestionRunner` 的多交易所 type-erasure 邊界（2）、backoff 參數調校（3）、多執行緒 `io_context` 策略（4）、Binance Spot 的 `SequencePolicy`（5，使用者明確表示暫不需要）。
+剩下的收尾項目（第 10 節）：`SymbolBook::apply_batch`（1，已完成）、`IngestionRunner`/`IVenueSession` 的多交易所 type-erasure 邊界（2，**已完成並測試**——`stop()` 的 cancellation 傳播/孤兒 snapshot 排空/strand 三件事是核心難點，見第 2 項內文）、backoff 參數調校（3）、多執行緒 `io_context` 策略（4）、Binance Spot 的 `SequencePolicy`（5，使用者明確表示暫不需要）。
 
 ---
 

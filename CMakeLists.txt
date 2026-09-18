@@ -149,5 +149,13 @@ if(HERMENEUTIC_BUILD_SERVICE)
             hermeneutic_proto hermeneutic Boost::asio Boost::beast OpenSSL::SSL OpenSSL::Crypto
             GTest::gtest_main)
         gtest_discover_tests(hermeneutic_venue_session_test)
+
+        add_executable(hermeneutic_ingestion_runner_test tests/ingestion_runner_test.cpp)
+        target_include_directories(hermeneutic_ingestion_runner_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/service)
+        target_link_libraries(hermeneutic_ingestion_runner_test PRIVATE
+            hermeneutic_proto hermeneutic Boost::asio Boost::beast OpenSSL::SSL OpenSSL::Crypto
+            GTest::gtest_main)
+        gtest_discover_tests(hermeneutic_ingestion_runner_test)
     endif()
 endif()

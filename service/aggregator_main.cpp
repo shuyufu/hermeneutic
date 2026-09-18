@@ -6,10 +6,13 @@
 #include <boost/asio/ssl.hpp>
 #include <boost/beast/core/tcp_stream.hpp>
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <exception>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -17,6 +20,7 @@
 
 #include "aggregator_service.hpp"
 #include "binance_futures_feed.hpp"
+#include "ingestion_runner.hpp"
 #include "venue_session.hpp"
 
 namespace {
@@ -77,22 +81,32 @@ int main(int argc, char** argv) {
     // unchanged" apart from "aggregator/feed stalled" during a quiet period,
     // well inside the keepalive timeout above so it isn't the only sign of
     // life on an idle connection.
+    //
+    // Joined at the end of main(), not detached: a detached thread that's
+    // still alive (mid-sleep) when main() reaches the end of this
+    // function calls service.send_heartbeat() on an object that's about
+    // to be (or already is) destroyed - a real use-after-free, not
+    // hypothetical, once anything actually makes server->Wait() return
+    // (nothing does yet - see the shutdown comment below - but this
+    // thread shouldn't be a landmine waiting for whoever wires that up).
     constexpr auto kHeartbeatInterval = std::chrono::seconds(1);
-    std::thread heartbeat_thread([&service, kHeartbeatInterval] {
-        while (true) {
+    std::atomic<bool> heartbeat_stop{false};
+    std::thread heartbeat_thread([&service, &heartbeat_stop, kHeartbeatInterval] {
+        while (!heartbeat_stop) {
             std::this_thread::sleep_for(kHeartbeatInterval);
+            if (heartbeat_stop) break;
             service.send_heartbeat();
         }
     });
-    heartbeat_thread.detach();
 
     // Ingestion: one VenueSession per venue, covering every symbol this
     // process serves, feeding the same AggregatorService the gRPC server
     // above exposes. Binance USDS-M Futures only for now (see
     // docs/ingestion_design.md - Binance Spot and other venues aren't
-    // implemented yet). A real TLS context, not the plain-TCP instantiation
-    // the tests use: this is the first time that path runs against a real
-    // exchange rather than a local test server.
+    // implemented yet, and IngestionRunner is what a second venue would go
+    // through - see 第 10 節第 2 項). A real TLS context, not the plain-TCP
+    // instantiation the tests use: this is the first time that path runs
+    // against a real exchange rather than a local test server.
     net::ssl::context ssl_ctx(net::ssl::context::tlsv12_client);
     ssl_ctx.set_default_verify_paths();
     ssl_ctx.set_verify_mode(net::ssl::verify_peer);
@@ -101,24 +115,12 @@ int main(int argc, char** argv) {
     for (const auto& symbol : symbols) registry.add(symbol, service.book(symbol));
 
     net::io_context io;
-    bobby::hermeneutic::ingestion::VenueSession<bobby::hermeneutic::ingestion::BinanceFuturesFeed,
-                                         bobby::hermeneutic::BinanceFuturesSequencePolicy,
-                                         net::ssl::stream<boost::beast::tcp_stream>>
-        binance_session(bobby::hermeneutic::ingestion::BinanceFuturesFeed{}, "binance_futures", symbols,
-                         std::move(registry), &ssl_ctx);
-    net::co_spawn(io, binance_session.run(), [](std::exception_ptr e) {
-        if (!e) return;
-        try {
-            std::rethrow_exception(e);
-        } catch (const std::exception& ex) {
-            // VenueSession::run() only returns via an uncaught exception in
-            // its own setup (co_await net::this_coro::executor, backoff's
-            // timer, etc.) - a dropped/failed venue connection is already
-            // handled internally (reconnect with backoff), so reaching
-            // here means ingestion for this venue has stopped for good.
-            std::cerr << "binance_futures ingestion session ended: " << ex.what() << '\n';
-        }
-    });
+    bobby::hermeneutic::ingestion::IngestionRunner runner;
+    runner.add<bobby::hermeneutic::ingestion::BinanceFuturesFeed, bobby::hermeneutic::BinanceFuturesSequencePolicy,
+               net::ssl::stream<boost::beast::tcp_stream>>(
+        bobby::hermeneutic::ingestion::BinanceFuturesFeed{}, "binance_futures", symbols, std::move(registry),
+        io.get_executor(), &ssl_ctx);
+    runner.start_all();
     std::thread io_thread([&io] { io.run(); });
 
     std::cout << "hermeneutic_aggregator_service listening on " << address << " for "
@@ -127,7 +129,55 @@ int main(int argc, char** argv) {
     std::cout << ", ingesting from binance_futures" << std::endl;
     server->Wait();
 
-    io.stop();
+    // No io.stop() as the primary shutdown mechanism: stop_all() aborts
+    // every session's in-flight read/backoff wait and drains any in-flight
+    // snapshot fetch (see VenueSession::stop()), so io.run() should return
+    // on its own - see docs/ingestion_design.md 第 10 節第 2 項's 驗收標準
+    // (verified live against wss://fstream.binance.com: join returned
+    // ~3ms after stop_all()). kShutdownTimeout is a backstop, not the
+    // expected path, and has to be comfortably longer than the longest
+    // timeout any single in-flight operation could legitimately still be
+    // running under when stop() lands - currently
+    // WebSocketConnection::connect()'s own 30s connect/TLS-handshake
+    // timeout (service/websocket_connection.hpp), the longest of the two
+    // (http_get's is 10s). A shorter watchdog would routinely fire and
+    // force the crude io.stop() fallback for a stop() that simply landed
+    // during a slow-but-still-progressing connect, not a genuinely stuck
+    // one. Even 35s doesn't cover every stage unconditionally: a snapshot
+    // fetch's DNS resolution (tcp::resolver, under the REST fetch's own
+    // cancellation) runs the underlying getaddrinfo() call on a
+    // background thread that keeps going until the OS call itself
+    // returns, regardless of the awaitable-level cancellation completing
+    // - a genuinely stuck/black-holed resolution can still delay process
+    // teardown past this bound. That's a Boost.Asio/OS-level limitation,
+    // not something this code can fix by waiting longer.
+    constexpr auto kShutdownTimeout = std::chrono::seconds(35);
+    std::mutex shutdown_mutex;
+    std::condition_variable shutdown_cv;
+    bool shutdown_complete = false;
+    std::thread shutdown_watchdog([&] {
+        std::unique_lock lock(shutdown_mutex);
+        if (!shutdown_cv.wait_for(lock, kShutdownTimeout, [&] { return shutdown_complete; })) {
+            std::cerr << "runner.stop_all() did not drain within " << kShutdownTimeout.count()
+                      << "s - forcing io.stop() as a backstop\n";
+            io.stop();
+        }
+    });
+
+    runner.stop_all();
     io_thread.join();
+
+    {
+        std::lock_guard lock(shutdown_mutex);
+        shutdown_complete = true;
+    }
+    shutdown_cv.notify_all();
+    shutdown_watchdog.join();
+
+    // Stopped and joined here, before `service` goes out of scope below -
+    // see the comment on heartbeat_thread's construction for why this
+    // can't be a detach().
+    heartbeat_stop = true;
+    heartbeat_thread.join();
     return 0;
 }
