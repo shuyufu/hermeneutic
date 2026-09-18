@@ -6,7 +6,7 @@
 
 ## 1. 目標與範圍
 
-從多個交易所（目前只做 Binance USDⓈ-M Futures）訂閱多個 symbol 的 L2 order book diff，維護正確的本地 order book 狀態，餵進已經存在的 `SymbolBook`（`service/aggregator_service.hpp`，`AggregatorService::book(symbol)`）。目標是非同步、多執行緒（Boost.Asio + Beast），且核心邏輯採 **sans-io** 設計：resync/序號校驗這類最容易出錯的邏輯完全不碰 socket，可以純用假資料序列做單元測試。
+從多個交易所（目前做 Binance USDⓈ-M Futures + Binance Spot）訂閱多個 symbol 的 L2 order book diff，維護正確的本地 order book 狀態，餵進已經存在的 `SymbolBook`（`service/aggregator_service.hpp`，`AggregatorService::book(symbol)`）。目標是非同步、多執行緒（Boost.Asio + Beast），且核心邏輯採 **sans-io** 設計：resync/序號校驗這類最容易出錯的邏輯完全不碰 socket，可以純用假資料序列做單元測試。
 
 ## 2. 分層總覽
 
@@ -365,19 +365,35 @@ loop:
    另外，若之後有人參考通用 C++20 coroutine runtime 文章想套用 `std::stop_source`/`std::stop_token`：**這在 Asio 裡不夠**，`stop_token` 只是被動旗標，本身叫不醒一個正在 `co_await` 卡住的 `async_read`/`async_wait`；真正能中斷 pending I/O 的是 Asio 的 `cancellation_signal`/`cancellation_slot`（即上面第 1 點），兩者不能互相替代。
 3. **backoff/jitter 的實際參數**：形狀已定（per-connection，帶 jitter：`min(30s, 500ms * 2^attempt)` + 最多 20% 隨機抖動），數值是暫定的，未經真實流量調校。
 4. **多執行緒 `io_context` thread pool 的大小**：先前討論過大方向（parsing 平行、apply 序列化在各自 `SymbolBook` 的 mutex 上），實際執行緒數量策略未定；`VenueSession::run()` 目前也還沒實際跑在多執行緒 `io_context` 上測試過，只驗證過單執行緒 `io_context::run_for()`。**strand 這半步已經在第 2 項（`IngestionRunner`/`IVenueSession`）裡先接住**：`VenueSession` 拿一個 `net::strand`，`run()` 跟 `handle_request_snapshot` 的 spawn 都掛在同一個 strand 上，這裡才不會被之後真的上多執行緒的決定回頭咬。
-5. **Binance Spot 的 `SequencePolicy`**：使用者明確表示目前不需要，之後才做。
+5. ~~Binance Spot 的 `SequencePolicy`~~ **已完成**：`BinanceSpotSequencePolicy`（`include/bobby/hermeneutic/symbol_sync.hpp`）+ `BinanceSpotFeed`（`service/binance_spot_feed.hpp`），對照 developers.binance.com 的 Spot 文件直接 WebFetch 逐字核對（2026-09-18，見文末 Sources），不是套用 Futures 的公式：
+   - 丟棄條件 `final_id <= last_update_id`（非嚴格 `<=`，跟 Futures 的嚴格 `<` 不同）
+   - 銜接條件 `first_id <= last_update_id+1 && final_id >= last_update_id+1`（有 `+1` 偏移，Futures 沒有）
+   - 穩態校驗用 `first_id == last_applied_final_id + 1`（"U 接續上一則的 u+1"），不是 `pu` 反向指標——Spot 的 `depthUpdate` 根本沒有 `pu` 欄位，`BinanceSpotFeed::parse_message` 把 `DepthUpdate::prev_final_id` 明確設成 `0`（不是留給 UB：`DepthUpdate` 沒有預設成員初始化，不明確賦值會是未定義值，`BinanceSpotSequencePolicy` 剛好從不讀這個欄位，這種 bug 不會被任何測試抓到，只能靠寫程式碼時就注意）。
+
+   Spot 文件另外還記載了第三個分支「`u` 小於本地 book 的 update ID 就直接忽略該事件」，`SymbolSync` 沒有對應的 ignore action——比 `is_contiguous` 判定失敗更早的一種「太舊」情況，目前會落到 gap 處理（整個重來），跟真的「太新」的 gap 用同一套處理。單一有序 TCP 連線上理論上不會發生（等於交易所自己送出亂序事件），刻意不特別建模，記在 `BinanceSpotSequencePolicy` 的註解跟這裡，避免被誤會成遺漏。
+
+   `BinanceSpotFeed` 跟 `BinanceFuturesFeed` 差異：WS 走 `stream.binance.com:9443/ws`（Spot 明文 WS port 是 9443，不是 443；bare `/ws` + SUBSCRIBE 已直接對真實 Binance 驗證過會送出**未包裝**的 payload，不是 `/stream` 那種 `{"stream":...,"data":...}` 包裝格式——這件事 sans-io 測試本身測不出來，見下方即時驗證），REST snapshot 走 `api.binance.com/api/v3/depth?symbol=...&limit=5000`（Spot 上限 5000，Futures 上限 1000；選滿額度是因為 Spot 的 `<=` 丟棄規則比 Futures 的嚴格 `<` 更容易在冷門 symbol 上把 buffer 清空、導致 `on_snapshot` 立刻又發一次 `RequestSnapshot`，滿額度快照能降低重試頻率，但沒有加任何節流機制去解決這個交互作用，只記在這裡）。
+
+   **`HttpRequestSpec` 跟 `detail::parse_decimal_string`/`parse_level`/`parse_levels` 抽到新的 `service/binance_wire.hpp`**，原本只在 `binance_futures_feed.hpp` 裡私有定義——`VenueSession` 本來就是靠 `auto spec = feed.snapshot_request(symbol)` 鴨子定型讀取 `.host`/`.port`/`.target`（已確認 grep 過 `venue_session.hpp` 完全不 include 任何 Feed header、不具名引用 `HttpRequestSpec` 型別），理論上兩個 Feed 各自定義一份同名 struct 也不會被 `VenueSession` 擋下來，但 `aggregator_main.cpp` 一份 `.cpp` 同時 include 兩個 Feed header 時，兩份完全相同的 `namespace bobby::hermeneutic::ingestion { struct HttpRequestSpec {...}; namespace detail { ... } }` 會直接 ODR 違規（重複定義）。這是真正的兩個使用者才動手抽的（不是預先設計），`binance_futures_feed.hpp` 也已經改成 include 這個共用 header，不再重複定義。
+
+   **即時驗證（跟 Futures 用完即刪的臨時程式同一招，`service/live_binance_spot_check_main.cpp`，驗證完已刪除，不留在 repo）**：實際連上 `wss://stream.binance.com:9443/ws`，送 `SUBSCRIBE` 訂閱 `btcusdt@depth@100ms`，收到 1 個 SUBSCRIBE ack（`nullopt`，符合預期）+ 3 個真實 `depthUpdate`（`parse_message` 正確解析出 `DepthUpdate`，`U`/`u`/bids/asks 都有值），證實 bare `/ws` 對 Spot 確實跟 Futures 一樣送未包裝 payload，不是 `/stream` 才有的包裝格式（這是 sans-io 測試結構性測不出來的唯一一件事，因為需要真的連線才知道 wire 上到底送什麼）。REST 那邊也對 `https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=5000` 實際打過，收到 `lastUpdateId`+5000 bids+5000 asks，`parse_snapshot_response` 正確解析。未做 Futures 之前做過的長時間（十幾分鐘）穩定性 soak test——這次只驗證「wire format 假設是否成立」這一個問題，不是收尾/backoff/cancellation 這些已經在 `VenueSession` 本體驗證過、與交易所無關的機制。
+
+   **`aggregator_main.cpp` 已接上兩個 venue**：每個 symbol 同時建 `IngestionRunner::add<BinanceFuturesFeed, BinanceFuturesSequencePolicy, ...>` 跟 `add<BinanceSpotFeed, BinanceSpotSequencePolicy, ...>`，各自一份獨立的 `SymbolRegistry`（不能共用同一份再 `std::move` 兩次——第一次 `add()` 會把 registry 整個搬空，第二個 venue 拿到的會是 moved-from 的空 map，`registry_.book(symbol)` 永遠回傳 `nullptr`）。同一個 `SymbolBook` 因此會同時收到 spot 跟 perp 兩個 `VenueId` 的貢獻，聚合後的 aggregate book 是兩個市場流動性的合併——`SymbolBook::apply_batch`/`invalidate_venue` 本來就是 per-`VenueId`、有自己的 mutex（第 10 節第 2 項已經記過這個保證），不是這次改動才需要驗證的新東西，但值得在這裡明講：現在跑起來，同一個 symbol 訂閱者看到的書面是 spot+期貨的合併結果，不是分開的兩本書。
 6. ~~正式環境的 `net::ssl::context` 建構/憑證驗證設定~~ **已完成並實測**：`aggregator_main.cpp` 接上 ingestion 後第一次真的編譯到 `net::ssl::stream<beast::tcp_stream>` 這個 template 實例化，發現漏了 `#include <boost/beast/websocket/ssl.hpp>`（Beast 對 SSL stream 的 `async_teardown` customization point 是獨立 header，沒 include 的話會在 `boost/beast/websocket/teardown.hpp` 出現 `static_assert(sizeof(Socket)==-1, "Unknown Socket type in async_teardown.")`）。修好後**實際跑起來連上 `wss://fstream.binance.com/ws` + `https://fapi.binance.com`，收到真實 BTCUSDT order book**（snapshot 1928 bids/1854 asks，diff 持續進來）。另外完成一次約 19 分鐘的即時雙 symbol（BTCUSDT、ETHUSDT，同一個 `hermeneutic_aggregator_service` process）穩定性驗證：全程只建立 1 次連線（無斷線重連），雙邊都收到真實 snapshot 並持續套用 diff（各自 diff_count 達 7500+ 才手動停止，不是自然結束），heartbeat 全程以預期節奏送達，驗證用的 log 裡沒有任何 error/disconnect 紀錄。（負責跑這個驗證的背景 agent 自己中途就停在一則「等 15 分鐘再回報」的訊息、沒有真的送出最終報告或清掉留下的兩個 process；這份紀錄是事後直接讀它留下的 log、確認狀態正常後，手動收尾補上的。）
 7. ~~`aggregator_main.cpp` 尚未接上 ingestion~~ **已完成**：見 `service/aggregator_main.cpp`——建構 `AggregatorService` 後，額外建一個 `net::ssl::context`（`tlsv12_client`，`set_default_verify_paths()` + `verify_peer`）、一個 `SymbolRegistry`（從 `service.book(symbol)` 建）、一個 `VenueSession<BinanceFuturesFeed, BinanceFuturesSequencePolicy, net::ssl::stream<beast::tcp_stream>>`，`co_spawn` 上一個獨立的 `io_context`（自己的 thread 跑 `io.run()`），跟原本的 gRPC server／heartbeat thread 並存，`server->Wait()` 回來後 `io.stop()` + join 收尾。目前寫死只接 Binance Futures 一個交易所（因為目前只實作這一個 `Feed`），之後真要多交易所需要走第 10-2 項的 `IngestionRunner`。
 
 ## 11. 下一步
 
-`SymbolSync<SequencePolicy>` + `BinanceFuturesSequencePolicy`（9 測試）、`BinanceFuturesFeed`（10 測試）、`WebSocketConnection`（1 測試）、`http_get`（3 測試）、`VenueSession<Feed,Policy,NextLayer>` + `SymbolRegistry`（1 個端對端整合測試）都已完成並測試通過。**`aggregator_main.cpp` 也已經接上 ingestion（第 10 節第 7 項），並且實際對 `wss://fstream.binance.com`/`https://fapi.binance.com` 跑起來過，收到真實 BTCUSDT order book**（第 10 節第 6 項的 TLS 實際連線驗證，也在這次一併完成）。整條「真實 Binance WS/REST → resync → 套用進真實 book → 真實 gRPC 訂閱者收到正確結果」的路徑，已經不只是測試證明可以動，是真的連過真實交易所跑過一次。
+`SymbolSync<SequencePolicy>` + `BinanceFuturesSequencePolicy`/`BinanceSpotSequencePolicy`（12 測試）、`BinanceFuturesFeed`（11 測試）、`BinanceSpotFeed`（12 測試）、`WebSocketConnection`（1 測試）、`http_get`（3 測試）、`VenueSession<Feed,Policy,NextLayer>` + `SymbolRegistry`（1 個端對端整合測試）都已完成並測試通過。**`aggregator_main.cpp` 已經接上 ingestion（第 10 節第 7 項），並且實際對 Futures（`wss://fstream.binance.com`/`https://fapi.binance.com`）跟 Spot（`wss://stream.binance.com:9443`/`https://api.binance.com`）都跑起來過，各自收到真實 BTCUSDT order book**（第 10 節第 6 項的 TLS 實際連線驗證，也在這次一併完成）。整條「真實 Binance WS/REST → resync → 套用進真實 book → 真實 gRPC 訂閱者收到正確結果」的路徑，兩個 venue 都不只是測試證明可以動，是真的連過真實交易所跑過一次。
 
-剩下的收尾項目（第 10 節）：`SymbolBook::apply_batch`（1，已完成）、`IngestionRunner`/`IVenueSession` 的多交易所 type-erasure 邊界（2，**已完成並測試**——`stop()` 的 cancellation 傳播/孤兒 snapshot 排空/strand 三件事是核心難點，見第 2 項內文）、backoff 參數調校（3）、多執行緒 `io_context` 策略（4）、Binance Spot 的 `SequencePolicy`（5，使用者明確表示暫不需要）。
+剩下的收尾項目（第 10 節）：`SymbolBook::apply_batch`（1，已完成）、`IngestionRunner`/`IVenueSession` 的多交易所 type-erasure 邊界（2，**已完成並測試**——`stop()` 的 cancellation 傳播/孤兒 snapshot 排空/strand 三件事是核心難點，見第 2 項內文）、backoff 參數調校（3）、多執行緒 `io_context` 策略（4）、Binance Spot 的 `SequencePolicy`（5，**已完成**，見上）。
 
 ---
 
-**Sources**（Binance 官方文件，2026-09-16 查證）：
-- [Order Book (REST /fapi/v1/depth)](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data#order-book)
-- [Diff. Book Depth Streams](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public#diff-book-depth-streams)
-- [How to manage a local order book correctly (USDⓈ-M Futures)](https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/How-to-manage-a-local-order-book-correctly)
+**Sources**（Binance 官方文件）：
+- [Order Book (REST /fapi/v1/depth)](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data#order-book)（2026-09-16 查證）
+- [Diff. Book Depth Streams](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public#diff-book-depth-streams)（2026-09-16 查證）
+- [How to manage a local order book correctly (USDⓈ-M Futures)](https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/How-to-manage-a-local-order-book-correctly)（2026-09-16 查證）
+- [How to manage a local order book correctly (Spot)](https://developers.binance.com/en/docs/products/spot/web-socket-streams#how-to-manage-a-local-order-book-correctly)（2026-09-18 查證）
+- [Diff. Book Depth Streams (Spot)](https://developers.binance.com/en/docs/catalog/core-trading-spot-trading/api/ws-streams/~#diff-book-depth)（2026-09-18 查證）
+- [Order Book (REST /api/v3/depth, Spot)](https://developers.binance.com/docs/binance-spot-api-docs/rest-api/market-data-endpoints)（2026-09-18 查證）

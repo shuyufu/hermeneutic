@@ -14,37 +14,44 @@
 #include <variant>
 #include <vector>
 
+#include "binance_futures_feed.hpp"  // for ParsedMessage - identical shape, shared rather than redefined
 #include "binance_wire.hpp"
 #include "bobby/hermeneutic/fixed_point.hpp"
 #include "bobby/hermeneutic/symbol_sync.hpp"
 
 namespace bobby::hermeneutic::ingestion {
 
-using ParsedMessage = std::optional<std::variant<SnapshotMessage, DepthUpdate>>;
-
-// VenueFeed for Binance USDS-M Futures: parse/encode only, no I/O. See
+// VenueFeed for Binance Spot: parse/encode only, no I/O. See
 // docs/ingestion_design.md for the design this implements and the primary
 // sources (developers.binance.com) the wire format and resync semantics
-// were verified against.
-class BinanceFuturesFeed {
+// were verified against - in particular, Spot's depthUpdate has no `pu`
+// field (unlike Futures'), so BinanceSpotSequencePolicy (symbol_sync.hpp)
+// validates continuity via `first_id == last_applied_final_id + 1`
+// instead, and DepthUpdate::prev_final_id is simply left at 0 below.
+class BinanceSpotFeed {
   public:
-    // Snapshot comes from a REST call (the RequestSnapshot action triggers
-    // an actual HTTP GET), not pushed over the WebSocket -- unlike some
-    // other venues (see docs/ingestion_design.md's TrustConnectionOrderPolicy
-    // note).
+    // Same as Futures: snapshot comes from a REST call, not pushed over
+    // the WebSocket.
     static constexpr bool kSnapshotViaRest = true;
 
-    // Combined-stream endpoint used with the SUBSCRIBE message below -
-    // depth events arrive unwrapped (no {"stream":...,"data":...} envelope),
-    // matching what parse_message() expects.
-    std::string_view ws_host() const { return "fstream.binance.com"; }
-    std::string_view ws_port() const { return "443"; }
+    // Bare /ws (not /stream, the combined-stream endpoint that wraps
+    // payloads as {"stream":...,"data":...}) accepts the same dynamic
+    // SUBSCRIBE method Futures uses and delivers unwrapped depthUpdate
+    // events, matching what parse_message() expects - verified directly
+    // against developers.binance.com's WebSocket Streams doc, not assumed
+    // from Futures' /ws (different port: Spot's plaintext WS port is 9443,
+    // not 443).
+    std::string_view ws_host() const { return "stream.binance.com"; }
+    std::string_view ws_port() const { return "9443"; }
     std::string_view ws_target() const { return "/ws"; }
 
     // Pure function: the JSON to send right after connecting, to subscribe
     // every symbol's depth diff stream. Stream name pattern is
-    // `{symbol}@depth@{update_speed}` (symbol lowercased), matching one of
-    // Binance's documented update_speed options ("100ms"/"500ms").
+    // `{symbol}@depth@{update_speed}` (symbol lowercased). Spot's
+    // documented update_speed options are "100ms" and the default 1000ms
+    // (spelled out explicitly, not "500ms" like Futures) - default kept at
+    // "100ms" here for parity with BinanceFuturesFeed's default, not
+    // because Spot's own default differs.
     std::string subscribe_message(std::span<const SymbolId> symbols,
                                    std::string_view update_speed = "100ms") const {
         std::string params;
@@ -87,7 +94,12 @@ class BinanceFuturesFeed {
             update.symbol.assign(std::string_view(root["s"].get_string()));
             update.first_id = static_cast<std::uint64_t>(root["U"].get_uint64());
             update.final_id = static_cast<std::uint64_t>(root["u"].get_uint64());
-            update.prev_final_id = static_cast<std::uint64_t>(root["pu"].get_uint64());
+            // No `pu` field on Spot's depthUpdate - BinanceSpotSequencePolicy
+            // never reads this, but it must still be set to something
+            // deterministic (see symbol_sync.hpp's DepthUpdate: no default
+            // member initializers, so an unset field is indeterminate, not
+            // zero).
+            update.prev_final_id = 0;
             update.bids = detail::parse_levels(root["b"].get_array());
             update.asks = detail::parse_levels(root["a"].get_array());
 
@@ -97,15 +109,21 @@ class BinanceFuturesFeed {
         }
     }
 
-    // GET /fapi/v1/depth?symbol=<symbol>&limit=1000 -- see
-    // developers.binance.com's Order Book REST endpoint doc.
+    // GET /api/v3/depth?symbol=<symbol>&limit=5000 -- see
+    // developers.binance.com's Order Book REST endpoint doc. limit=5000 is
+    // the maximum Spot allows (Futures caps at 1000); a full-depth
+    // snapshot minimizes how often on_snapshot() has to retry when Spot's
+    // <= drop rule (BinanceSpotSequencePolicy, unlike Futures' strict <)
+    // empties the buffer on a quiet symbol - see docs/ingestion_design.md.
     HttpRequestSpec snapshot_request(const SymbolId& symbol) const {
-        return HttpRequestSpec{"fapi.binance.com", "443", "/fapi/v1/depth?symbol=" + symbol + "&limit=1000"};
+        return HttpRequestSpec{"api.binance.com", "443", "/api/v3/depth?symbol=" + symbol + "&limit=5000"};
     }
 
     // `symbol` is supplied by the caller (the request it made), not read
     // from the response body -- the REST response itself carries no symbol
-    // field (see the doc's Sources for the exact shape).
+    // field (see the doc's Sources for the exact shape). Same shape as
+    // Futures' response minus the `E`/`T` fields Futures has and this code
+    // doesn't parse from either.
     std::expected<SnapshotMessage, std::errc> parse_snapshot_response(SymbolId symbol,
                                                                        std::string_view body) const {
         try {

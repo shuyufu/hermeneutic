@@ -185,5 +185,60 @@ TEST(SymbolSyncTest, DisconnectWhileLiveInvalidatesAndReturnsToBuffering) {
     EXPECT_TRUE(sync.on_depth_update(make_update(101, 105, 100)).empty());
 }
 
+// Spot-specific tests: each one exercises a rule that differs from
+// BinanceFuturesSequencePolicy (see the mirrored Futures test named in each
+// comment) - a policy that was copy-pasted from Futures without actually
+// implementing Spot's own (documented) rules would fail these.
+namespace spot {
+
+using SpotSync = SymbolSync<BinanceSpotSequencePolicy>;
+
+TEST(SymbolSyncSpotTest, DropBoundaryIsNonStrictLessThanOrEqualUnlikeFutures) {
+    // Mirrors SymbolSyncTest.DropBoundaryIsStrictLessThan, inverted: Spot
+    // drops final_id == last_update_id (non-strict <=); Futures keeps it.
+    SpotSync sync;
+    sync.on_connected();
+    sync.on_depth_update(make_update(150, 160, /*prev_final_id=*/0));
+
+    // final_id (160) == last_update_id (160): dropped under Spot's rule, so
+    // nothing survives to bridge - must retry, not apply.
+    auto actions = sync.on_snapshot(make_snapshot(160));
+    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::RequestSnapshot}));
+}
+
+TEST(SymbolSyncSpotTest, BridgeHasPlusOneOffsetUnlikeFutures) {
+    // Mirrors SymbolSyncTest.BridgeHasNoPlusOneOffsetUnlikeSpot, inverted:
+    // under Futures' "no +1 offset" model this would be a gap; Spot's
+    // U <= lastUpdateId+1 <= u model bridges it.
+    SpotSync sync;
+    sync.on_connected();
+    sync.on_depth_update(make_update(161, 165, /*prev_final_id=*/0));
+
+    auto actions = sync.on_snapshot(make_snapshot(160));
+    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::ApplySnapshot, Kind::ApplyDelta}));
+}
+
+TEST(SymbolSyncSpotTest, ContinuityIgnoresPrevFinalIdAndUsesFirstIdInstead) {
+    // Proves the policy never reads prev_final_id: a live-state event whose
+    // prev_final_id is garbage (not the last applied final_id, and not even
+    // set by anything - Spot depthUpdate has no `pu` field) must still
+    // apply, because Spot's continuity check is first_id == last_u+1, not a
+    // pu back-pointer comparison.
+    SpotSync sync;
+    sync.on_connected();
+    // last_update_id (99), not 100: Spot drops final_id <= last_update_id
+    // (non-strict), so a snapshot of 100 here would drop this very event
+    // instead of bridging on it.
+    sync.on_depth_update(make_update(1, 100, /*prev_final_id=*/0));
+    ASSERT_EQ(kinds_of(sync.on_snapshot(make_snapshot(99))).size(), 2u);  // now Live, last_final_id_ == 100
+
+    constexpr std::uint64_t kGarbagePrevFinalId = 999'999;
+    auto actions = sync.on_depth_update(
+        make_update(101, 105, kGarbagePrevFinalId, {{Price(9.0), Size(9.0)}}));
+    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::ApplyDelta}));
+}
+
+}  // namespace spot
+
 }  // namespace
 }  // namespace bobby::hermeneutic
