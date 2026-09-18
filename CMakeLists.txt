@@ -58,6 +58,7 @@ if(HERMENEUTIC_BUILD_TESTS)
         tests/book/price_bands_test.cpp
         tests/book/volume_bands_test.cpp
         tests/book/symbol_sync_test.cpp
+        tests/ingestion/book_subscription_test.cpp
     )
     target_link_libraries(hermeneutic_tests PRIVATE
         hermeneutic::book hermeneutic::exchange_policy GTest::gtest_main)
