@@ -4,8 +4,35 @@ project(hermeneutic CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_library(hermeneutic INTERFACE)
-target_include_directories(hermeneutic INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+# Target layout mirrors include/bobby/hermeneutic/<tier>/ and tracks the
+# actual dependency graph, not just the directory names: core/book/
+# exchange_policy are always available (zero third-party dependency beyond
+# each other); exchange (real Feed parsers) needs simdjson
+# (HERMENEUTIC_BUILD_INGESTION); net/service/ingestion need gRPC/Boost/
+# OpenSSL (HERMENEUTIC_BUILD_SERVICE). Every target is an INTERFACE library
+# (this project is header-only outside the generated proto/gRPC code and
+# the aggregator executable) exposed under a hermeneutic::<tier> ALIAS -
+# `::` is reserved for ALIAS/IMPORTED targets in CMake, so the real
+# add_library() name stays the plain hermeneutic_<tier> spelling and only
+# the ALIAS carries the namespaced name consumers link against.
+
+add_library(hermeneutic_core INTERFACE)
+target_include_directories(hermeneutic_core INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+add_library(hermeneutic::core ALIAS hermeneutic_core)
+
+add_library(hermeneutic_book INTERFACE)
+target_link_libraries(hermeneutic_book INTERFACE hermeneutic::core)
+add_library(hermeneutic::book ALIAS hermeneutic_book)
+
+# The per-venue *SequencePolicy structs (exchange/<venue>/*_sequence_policy.hpp)
+# are deliberately split out from their venue's Feed header: a Policy only
+# needs SymbolSync's own DepthUpdate/SnapshotMessage types, never simdjson,
+# and VenueSessionTest/IngestionRunnerTest drive a fake Feed against a real
+# Policy specifically to avoid linking simdjson into those tests - see
+# tests/ingestion/venue_session_test.cpp's FakeHttpRequestSpec comment.
+add_library(hermeneutic_exchange_policy INTERFACE)
+target_link_libraries(hermeneutic_exchange_policy INTERFACE hermeneutic::book)
+add_library(hermeneutic::exchange_policy ALIAS hermeneutic_exchange_policy)
 
 option(HERMENEUTIC_BUILD_TESTS "Build unit tests" ON)
 
@@ -24,15 +51,16 @@ if(HERMENEUTIC_BUILD_TESTS)
     include(GoogleTest)
 
     add_executable(hermeneutic_tests
-        tests/fixed_point_test.cpp
-        tests/order_book_test.cpp
-        tests/aggregate_order_book_test.cpp
-        tests/notional_test.cpp
-        tests/volume_bands_test.cpp
-        tests/price_bands_test.cpp
-        tests/symbol_sync_test.cpp
+        tests/core/fixed_point_test.cpp
+        tests/core/notional_test.cpp
+        tests/book/l2_order_book_test.cpp
+        tests/book/aggregate_order_book_test.cpp
+        tests/book/price_bands_test.cpp
+        tests/book/volume_bands_test.cpp
+        tests/book/symbol_sync_test.cpp
     )
-    target_link_libraries(hermeneutic_tests PRIVATE hermeneutic GTest::gtest_main)
+    target_link_libraries(hermeneutic_tests PRIVATE
+        hermeneutic::book hermeneutic::exchange_policy GTest::gtest_main)
     gtest_discover_tests(hermeneutic_tests)
 endif()
 
@@ -52,40 +80,34 @@ if(HERMENEUTIC_BUILD_INGESTION)
     )
     FetchContent_MakeAvailable(simdjson)
 
+    add_library(hermeneutic_exchange INTERFACE)
+    target_link_libraries(hermeneutic_exchange INTERFACE hermeneutic::book simdjson)
+    add_library(hermeneutic::exchange ALIAS hermeneutic_exchange)
+
     if(HERMENEUTIC_BUILD_TESTS)
-        add_executable(hermeneutic_binance_futures_feed_test tests/binance_futures_feed_test.cpp)
-        target_include_directories(hermeneutic_binance_futures_feed_test PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/service)
+        add_executable(hermeneutic_binance_futures_feed_test tests/exchange/binance/binance_futures_feed_test.cpp)
         target_link_libraries(hermeneutic_binance_futures_feed_test PRIVATE
-            hermeneutic simdjson GTest::gtest_main)
+            hermeneutic::exchange GTest::gtest_main)
         gtest_discover_tests(hermeneutic_binance_futures_feed_test)
 
-        add_executable(hermeneutic_binance_spot_feed_test tests/binance_spot_feed_test.cpp)
-        target_include_directories(hermeneutic_binance_spot_feed_test PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/service)
+        add_executable(hermeneutic_binance_spot_feed_test tests/exchange/binance/binance_spot_feed_test.cpp)
         target_link_libraries(hermeneutic_binance_spot_feed_test PRIVATE
-            hermeneutic simdjson GTest::gtest_main)
+            hermeneutic::exchange GTest::gtest_main)
         gtest_discover_tests(hermeneutic_binance_spot_feed_test)
 
-        add_executable(hermeneutic_bybit_linear_feed_test tests/bybit_linear_feed_test.cpp)
-        target_include_directories(hermeneutic_bybit_linear_feed_test PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/service)
+        add_executable(hermeneutic_bybit_linear_feed_test tests/exchange/bybit/bybit_linear_feed_test.cpp)
         target_link_libraries(hermeneutic_bybit_linear_feed_test PRIVATE
-            hermeneutic simdjson GTest::gtest_main)
+            hermeneutic::exchange GTest::gtest_main)
         gtest_discover_tests(hermeneutic_bybit_linear_feed_test)
 
-        add_executable(hermeneutic_bybit_spot_feed_test tests/bybit_spot_feed_test.cpp)
-        target_include_directories(hermeneutic_bybit_spot_feed_test PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/service)
+        add_executable(hermeneutic_bybit_spot_feed_test tests/exchange/bybit/bybit_spot_feed_test.cpp)
         target_link_libraries(hermeneutic_bybit_spot_feed_test PRIVATE
-            hermeneutic simdjson GTest::gtest_main)
+            hermeneutic::exchange GTest::gtest_main)
         gtest_discover_tests(hermeneutic_bybit_spot_feed_test)
 
-        add_executable(hermeneutic_okx_feed_test tests/okx_feed_test.cpp)
-        target_include_directories(hermeneutic_okx_feed_test PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/service)
+        add_executable(hermeneutic_okx_feed_test tests/exchange/okx/okx_feed_test.cpp)
         target_link_libraries(hermeneutic_okx_feed_test PRIVATE
-            hermeneutic simdjson GTest::gtest_main)
+            hermeneutic::exchange GTest::gtest_main)
         gtest_discover_tests(hermeneutic_okx_feed_test)
     endif()
 endif()
@@ -98,6 +120,17 @@ if(HERMENEUTIC_BUILD_SERVICE)
     find_package(boost_asio CONFIG REQUIRED)
     find_package(boost_beast CONFIG REQUIRED)
     find_package(OpenSSL REQUIRED)
+
+    # net_traits.hpp/http_client.hpp/websocket_connection.hpp never touch
+    # Price/Size or any book type, but every header in this project
+    # #includes its neighbors via the repo-root-relative
+    # "bobby/hermeneutic/..." spelling rather than a relative path, so this
+    # target still needs hermeneutic::core purely for the include/ root -
+    # not a real dependency on anything core actually defines.
+    add_library(hermeneutic_net INTERFACE)
+    target_link_libraries(hermeneutic_net INTERFACE
+        hermeneutic::core Boost::asio Boost::beast OpenSSL::SSL OpenSSL::Crypto)
+    add_library(hermeneutic::net ALIAS hermeneutic_net)
 
     set(HERMENEUTIC_PROTO_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/proto)
     set(HERMENEUTIC_PROTO_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
@@ -143,47 +176,56 @@ if(HERMENEUTIC_BUILD_SERVICE)
     add_library(hermeneutic_proto STATIC ${HERMENEUTIC_PROTO_GENERATED_SRCS})
     target_include_directories(hermeneutic_proto PUBLIC ${HERMENEUTIC_PROTO_GEN_DIR})
     target_link_libraries(hermeneutic_proto PUBLIC gRPC::grpc++ protobuf::libprotobuf)
+    add_library(hermeneutic::proto ALIAS hermeneutic_proto)
 
-    add_executable(hermeneutic_aggregator_service service/aggregator_main.cpp)
+    # SymbolBook/AggregatorService (aggregator_service.hpp): the aggregate
+    # book plus its gRPC fan-out - genuinely depends on both book (for
+    # AggregateOrderBook) and the generated proto/gRPC types, not just a
+    # thin gRPC wrapper around ingestion.
+    add_library(hermeneutic_service INTERFACE)
+    target_link_libraries(hermeneutic_service INTERFACE hermeneutic::book hermeneutic::proto)
+    add_library(hermeneutic::service ALIAS hermeneutic_service)
+
+    # venue_session.hpp/ingestion_runner.hpp: the I/O driver that feeds a
+    # venue's WebSocket stream into SymbolBook - depends on net (its own
+    # transport) *and* service (venue_session.hpp uses
+    # bobby::hermeneutic::aggregator::SymbolBook directly, a real, not
+    # incidental, dependency - see SymbolBook's grpc::ServerWriter-typed
+    # public API). This is the opposite direction from what the directory
+    # names alone might suggest: ingestion sits above service in the
+    # dependency graph, not below it.
+    add_library(hermeneutic_ingestion INTERFACE)
+    target_link_libraries(hermeneutic_ingestion INTERFACE hermeneutic::net hermeneutic::service)
+    add_library(hermeneutic::ingestion ALIAS hermeneutic_ingestion)
+
+    add_executable(hermeneutic_aggregator_service apps/aggregator/main.cpp)
     target_link_libraries(hermeneutic_aggregator_service PRIVATE
-        hermeneutic_proto hermeneutic simdjson Boost::asio Boost::beast OpenSSL::SSL OpenSSL::Crypto)
+        hermeneutic::ingestion hermeneutic::exchange hermeneutic::exchange_policy)
 
     if(HERMENEUTIC_BUILD_TESTS)
-        add_executable(hermeneutic_aggregator_service_test tests/aggregator_service_test.cpp)
-        target_include_directories(hermeneutic_aggregator_service_test PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/service)
+        add_executable(hermeneutic_aggregator_service_test tests/service/aggregator_service_test.cpp)
         target_link_libraries(hermeneutic_aggregator_service_test PRIVATE
-            hermeneutic_proto hermeneutic GTest::gtest_main)
+            hermeneutic::service GTest::gtest_main)
         gtest_discover_tests(hermeneutic_aggregator_service_test)
 
-        add_executable(hermeneutic_websocket_connection_test tests/websocket_connection_test.cpp)
-        target_include_directories(hermeneutic_websocket_connection_test PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/service)
+        add_executable(hermeneutic_websocket_connection_test tests/net/websocket_connection_test.cpp)
         target_link_libraries(hermeneutic_websocket_connection_test PRIVATE
-            hermeneutic Boost::asio Boost::beast OpenSSL::SSL OpenSSL::Crypto GTest::gtest_main)
+            hermeneutic::net GTest::gtest_main)
         gtest_discover_tests(hermeneutic_websocket_connection_test)
 
-        add_executable(hermeneutic_http_client_test tests/http_client_test.cpp)
-        target_include_directories(hermeneutic_http_client_test PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/service)
+        add_executable(hermeneutic_http_client_test tests/net/http_client_test.cpp)
         target_link_libraries(hermeneutic_http_client_test PRIVATE
-            hermeneutic Boost::asio Boost::beast OpenSSL::SSL OpenSSL::Crypto GTest::gtest_main)
+            hermeneutic::net GTest::gtest_main)
         gtest_discover_tests(hermeneutic_http_client_test)
 
-        add_executable(hermeneutic_venue_session_test tests/venue_session_test.cpp)
-        target_include_directories(hermeneutic_venue_session_test PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/service)
+        add_executable(hermeneutic_venue_session_test tests/ingestion/venue_session_test.cpp)
         target_link_libraries(hermeneutic_venue_session_test PRIVATE
-            hermeneutic_proto hermeneutic Boost::asio Boost::beast OpenSSL::SSL OpenSSL::Crypto
-            GTest::gtest_main)
+            hermeneutic::ingestion hermeneutic::exchange_policy GTest::gtest_main)
         gtest_discover_tests(hermeneutic_venue_session_test)
 
-        add_executable(hermeneutic_ingestion_runner_test tests/ingestion_runner_test.cpp)
-        target_include_directories(hermeneutic_ingestion_runner_test PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/service)
+        add_executable(hermeneutic_ingestion_runner_test tests/ingestion/ingestion_runner_test.cpp)
         target_link_libraries(hermeneutic_ingestion_runner_test PRIVATE
-            hermeneutic_proto hermeneutic Boost::asio Boost::beast OpenSSL::SSL OpenSSL::Crypto
-            GTest::gtest_main)
+            hermeneutic::ingestion hermeneutic::exchange_policy GTest::gtest_main)
         gtest_discover_tests(hermeneutic_ingestion_runner_test)
     endif()
 endif()
