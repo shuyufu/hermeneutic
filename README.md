@@ -43,18 +43,26 @@ example, alongside its hand-written service in `service/aggregator_service.hpp`.
 ### Aggregator service
 
 `hermeneutic_aggregator_service` (`service/aggregator_main.cpp`) streams the
-aggregated L2 order book to subscribers: a client calls `Subscribe` with the
-symbol it wants, gets an initial snapshot, then every subsequent change as it
-happens. One instance serves any number of symbols on a single port — each
-gets its own `SymbolBook` (an `AggregateOrderBook` plus its own subscriber
-fan-out), routed by `SubscribeRequest.symbol`. It only wraps the book(s) and
-broadcasts to subscribers — feeding real market data
-(`SymbolBook::apply_delta`/`apply_snapshot`/`invalidate_venue`, reached via
-`AggregatorService::book(symbol)`) is up to the caller.
+aggregated L2 order book to subscribers: a client calls `SubscribeL2Diff` or
+`SubscribeBbo` with the symbol it wants, gets an initial snapshot, then every
+subsequent change as it happens. One instance serves any number of symbols on
+a single port — each gets two independent `SymbolBook`s (an
+`AggregateOrderBook` plus its own subscriber fan-out), one for perpetual/
+futures liquidity and one for spot, routed by `SubscribeL2DiffRequest.symbol`/
+`SubscribeBboRequest.symbol`. The CLI's own symbol list is the bare base pair
+(`BTCUSDT`), but the symbol a client actually subscribes with is
+`.PERP`/`.SPOT`-suffixed (`"BTCUSDT.PERP"`, `"BTCUSDT.SPOT"`) - see
+`docs/ingestion_design.md`'s OKX section for why perp and spot aren't merged
+into one book. It only wraps the book(s) and broadcasts to subscribers —
+feeding real market data (`SymbolBook::apply_delta`/`apply_snapshot`/
+`invalidate_venue`, reached via `AggregatorService::book(".PERP"/".SPOT"-suffixed
+symbol)`) is up to the caller.
 
 ```sh
 cmake --build build-vcpkg --target hermeneutic_aggregator_service
-./build-vcpkg/hermeneutic_aggregator_service 0.0.0.0:50051 BTCUSDT,ETHUSDT
+# [address] [BASE_SYMBOL1,BASE_SYMBOL2,...] [OKX_INSTID1,OKX_INSTID2,...] - the
+# third argument is optional; omitting it runs without an OKX venue.
+./build-vcpkg/hermeneutic_aggregator_service 0.0.0.0:50051 BTCUSDT,ETHUSDT BTC-USDT,BTC-USDT-SWAP
 ```
 
 `hermeneutic_aggregator_service_test` exercises it over a real (in-process)

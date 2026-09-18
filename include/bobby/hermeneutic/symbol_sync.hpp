@@ -1,7 +1,6 @@
 #pragma once
 
 #include <algorithm>
-#include <cassert>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -172,11 +171,28 @@ class SymbolSync {
             // bridge a fresher snapshot), ask for another one.
             return {RequestSnapshot{}};
         }
-        // Sequence IDs only increase, and should_drop_buffered() already
-        // removed everything below the snapshot's coverage, so the first
-        // surviving event either bridges or nothing does - never a later
-        // one while an earlier survivor is silently skipped.
-        assert(bridge == buffer_.begin());
+        // For a policy whose sequence numbers only increase (Binance,
+        // Bybit), should_drop_buffered() already removed everything below
+        // the snapshot's coverage, so the first surviving event always
+        // either bridges or nothing does - bridge lands on buffer_.begin()
+        // whenever it's found at all. This is NOT a precondition the loop
+        // below actually depends on, though: applying from bridge onward
+        // and discarding anything before it (in arrival order) is correct
+        // regardless of bridge's position, because the snapshot itself is
+        // the authoritative state as of its own sequence number - anything
+        // buffered before the bridge event is superseded by the snapshot no
+        // matter why it didn't survive should_drop_buffered's own filter.
+        // This matters for a policy whose sequence numbers are explicitly
+        // NOT assumed monotonic (see OkxSequencePolicy's documented
+        // sequence-reset case): should_drop_buffered's numeric comparison
+        // can under-drop across a reset, leaving a stale earlier survivor
+        // in front of the real bridge - asserting bridge == begin() here
+        // would be a false alarm in a debug build (or, worse, would have
+        // silently been relied upon to always hold), not a real invariant
+        // violation. There used to be an assert(bridge == buffer_.begin())
+        // here for exactly that now-incorrect reason - removed rather than
+        // conditioned on a new policy trait, since the loop needs no such
+        // guarantee to behave correctly either way.
 
         std::vector<SyncAction> actions;
         actions.emplace_back(ApplySnapshot{std::move(snapshot.bids), std::move(snapshot.asks)});
@@ -341,6 +357,55 @@ struct BybitSequencePolicy {
 
     static bool is_contiguous(const DepthUpdate& event, std::uint64_t last_applied_final_id) {
         return event.final_id == last_applied_final_id + 1;
+    }
+};
+
+// OKX v5 public `books` channel, verified against the sequencing rules the
+// user quoted directly from OKX's own docs (not assumed from training
+// data), then traced against the worked example those docs give:
+//   snapshot: prevSeqId=-1, seqId=10
+//   normal update:          prevSeqId=10, seqId=15
+//   idle heartbeat:         prevSeqId=15, seqId=15   (empty bids/asks)
+//   sequence reset:         prevSeqId=15, seqId=3    (seqId itself resets down)
+//   normal update:          prevSeqId=3,  seqId=5
+// Every step checks out under a pure prevSeqId == last-applied-seqId chain,
+// the same shape as Binance Futures' `pu` back-pointer - no special-casing
+// needed for either the heartbeat (chains from itself: prevSeqId==seqId,
+// applies as a harmless empty ApplyDelta) or the reset (prevSeqId still
+// chains correctly from the prior seqId; only the numeric value of seqId
+// itself moves backward, which nothing here assumes is monotonic).
+//   - OKX gives one seqId per message, not Binance's first_id/final_id
+//     range - DepthUpdate::first_id and ::final_id both carry seqId
+//     (OkxFeed::parse_message sets both), so either field reads
+//     consistently; first_id has no distinct meaning for OKX.
+//   - should_drop_buffered()'s `<` (not `<=`) is a buffer-hygiene detail,
+//     not a correctness-critical gap check - the real gap detection is
+//     is_contiguous()'s exact chain match. Under the documented sequence
+//     reset, a buffered event could in principle have a final_id that
+//     doesn't compare cleanly against a post-reset snapshot's
+//     last_update_id; if that ever under-drops, on_snapshot() just fails to
+//     find a bridge and safely retries (RequestSnapshot), it does not apply
+//     wrong data - resets are documented as maintenance-only and rare.
+//   - Checksum (CRC32 over the top book levels) is deliberately not
+//     implemented - the user confirmed relying on the seqId/prevSeqId chain
+//     alone, the same rigor Binance's policies already operate at with no
+//     extra integrity layer.
+//   - kTrustsConnectionOrder = true: OKX pushes its own snapshot as the
+//     first message on a fresh (re)subscribe (kSnapshotViaRest == false),
+//     same reasoning as BybitSequencePolicy above.
+struct OkxSequencePolicy {
+    static constexpr bool kTrustsConnectionOrder = true;
+
+    static bool should_drop_buffered(const DepthUpdate& event, const SnapshotMessage& snapshot) {
+        return event.final_id < snapshot.last_update_id;
+    }
+
+    static bool bridges_snapshot(const DepthUpdate& event, const SnapshotMessage& snapshot) {
+        return event.prev_final_id == snapshot.last_update_id;
+    }
+
+    static bool is_contiguous(const DepthUpdate& event, std::uint64_t last_applied_final_id) {
+        return event.prev_final_id == last_applied_final_id;
     }
 };
 

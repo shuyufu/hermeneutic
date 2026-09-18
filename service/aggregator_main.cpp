@@ -6,7 +6,9 @@
 #include <boost/asio/ssl.hpp>
 #include <boost/beast/core/tcp_stream.hpp>
 
+#include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <condition_variable>
 #include <exception>
@@ -24,6 +26,7 @@
 #include "bybit_linear_feed.hpp"
 #include "bybit_spot_feed.hpp"
 #include "ingestion_runner.hpp"
+#include "okx_feed.hpp"
 #include "venue_session.hpp"
 
 namespace {
@@ -51,9 +54,23 @@ int main(int argc, char** argv) {
         std::string("BTCUSDT")};
     if (symbols.empty()) {
         std::cerr << "no symbols given (usage: hermeneutic_aggregator_service [address] "
-                     "[SYMBOL1,SYMBOL2,...])\n";
+                     "[SYMBOL1,SYMBOL2,...] [OKX_INSTID1,OKX_INSTID2,...])\n";
         return 1;
     }
+
+    // OKX symbols are given in OKX's own native instId format (e.g.
+    // "BTC-USDT", "BTC-USDT-SWAP"), not the bare "BTCUSDT" `symbols` above -
+    // see okx_canonical() for why only this direction is unambiguous.
+    // Defaults to empty (no OKX venue at all), not a hardcoded "BTC-USDT":
+    // a fixed default here has no way to track whatever `symbols` actually
+    // ended up being (its own default, or an operator-supplied list that
+    // doesn't include BTC at all), so it would either validate against
+    // unrelated symbols and fail startup outright, or - even in the fully-
+    // default case - only cover one of BTCUSDT's two book_symbols entries
+    // and warn about the other on every default run. Preserves the
+    // pre-OKX, two-positional-argument invocation exactly (no OKX arg means
+    // no OKX venue, not a guess).
+    std::vector<std::string> okx_symbols = argc > 3 ? split_symbols(argv[3]) : std::vector<std::string>{};
 
     // AggregatorService's book set is keyed by ".PERP"/".SPOT"-suffixed
     // canonical symbols, not the bare "BTCUSDT" `symbols` themselves -
@@ -68,6 +85,48 @@ int main(int argc, char** argv) {
         book_symbols.push_back(symbol + ".PERP");
         book_symbols.push_back(symbol + ".SPOT");
     }
+
+    // Validated here, before AggregatorService/the gRPC server/heartbeat_thread
+    // exist - not later, once other resources are already running. A
+    // std::thread left joinable when main() early-returns calls
+    // std::terminate() in its destructor during stack unwind, so any exit
+    // path taken after heartbeat_thread starts below would need to stop and
+    // join it first; simplest to just not have an exit path there at all by
+    // finishing every startup-configuration check first. Every OKX symbol
+    // must canonicalize to one of the tracked base symbols above - a typo or
+    // an unsupported instId shape (dated futures/options) is a startup
+    // configuration error, not something to silently drop.
+    //
+    // covered_by_okx tracks, per book_symbols entry, whether any OKX instId
+    // maps to it - Binance/Bybit always cover every tracked symbol
+    // unconditionally (see the registry-building loop below), but OKX
+    // coverage is opt-in per instId, so a book with no matching OKX instId
+    // at all still runs fine (on Binance/Bybit liquidity alone) but
+    // silently so unless flagged here - easy to miss since the two symbol
+    // lists use different formats and are positionally separate
+    // command-line args.
+    // Skipped entirely when okx_symbols is empty (OKX not requested at
+    // all): warning about missing OKX coverage for every book on every
+    // invocation that never asked for OKX in the first place would just be
+    // noise, not a useful signal.
+    if (!okx_symbols.empty()) {
+        std::vector<bool> covered_by_okx(book_symbols.size(), false);
+        for (const auto& okx_symbol : okx_symbols) {
+            auto canonical = bobby::hermeneutic::ingestion::okx_canonical(okx_symbol);
+            auto it =
+                canonical ? std::find(book_symbols.begin(), book_symbols.end(), *canonical) : book_symbols.end();
+            if (it == book_symbols.end()) {
+                std::cerr << "OKX symbol " << okx_symbol
+                          << " is not a supported spot/swap instId among the tracked symbols\n";
+                return 1;
+            }
+            covered_by_okx[static_cast<std::size_t>(it - book_symbols.begin())] = true;
+        }
+        for (std::size_t i = 0; i < book_symbols.size(); ++i) {
+            if (!covered_by_okx[i]) std::cerr << "warning: no OKX instId given for " << book_symbols[i] << "\n";
+        }
+    }
+
     bobby::hermeneutic::aggregator::AggregatorService service(book_symbols);
 
     grpc::ServerBuilder builder;
@@ -118,23 +177,22 @@ int main(int argc, char** argv) {
     // Ingestion: one VenueSession per venue, covering every symbol this
     // process serves, feeding the same AggregatorService the gRPC server
     // above exposes. Binance USDS-M Futures, Binance Spot, Bybit linear
-    // (USDT perpetuals), and Bybit spot for now (see
-    // docs/ingestion_design.md - IngestionRunner is what any further venue
-    // would go through too - see 第 10 節第 2 項). The two perp/futures
-    // venues write into the ".PERP" book, the two spot venues into the
-    // ".SPOT" book - two independent SymbolBooks per base symbol, each
-    // aggregating two venues' liquidity under distinct VenueIds
-    // (SymbolBook::apply_batch/invalidate_venue are per-VenueId, so this is
-    // safe - see 第 10 節第 2 項's note on multiple sessions writing the
-    // same SymbolBook*), not all four venues sharing one book the way an
-    // earlier revision of this file did. A real TLS context, not the
-    // plain-TCP instantiation the tests use: this is the path that runs
-    // against real exchanges rather than a local test server.
+    // (USDT perpetuals), Bybit spot, and OKX (spot + perpetual swap) for
+    // now (see docs/ingestion_design.md - IngestionRunner is what any
+    // further venue would go through too - see 第 10 節第 2 項). The
+    // perp/futures/swap venues write into the ".PERP" book, the spot
+    // venues into the ".SPOT" book - two independent SymbolBooks per base
+    // symbol, each aggregating multiple venues' liquidity under distinct
+    // VenueIds (SymbolBook::apply_batch/invalidate_venue are per-VenueId,
+    // so this is safe - see 第 10 節第 2 項's note on multiple sessions
+    // writing the same SymbolBook*). A real TLS context, not the plain-TCP
+    // instantiation the tests use: this is the path that runs against real
+    // exchanges rather than a local test server.
     net::ssl::context ssl_ctx(net::ssl::context::tlsv12_client);
     ssl_ctx.set_default_verify_paths();
     ssl_ctx.set_verify_mode(net::ssl::verify_peer);
 
-    // Four independent registries, not one shared/moved: each VenueSession
+    // Independent registries, not one shared/moved: each VenueSession
     // takes its registry by value and moves it in, so passing the same
     // moved-from registry to a later add<>() would leave that venue's
     // SymbolRegistry::book() returning nullptr for every symbol.
@@ -147,6 +205,31 @@ int main(int argc, char** argv) {
         binance_spot_registry.add(symbol, service.book(symbol + ".SPOT"));
         bybit_linear_registry.add(symbol, service.book(symbol + ".PERP"));
         bybit_spot_registry.add(symbol, service.book(symbol + ".SPOT"));
+    }
+
+    // OKX is a single Feed/Policy pair covering both spot and perpetual
+    // swap instIds (the `books` channel is protocol-identical for both -
+    // see okx_feed.hpp), wired as two separate venues ("okx_spot",
+    // "okx_swap") so each contributes to the right book. Already validated
+    // above (before any resource here existed) that every okx_symbol
+    // canonicalizes to one of book_symbols, so service.book() below cannot
+    // return nullptr - asserted, not re-checked with another exit path.
+    bobby::hermeneutic::ingestion::SymbolRegistry okx_spot_registry;
+    bobby::hermeneutic::ingestion::SymbolRegistry okx_swap_registry;
+    std::vector<std::string> okx_spot_symbols;
+    std::vector<std::string> okx_swap_symbols;
+    for (const auto& okx_symbol : okx_symbols) {
+        auto canonical = bobby::hermeneutic::ingestion::okx_canonical(okx_symbol);
+        assert(canonical);
+        auto* book = service.book(*canonical);
+        assert(book);
+        if (bobby::hermeneutic::ingestion::is_swap(okx_symbol)) {
+            okx_swap_registry.add(okx_symbol, book);
+            okx_swap_symbols.push_back(okx_symbol);
+        } else {
+            okx_spot_registry.add(okx_symbol, book);
+            okx_spot_symbols.push_back(okx_symbol);
+        }
     }
 
     net::io_context io;
@@ -167,13 +250,28 @@ int main(int argc, char** argv) {
                net::ssl::stream<boost::beast::tcp_stream>>(
         bobby::hermeneutic::ingestion::BybitSpotFeed{}, "bybit_spot", symbols, std::move(bybit_spot_registry),
         io.get_executor(), &ssl_ctx);
+    if (!okx_spot_symbols.empty()) {
+        runner.add<bobby::hermeneutic::ingestion::OkxFeed, bobby::hermeneutic::OkxSequencePolicy,
+                   net::ssl::stream<boost::beast::tcp_stream>>(
+            bobby::hermeneutic::ingestion::OkxFeed{}, "okx_spot", okx_spot_symbols,
+            std::move(okx_spot_registry), io.get_executor(), &ssl_ctx);
+    }
+    if (!okx_swap_symbols.empty()) {
+        runner.add<bobby::hermeneutic::ingestion::OkxFeed, bobby::hermeneutic::OkxSequencePolicy,
+                   net::ssl::stream<boost::beast::tcp_stream>>(
+            bobby::hermeneutic::ingestion::OkxFeed{}, "okx_swap", okx_swap_symbols,
+            std::move(okx_swap_registry), io.get_executor(), &ssl_ctx);
+    }
     runner.start_all();
     std::thread io_thread([&io] { io.run(); });
 
     std::cout << "hermeneutic_aggregator_service listening on " << address << " for "
               << symbols.size() << " symbol(s):";
     for (const auto& symbol : symbols) std::cout << ' ' << symbol;
-    std::cout << ", ingesting from binance_futures + binance_spot + bybit_linear + bybit_spot" << std::endl;
+    std::cout << ", ingesting from binance_futures + binance_spot + bybit_linear + bybit_spot";
+    if (!okx_spot_symbols.empty()) std::cout << " + okx_spot";
+    if (!okx_swap_symbols.empty()) std::cout << " + okx_swap";
+    std::cout << std::endl;
     server->Wait();
 
     // No io.stop() as the primary shutdown mechanism: stop_all() aborts

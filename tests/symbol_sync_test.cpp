@@ -400,5 +400,164 @@ TEST(SymbolSyncBybitTest, ContinuityIgnoresPrevFinalIdAndFirstIdEntirely) {
 
 }  // namespace bybit
 
+// OKX-specific tests, using OkxSequencePolicy directly (not the generic
+// TrustingSequencePolicy in the trust_connection_order namespace above,
+// which only proves the shared kTrustsConnectionOrder mechanism in the
+// abstract) - see OkxSequencePolicy's doc comment in symbol_sync.hpp for
+// the seqId/prevSeqId semantics these exercise, verified against the OKX
+// documentation text the user quoted directly. make_update()'s first_id is
+// irrelevant here (OKX has no distinct range start - OkxFeed::parse_message
+// sets first_id == final_id, and OkxSequencePolicy never reads first_id at
+// all), so it's set to whatever value each test finds clearest.
+namespace okx {
+
+using OkxSync = SymbolSync<OkxSequencePolicy>;
+
+TEST(SymbolSyncOkxTest, SnapshotArrivingBeforeAnyBufferedEventGoesLiveDirectly) {
+    // OKX's actual message order: the snapshot is the first message
+    // VenueSession ever reads for a topic, so buffer_ is empty when
+    // on_snapshot() first runs.
+    OkxSync sync;
+    sync.on_connected();
+
+    auto actions = sync.on_snapshot(make_snapshot(10));
+    ASSERT_EQ(kinds_of(actions), (std::vector{Kind::ApplySnapshot}));
+
+    // Now live with last_final_id_ == snapshot.last_update_id (10): a
+    // directly-chaining update (prevSeqId == 10) applies without buffering.
+    auto live_actions = sync.on_depth_update(make_update(15, 15, /*prev_final_id=*/10, {{Price(2.0), Size(2.0)}}));
+    ASSERT_EQ(kinds_of(live_actions), (std::vector{Kind::ApplyDelta}));
+    EXPECT_EQ(std::get<ApplyDelta>(live_actions[0]).bids,
+              (std::vector<std::pair<Price, Size>>{{Price(2.0), Size(2.0)}}));
+}
+
+TEST(SymbolSyncOkxTest, NonEmptyBufferThatDoesNotBridgeStillRetriesDespiteTrustingConnectionOrder) {
+    OkxSync sync;
+    sync.on_connected();
+    // Buffered, but neither dropped (final_id 15 is not < 5) nor bridging
+    // (prev_final_id 10 != snapshot's last_update_id 5).
+    sync.on_depth_update(make_update(15, 15, /*prev_final_id=*/10));
+
+    auto actions = sync.on_snapshot(make_snapshot(5));
+    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::RequestSnapshot}));
+}
+
+TEST(SymbolSyncOkxTest, PostGapBufferedEventIsNotDiscardedByTheEmptyBufferShortcut) {
+    OkxSync sync;
+    sync.on_connected();
+    ASSERT_EQ(kinds_of(sync.on_snapshot(make_snapshot(10))),
+              (std::vector{Kind::ApplySnapshot}));  // live, last_final_id_ == 10
+
+    // A gap: prev_final_id (999) doesn't match the last applied final_id (10).
+    auto gap_actions = sync.on_depth_update(make_update(1000, 1000, /*prev_final_id=*/999));
+    EXPECT_EQ(kinds_of(gap_actions), (std::vector{Kind::InvalidateVenue}));
+
+    // A fresher snapshot (2000) drops that buffered event as stale
+    // (1000 < 2000) - buffer_ ends up empty *after* dropping, the same
+    // observable state as "nothing was ever buffered". Must still retry.
+    auto actions = sync.on_snapshot(make_snapshot(2000));
+    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::RequestSnapshot}));
+}
+
+TEST(SymbolSyncOkxTest, DropBoundaryIsStrictLessThan) {
+    OkxSync sync;
+    sync.on_connected();
+    // final_id == last_update_id exactly: must survive the drop filter
+    // (should_drop_buffered is strict <, not <=).
+    sync.on_depth_update(make_update(160, 160, /*prev_final_id=*/149));
+
+    auto actions = sync.on_snapshot(make_snapshot(160));
+    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::RequestSnapshot}));
+}
+
+TEST(SymbolSyncOkxTest, BridgeCanLandAfterAnEarlierNonBridgingSurvivorAcrossASequenceReset) {
+    // OkxSequencePolicy's seqId is explicitly not assumed monotonic (see its
+    // doc comment) - unlike Binance/Bybit, should_drop_buffered()'s numeric
+    // `<` comparison can under-drop across a documented sequence reset,
+    // leaving a stale, non-bridging survivor sitting *before* the real
+    // bridge in arrival order. on_snapshot() must still find and apply from
+    // that later bridge, silently discarding the earlier survivor, rather
+    // than assuming (or asserting) the first survivor is always the bridge.
+    //
+    // Buffered while still connecting: A{prev_final_id=15, final_id=3} (the
+    // reset event itself - seqId drops to 3 but still chains from a prior
+    // seqId of 15), then B{prev_final_id=3, final_id=5} (chains from A).
+    // A snapshot with last_update_id=3 arrives: should_drop_buffered keeps
+    // both (3<3 and 5<3 are both false), but only B bridges (prev_final_id
+    // 3 == 3) - A does not (prev_final_id 15 != 3). Only B's data must
+    // apply; A is superseded by the snapshot's own state and must not be.
+    OkxSync sync;
+    sync.on_connected();
+    sync.on_depth_update(make_update(3, 3, /*prev_final_id=*/15, {{Price(1.0), Size(1.0)}}));
+    sync.on_depth_update(make_update(5, 5, /*prev_final_id=*/3, {{Price(2.0), Size(2.0)}}));
+
+    auto actions = sync.on_snapshot(make_snapshot(3));
+    ASSERT_EQ(kinds_of(actions), (std::vector{Kind::ApplySnapshot, Kind::ApplyDelta}));
+    EXPECT_EQ(std::get<ApplyDelta>(actions[1]).bids,
+              (std::vector<std::pair<Price, Size>>{{Price(2.0), Size(2.0)}}));  // B, not A
+
+    // last_final_id_ must be B's final_id (5), not A's (3): a directly
+    // chaining update now applies live.
+    auto live = sync.on_depth_update(make_update(6, 6, /*prev_final_id=*/5));
+    EXPECT_EQ(kinds_of(live), (std::vector{Kind::ApplyDelta}));
+}
+
+TEST(SymbolSyncOkxTest, BridgeIsExactPrevSeqIdEqualityNotARange) {
+    // Unlike Futures' first_id<=last_update_id<=final_id range check, OKX
+    // has an explicit prevSeqId back-pointer - bridging is an exact
+    // prev_final_id == snapshot.last_update_id equality.
+    OkxSync sync;
+    sync.on_connected();
+    sync.on_depth_update(make_update(165, 165, /*prev_final_id=*/12));
+
+    // Not a match: this event's prev_final_id (12) != snapshot's
+    // last_update_id (10).
+    auto actions = sync.on_snapshot(make_snapshot(10));
+    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::RequestSnapshot}));
+}
+
+// Traces the exact four-message worked example from OKX's own
+// documentation (quoted directly by the user, not assumed from training
+// data): a normal update, an idle-heartbeat (prevSeqId == seqId, empty
+// bids/asks), then a sequence reset (seqId itself moves backward, but
+// prevSeqId still chains from the prior seqId) - all four must apply as
+// ordinary contiguous updates, with no special-casing for the heartbeat or
+// the reset. This is the scenario OkxSequencePolicy's doc comment in
+// symbol_sync.hpp describes by hand; this test is what actually proves it
+// against the real state machine rather than a comment alone.
+TEST(SymbolSyncOkxTest, IdleHeartbeatAndSequenceResetChainLikeOkxsDocumentedExample) {
+    OkxSync sync;
+    sync.on_connected();
+
+    // Snapshot: prevSeqId=-1, seqId=10.
+    ASSERT_EQ(kinds_of(sync.on_snapshot(make_snapshot(10))), (std::vector{Kind::ApplySnapshot}));
+
+    // Normal update: prevSeqId=10, seqId=15.
+    auto normal = sync.on_depth_update(make_update(15, 15, /*prev_final_id=*/10, {{Price(1.0), Size(1.0)}}));
+    ASSERT_EQ(kinds_of(normal), (std::vector{Kind::ApplyDelta}));
+
+    // Idle heartbeat: prevSeqId=15, seqId=15 (chains from itself), empty
+    // bids/asks - must still apply as a normal (harmless) delta, not be
+    // treated as a gap or silently dropped (dropping it would break the
+    // prevSeqId chain for the next message).
+    auto heartbeat = sync.on_depth_update(make_update(15, 15, /*prev_final_id=*/15));
+    ASSERT_EQ(kinds_of(heartbeat), (std::vector{Kind::ApplyDelta}));
+    EXPECT_TRUE(std::get<ApplyDelta>(heartbeat[0]).bids.empty());
+    EXPECT_TRUE(std::get<ApplyDelta>(heartbeat[0]).asks.empty());
+
+    // Sequence reset: prevSeqId=15 (still chains from the last applied
+    // seqId), seqId=3 (the counter itself moves backward) - is_contiguous
+    // only compares prev_final_id against last_applied_final_id, so this
+    // is not treated as a gap despite seqId decreasing.
+    auto reset = sync.on_depth_update(make_update(3, 3, /*prev_final_id=*/15, {{Price(2.0), Size(2.0)}}));
+    ASSERT_EQ(kinds_of(reset), (std::vector{Kind::ApplyDelta}));
+
+    // Normal update after the reset: prevSeqId=3, seqId=5.
+    auto after_reset = sync.on_depth_update(make_update(5, 5, /*prev_final_id=*/3, {{Price(3.0), Size(3.0)}}));
+    EXPECT_EQ(kinds_of(after_reset), (std::vector{Kind::ApplyDelta}));
+}
+
+}  // namespace okx
+
 }  // namespace
 }  // namespace bobby::hermeneutic
