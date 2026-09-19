@@ -476,6 +476,26 @@ loop:
 
    **第 8 項提到的 live-gap 恢復限制，同樣適用於 OKX**：`kTrustsConnectionOrder` 的捷徑只在「進入 `on_snapshot()` 當下 buffer 完全沒被寫過」時生效，mid-stream 的 gap 會讓這個 symbol 卡在 `Buffering` 直到整條連線斷線重連——跟 Bybit 面對的是同一個尚未解決的限制，不是 OKX 特有的新問題。
 
+10. **`symbol.hpp::book_key()` 的字串格式是這個專案目前唯一還在製造「無法還原」歧義的地方，尚未決定要不要改，牽涉 breaking change**：`native_symbol()`/`venue_id()` 都吃 `(Venue, BaseQuote, BookType)`、對整個 domain model保持 total；只有 `book_key()` 把 `{BTC, USDT}` 攤平成無底線的 `BTCUSDT.SPOT`/`BTCUSDT.PERP`，base/quote 的邊界從此永久消失——跟 `split_base_quote()` 自己註解講的「串接字串在沒有維護 quote-asset 字典時無法反推邊界」是同一個問題，也是這個專案先前刪掉 `okx_canonical()`（第 9 節、`5d5dd69`）的同一個理由：猜邊界是死路，`book_key()` 是最後一個還在做這件事的地方。判斷式：能不能寫出 `parse_book_key(s) -> optional<pair<BaseQuote, BookType>>` 當精確反函式？現在不行。連帶地，`book_subscription.hpp` 的 `seen_book_keys` 用串接後的字串去重，「不同的 (base, quote, type) 不會撞成同一個 key」這件事目前是靠實際幣別代碼的巧合成立，不是靠結構保證。
+
+    **現況是刻意的，先講清楚不是 bug**：`book_key()` 的註解本來就講明「client 訂閱 `"BTCUSDT.PERP"` 不受設定檔輸入拼寫（`BASE_QUOTE`，例如 `BTC_USDT`）影響」——`BASE_QUOTE` 底線只是設定檔/CLI 的*輸入*拼寫慣例，用來消除 base/quote 邊界的歧義；`book_key()` 產生的才是 gRPC client 實際訂閱用的*穩定* key，兩者故意脫鉤，這樣設定檔輸入格式以後要改，既有 client 的訂閱字串不用跟著動。這個「輸入拼寫跟 key 脫鉤」的原則本身沒有問題，該保留。
+
+    **如果哪天可以接受 breaking change，比較好的方向：把 book 的身份做成 gRPC 上結構化的型別，字串只留給人類看（log/CLI/錯誤訊息）**，而不是繼續在字串格式本身打轉（例如光是把 `book_key()` 輸出改成帶底線的 `BTC_USDT.SPOT`，只解決得了「能不能反解析」，解決不了「無效輸入在型別層級就不可表達」）：
+
+    ```proto
+    enum MarketType { MARKET_TYPE_UNSPECIFIED = 0; SPOT = 1; PERP = 2; }
+    message BookId { string base = 1; string quote = 2; MarketType market = 3; }
+    ```
+
+    `SubscribeBboRequest`/`SubscribeL2DiffRequest` 都改成帶一個 `BookId book = 1`；`AggregatorService` 內部的 map 直接用 `struct BookId`（配 `operator<=>`/`std::hash`）當 key，不再是字串。三個訴求分別對應：
+    - **不容易出錯**：打錯的 key 在型別層級就不可表達，不用等 server 回 `NOT_FOUND` 才發現——現在 `client_main.cpp` 吃的是 `argv` 字串，完全沒辦法在本地驗證。
+    - **延展性**：以後加新市場類型（幣本位反向合約、到期期貨）只是加一個 enum value，`symbol.hpp` 裡每個 exhaustive switch（`native_symbol()`/`venue_id()` 那種、本來就靠 `-Wreturn-type` 逼你補 case 的寫法）會編譯失敗直到補上處理——這已經是這個檔案自己的既有慣例，字串後綴格式完全享受不到這層保護。要加新維度（結算幣別、venue-scoped book）也只是加 proto 欄位，向後相容。
+    - **可維護性**：除了 CLI/設定檔這個輸入邊界之外，其餘地方完全不需要解析，沒有「round-trip 是否正確」這種要一直維護的性質。`to_string(BookId) -> "BTC_USDT.SPOT"` 之類的字串形式保留給 log/錯誤訊息/CLI 用，parse 只在輸入邊界做一次。
+
+    會動到的地方：`symbol.hpp`（`book_key`、新的 `BookId`/parse）、`book_subscription.hpp`（`seen_book_keys` 改用 `BookId` 當 set key）、`proto/bobby/hermeneutic/aggregator/aggregator.proto`、`aggregator_service.hpp`（`book()`、`SymbolBook` map、`NOT_FOUND` 路徑）、`server_main.cpp` 的 registry 迴圈、`client_main.cpp`（argv 解析 + usage）、`README.md`、以及 `symbol_test.cpp`/`book_subscription_test.cpp`/`aggregator_service_test.cpp`（`UnknownSymbolFailsWithNotFound`、`MultiSymbolAggregatorServiceTest` 都要跟著改）。
+
+    **尚未決定，也還沒排進任何分支**：這是 2026-09-19 討論 `hermeneutic_aggregator_client` cherry-pick 時，另外問顧問「如果可以 breaking change，這個 key 怎麼設計比較好」得到的建議，記在這裡避免遺忘在對話 scrollback 裡；真的要做的話應該另開一個獨立分支，不要跟既有的、乾淨的 cherry-pick 分支混在一起。
+
 ## 11. 下一步
 
 `SymbolSync<SequencePolicy>` + `BinanceFuturesSequencePolicy`/`BinanceSpotSequencePolicy`/`BybitSequencePolicy`/`OkxSequencePolicy`（測試涵蓋四種 policy，包含共用的 `kTrustsConnectionOrder` 機制）、`BinanceFuturesFeed`（11 測試）、`BinanceSpotFeed`（12 測試）、`BybitLinearFeed`（10 測試）、`BybitSpotFeed`（8 測試）、`OkxFeed`（17 測試，含 `okx_canonical()`/`is_swap()`）、`WebSocketConnection`（1 測試）、`http_get`（3 測試）、`VenueSession<Feed,Policy,NextLayer>` + `SymbolRegistry`（整合測試）都已完成並測試通過。**`aggregator_main.cpp` 已經接上 ingestion（第 10 節第 7 項），並且分別對 Binance Futures（`wss://fstream.binance.com`/`https://fapi.binance.com`）、Binance Spot（`wss://stream.binance.com:9443`/`https://api.binance.com`）、Bybit linear（`wss://stream.bybit.com/v5/public/linear`）、Bybit spot（`.../v5/public/spot`）各自單獨跑起來過，各自收到真實 BTCUSDT order book，Bybit 兩個 venue 也各自透過真正的 `SubscribeBbo` gRPC 路徑確認過能把資料送到訂閱者**（第 10 節第 6/7 項的 TLS/端對端驗證；六個 venue 同時掛著跑則還沒有另外驗證過，見第 6 節「即時驗證」小節最後一段的說明）。整條「真實交易所 WS/REST → resync → 套用進真實 book → 真實 gRPC 訂閱者收到正確結果」的路徑，Binance/Bybit 四個 venue 都不只是測試證明可以動，是真的連過真實交易所跑過一次——但 Bybit 這兩個 venue 第一輪的「驗證」其實是無效的（見第 6 節），因為當時 `SymbolSync` 有一個會讓 Bybit 安靜貢獻零筆資料的真實 bug（見第 5 節 `BybitSequencePolicy` 的修正記錄），第二輪單獨掛 Bybit venue 重跑才是真正證明有效的那次。**OKX 兩個 venue 也已經完成端對端驗證**：用跟 Binance Spot 那次同一招的臨時、用完即刪的 `service/live_okx_check_main.cpp`——真實 `AggregatorService`（book `"BTCUSDT.SPOT"`/`"BTCUSDT.PERP"`）+ 真實 gRPC server + 真實 `Aggregator::Stub` client 對兩個 symbol 各開一個 `SubscribeBbo` 串流 + 真實 `OkxFeed`/`OkxSequencePolicy` 的 `okx_spot`（`BTC-USDT`）/`okx_swap`（`BTC-USDT-SWAP`）兩個 `VenueSession` 連 `wss://ws.okx.com:8443/ws/v5/public`（2026-09-18）。跑 15 秒：兩個訂閱一開始都收到空書（`bid_present=0 ask_present=0`，`SubscribeBbo` 送出當下狀態的既有行為），snapshot 套用後很快兩邊都變成有值，之後持續收到真實更新——spot 55 筆 BBO、perp 119 筆（含收尾時 `stop_all()` 觸發 `invalidate_venue` 送出的最後一筆空書），全程無 crash、無錯誤 log，`kTrustsConnectionOrder` 的空 buffer 捷徑確實讓兩個 symbol 都直接從第一筆 snapshot 起步進 Live，不是理論上而已。
