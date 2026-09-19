@@ -15,7 +15,7 @@ namespace bobby::hermeneutic::ingestion {
 using bobby::hermeneutic::symbol::BookType;
 using bobby::hermeneutic::symbol::Venue;
 
-// One venue's contribution to one book: everything apps/aggregator/main.cpp
+// One venue's contribution to one book: everything apps/aggregator/server_main.cpp
 // needs to add this (venue, symbol, type) triple to the right
 // SymbolRegistry and, grouped by (venue, type), to IngestionRunner. This is
 // a parsing *result*, not part of the symbol domain model itself (see

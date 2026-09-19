@@ -22,7 +22,7 @@ namespace bobby::hermeneutic::ingestion::detail {
 // each Feed's parse_message()/parse_snapshot_response() duck-typed, so
 // nothing requires these helpers to live in one place - but a single
 // translation unit that includes more than one Feed header needing them
-// (aggregator_main.cpp, once it wires up a second venue) would otherwise
+// (server_main.cpp, once it wires up a second venue) would otherwise
 // get a duplicate-definition (ODR) error from two identical `namespace
 // bobby::hermeneutic::ingestion::detail { ... }` blocks.
 inline double parse_decimal_string(std::string_view text) {

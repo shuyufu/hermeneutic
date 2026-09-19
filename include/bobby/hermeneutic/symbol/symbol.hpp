@@ -26,7 +26,7 @@ enum class BookType { Spot, Perp };
 // config) stays usable - and unit-testable - without linking simdjson or
 // gRPC at all. Adding a venue means adding a case to native_symbol()/
 // venue_id()/parse_venue() below, and separately wiring its Feed/Policy
-// into apps/aggregator/main.cpp's own dispatch.
+// into apps/aggregator/server_main.cpp's own dispatch.
 enum class Venue { Binance, Bybit, Okx };
 
 inline std::optional<Venue> parse_venue(std::string_view token) {
@@ -122,7 +122,7 @@ inline std::string venue_id(Venue venue, BookType type) {
 
 // The wire-format symbol a venue's own Feed subscribes with. Binance/Bybit
 // use the same concatenated spelling for both spot and their derivatives
-// market ("BTCUSDT" either way - see apps/aggregator/main.cpp's registry-
+// market ("BTCUSDT" either way - see apps/aggregator/server_main.cpp's registry-
 // building loop, which relies on this); OKX separates base/quote with its
 // own dash and tags a swap with "-SWAP" (matching the instId shape
 // OkxFeed::parse_message() reads back verbatim - see okx_feed.hpp).

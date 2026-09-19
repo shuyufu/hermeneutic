@@ -70,7 +70,7 @@ inline void log_exception(std::string_view component, std::string_view action, s
 // route a parsed delta into a book, even though VenueSession itself never
 // touches SymbolBook's actual gRPC surface (subscribe/subscribe_bbo/
 // send_heartbeat). A production binary still supplies SymbolBook here
-// (see apps/aggregator/main.cpp) to get its gRPC fan-out; a test that
+// (see apps/aggregator/server_main.cpp) to get its gRPC fan-out; a test that
 // only cares about VenueSession's own mechanics can supply plain
 // AggregateOrderBook instead and stay off that dependency entirely.
 template <typename Book>

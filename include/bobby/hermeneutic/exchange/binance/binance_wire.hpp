@@ -24,7 +24,7 @@ struct HttpRequestSpec {
 // duplicating the identical helpers Bybit's ingestion needed (both venues
 // happen to send price/quantity as JSON strings) - two copies in the same
 // `bobby::hermeneutic::ingestion::detail` namespace, pulled into the same
-// translation unit (aggregator_main.cpp includes every Feed header), is an
+// translation unit (server_main.cpp includes every Feed header), is an
 // ODR violation. Moved to the venue-neutral service/json_wire.hpp; this
 // file now only holds what's genuinely Binance-specific (HttpRequestSpec,
 // for its REST snapshot endpoint - Bybit has no REST snapshot at all, see

@@ -277,7 +277,7 @@ class SymbolBook {
     // the L2Diff and the Bbo stream), independent of any book change -
     // unlike publish(), this never touches seq_ (a heartbeat is not a book
     // revision). Callers (e.g. AggregatorService::send_heartbeat(), driven
-    // by aggregator_main.cpp) are expected to invoke this on a fixed
+    // by server_main.cpp) are expected to invoke this on a fixed
     // interval; this class has no internal timer of its own.
     void send_heartbeat() {
         std::lock_guard lock(mutex_);

@@ -42,7 +42,7 @@ example, alongside its hand-written service in `apps/aggregator/aggregator_servi
 
 ### Aggregator service
 
-`hermeneutic_aggregator_service` (`apps/aggregator/main.cpp`) streams the
+`hermeneutic_aggregator_service` (`apps/aggregator/server_main.cpp`) streams the
 aggregated L2 order book to subscribers: a client calls `SubscribeL2Diff` or
 `SubscribeBbo` with the symbol it wants, gets an initial snapshot, then every
 subsequent change as it happens. One instance serves any number of symbols on
