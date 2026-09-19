@@ -28,7 +28,9 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -88,6 +90,34 @@ std::string format_level(const PriceLevel& level) {
     return out.str();
 }
 
+// BasicFixedPoint's own operator<< streams to_double() through the
+// ostream's ambient (default) precision, which is only 6 significant
+// digits - fine for a Price/Size around 80000.5, but a Notional in this
+// tool's own 1M-50M+ band range overflows that into scientific notation
+// ("1.23457e+07"), defeating the readability these two publisher modes
+// exist for. Used for every fixed-point value volume-bands/price-bands
+// print, not just Notional, so a VWAP/size prints with the same fixed,
+// two-decimal style rather than mixing formatting conventions.
+template <typename FixedPoint>
+std::string format_fixed(FixedPoint value) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(2) << value.to_double();
+    return out.str();
+}
+
+// Guards stdout: each publish_bbo()/publish_l2_bands() call runs on its
+// own thread (one per symbol - see main()), and a bare `std::cout << a <<
+// b << c` is a sequence of independent stream operations, not one atomic
+// write - two threads' chains can interleave mid-line into a single
+// garbled, unparseable line. Callers build the complete line first (this
+// file already does, via ostringstream) and hand it here as one string so
+// the lock covers the entire write.
+void print_line(const std::string& line) {
+    static std::mutex out_mutex;
+    std::lock_guard lock(out_mutex);
+    std::cout << line << std::endl;
+}
+
 // One band's worth of `label=value`. `bands` is expected to line up
 // index-for-index with kVolumeBandLabels (volume_band_prices() always
 // returns exactly one entry per input threshold, even for an empty/thin
@@ -98,8 +128,8 @@ std::string format_volume_bands(const std::vector<VolumeBand>& bands) {
     for (std::size_t i = 0; i < bands.size() && i < kVolumeBandLabels.size(); ++i) {
         if (i) out << ' ';
         out << kVolumeBandLabels[i] << '=';
-        if (bands[i].vwap) out << *bands[i].vwap;
-        else out << "NA(filled=" << bands[i].filled_notional << ')';
+        if (bands[i].vwap) out << format_fixed(*bands[i].vwap);
+        else out << "NA(filled=" << format_fixed(bands[i].filled_notional) << ')';
     }
     return out.str();
 }
@@ -112,7 +142,8 @@ std::string format_price_bands(const std::vector<PriceBand>& bands) {
     std::ostringstream out;
     for (std::size_t i = 0; i < bands.size() && i < kPriceBandLabels.size(); ++i) {
         if (i) out << ' ';
-        out << kPriceBandLabels[i] << '=' << bands[i].cumulative_size << '@' << bands[i].cumulative_notional;
+        out << kPriceBandLabels[i] << '=' << format_fixed(bands[i].cumulative_size) << '@'
+            << format_fixed(bands[i].cumulative_notional);
     }
     return out.str();
 }
@@ -134,15 +165,19 @@ void apply_levels(Map& side, const Levels& levels) {
     }
 }
 
-// Cancels `context` once `stop` flips - the only way to make a blocking
-// ClientReader::Read() loop below actually return once a caller-supplied
-// duration elapses (see main()'s `stop` watcher), or, for the run-until-
-// interrupted case (duration_seconds <= 0), never fires at all - Read()
-// then only returns when the server ends the stream or the process is
-// killed.
-std::thread make_canceller(grpc::ClientContext& context, std::atomic<bool>* stop) {
-    return std::thread([&context, stop] {
-        while (!*stop) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+// Cancels `context` once `stop` flips (the caller-supplied duration
+// elapsed - see main()'s `stop` watcher) or once `done` flips (this call's
+// own read loop is finished on its own - see publish_bbo()/
+// publish_l2_bands()). `done` matters even for duration_seconds <= 0 ("run
+// until interrupted or the server ends the stream"): without it, this
+// thread would only ever watch the shared, process-wide `stop`, which
+// nothing sets in that mode - so a read loop that exits early for a
+// reason local to this one call (a book_seq gap; the stream ending on its
+// own) would leave this thread sleeping forever, and the caller's
+// `canceller.join()` right after would hang the whole process.
+std::thread make_canceller(grpc::ClientContext& context, std::atomic<bool>* stop, std::atomic<bool>* done) {
+    return std::thread([&context, stop, done] {
+        while (!*stop && !*done) std::this_thread::sleep_for(std::chrono::milliseconds(200));
         context.TryCancel();
     });
 }
@@ -155,7 +190,8 @@ void publish_bbo(const std::string& address, const std::string& symbol, std::ato
     SubscribeBboRequest request;
     request.set_symbol(symbol);
     auto reader = stub->SubscribeBbo(&context, request);
-    std::thread canceller = make_canceller(context, stop);
+    std::atomic<bool> done{false};
+    std::thread canceller = make_canceller(context, stop, &done);
 
     BboUpdate update;
     long bbo_count = 0, heartbeat_count = 0;
@@ -168,16 +204,19 @@ void publish_bbo(const std::string& address, const std::string& symbol, std::ato
             line << "book_seq=" << bbo.book_seq() << " bid=" << (bbo.has_bid() ? format_level(bbo.bid()) : "(none)")
                  << " ask=" << (bbo.has_ask() ? format_level(bbo.ask()) : "(none)");
             last_line = line.str();
-            std::cout << "[" << symbol << " BBO] " << last_line << std::endl;
+            print_line("[" + symbol + " BBO] " + last_line);
         } else if (update.has_heartbeat()) {
             ++heartbeat_count;
         }
     }
+    done = true;
     canceller.join();
     auto status = reader->Finish();
-    std::cout << "[" << symbol << " BBO] DONE bbo_count=" << bbo_count << " heartbeat_count=" << heartbeat_count
+    std::ostringstream done_line;
+    done_line << "[" << symbol << " BBO] DONE bbo_count=" << bbo_count << " heartbeat_count=" << heartbeat_count
               << " last=(" << last_line << ") grpc_status=" << status.error_code() << " ("
-              << status.error_message() << ")" << std::endl;
+              << status.error_message() << ")";
+    print_line(done_line.str());
 }
 
 // Shared by volume-bands and price-bands: both subscribe to SubscribeL2Diff
@@ -191,7 +230,8 @@ void publish_l2_bands(Mode mode, const std::string& address, const std::string& 
     SubscribeL2DiffRequest request;
     request.set_symbol(symbol);
     auto reader = stub->SubscribeL2Diff(&context, request);
-    std::thread canceller = make_canceller(context, stop);
+    std::atomic<bool> done{false};
+    std::thread canceller = make_canceller(context, stop, &done);
 
     const char* mode_tag = mode == Mode::VolumeBands ? "VOLUME_BANDS" : "PRICE_BANDS";
     L2OrderBook book;
@@ -209,7 +249,7 @@ void publish_l2_bands(Mode mode, const std::string& address, const std::string& 
             line << " ask[" << format_price_bands(ask_price_band_depths(book, kPriceBandBps)) << "]";
         }
         std::string result = line.str();
-        std::cout << "[" << symbol << " " << mode_tag << "] " << result << std::endl;
+        print_line("[" + symbol + " " + mode_tag + "] " + result);
         return result;
     };
 
@@ -241,9 +281,11 @@ void publish_l2_bands(Mode mode, const std::string& address, const std::string& 
             // the operator's signal to restart it.
             if (last_seq && diff.book_seq() != *last_seq + 1) {
                 ++gap_count;
-                std::cout << "[" << symbol << " " << mode_tag << "] GAP: expected book_seq="
+                std::ostringstream gap_line;
+                gap_line << "[" << symbol << " " << mode_tag << "] GAP: expected book_seq="
                           << (*last_seq + 1) << " got " << diff.book_seq()
-                          << " - local book invalid, stopping this stream" << std::endl;
+                          << " - local book invalid, stopping this stream";
+                print_line(gap_line.str());
                 break;
             }
             last_seq = diff.book_seq();
@@ -254,32 +296,46 @@ void publish_l2_bands(Mode mode, const std::string& address, const std::string& 
             ++heartbeat_count;
         }
     }
+    done = true;
     canceller.join();
     auto status = reader->Finish();
-    std::cout << "[" << symbol << " " << mode_tag << "] DONE snapshot_count=" << snapshot_count
+    std::ostringstream done_line;
+    done_line << "[" << symbol << " " << mode_tag << "] DONE snapshot_count=" << snapshot_count
               << " diff_count=" << diff_count << " heartbeat_count=" << heartbeat_count
               << " gap_count=" << gap_count << " last=(" << last_line << ") grpc_status=" << status.error_code()
-              << " (" << status.error_message() << ")" << std::endl;
+              << " (" << status.error_message() << ")";
+    print_line(done_line.str());
+}
+
+void print_usage() {
+    std::cerr << "usage: hermeneutic_aggregator_client <address> <bbo|volume-bands|price-bands> "
+                 "<duration_seconds> <symbol1> [symbol2 ...]\n"
+                 "  duration_seconds <= 0 means run until interrupted or the server ends the stream\n"
+                 "  symbols are book keys, e.g. BTCUSDT.SPOT or BTCUSDT.PERP\n"
+                 "  bbo:          subscribes to SubscribeBbo, prints best bid/ask on every update\n"
+                 "  volume-bands: subscribes to SubscribeL2Diff, prints the VWAP needed to fill\n"
+                 "                1M/5M/10M/25M/50M+ notional on each side on every update\n"
+                 "  price-bands:  subscribes to SubscribeL2Diff, prints depth within\n"
+                 "                50/100/200/500/1000+ bps of BBO on each side on every update\n";
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 5) {
-        std::cerr << "usage: hermeneutic_aggregator_client <address> <bbo|volume-bands|price-bands> "
-                     "<duration_seconds> <symbol1> [symbol2 ...]\n"
-                     "  duration_seconds <= 0 means run until interrupted or the server ends the stream\n"
-                     "  symbols are book keys, e.g. BTCUSDT.SPOT or BTCUSDT.PERP\n"
-                     "  bbo:          subscribes to SubscribeBbo, prints best bid/ask on every update\n"
-                     "  volume-bands: subscribes to SubscribeL2Diff, prints the VWAP needed to fill\n"
-                     "                1M/5M/10M/25M/50M+ notional on each side on every update\n"
-                     "  price-bands:  subscribes to SubscribeL2Diff, prints depth within\n"
-                     "                50/100/200/500/1000+ bps of BBO on each side on every update\n";
+        print_usage();
         return 1;
     }
     std::string address = argv[1];
     std::string mode_str = argv[2];
-    int duration_s = std::stoi(argv[3]);
+    int duration_s;
+    try {
+        duration_s = std::stoi(argv[3]);
+    } catch (const std::exception&) {
+        std::cerr << "invalid duration_seconds \"" << argv[3] << "\" (expected an integer)\n";
+        print_usage();
+        return 1;
+    }
     std::vector<std::string> symbols(argv + 4, argv + argc);
 
     auto mode = parse_mode(mode_str);
