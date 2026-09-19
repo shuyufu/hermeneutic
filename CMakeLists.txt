@@ -226,6 +226,12 @@ if(HERMENEUTIC_BUILD_SERVICE)
         hermeneutic::ingestion hermeneutic::exchange hermeneutic::exchange_policy hermeneutic::symbol
         hermeneutic::proto)
 
+    # Example/diagnostic client for the service above - see
+    # apps/aggregator/client_main.cpp's own comment for why this one isn't
+    # a throwaway like this project's other live-verification programs.
+    add_executable(hermeneutic_aggregator_client apps/aggregator/client_main.cpp)
+    target_link_libraries(hermeneutic_aggregator_client PRIVATE hermeneutic::proto)
+
     if(HERMENEUTIC_BUILD_TESTS)
         add_executable(hermeneutic_aggregator_service_test tests/apps/aggregator/aggregator_service_test.cpp)
         target_include_directories(hermeneutic_aggregator_service_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

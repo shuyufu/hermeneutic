@@ -68,6 +68,23 @@ cmake --build build-vcpkg --target hermeneutic_aggregator_service
 ./build-vcpkg/hermeneutic_aggregator_service 0.0.0.0:50051 apps/aggregator/subscriptions.example.json
 ```
 
+`hermeneutic_aggregator_client` (`apps/aggregator/client_main.cpp`) is a
+minimal example client for the service above - not a throwaway (unlike this
+project's earlier live-verification programs, see `docs/ingestion_design.md`),
+kept around as a starting point for consuming `AggregatorService`'s output
+and for manually poking at a running instance. It subscribes one or more book
+keys to `SubscribeBbo`, `SubscribeL2Diff`, or both (one thread per
+`(symbol, stream)` pair), logging every update, and checks `SubscribeL2Diff`'s
+own `book_seq` contiguity guarantee itself, printing a `GAP` line if that
+contract is ever violated:
+
+```sh
+cmake --build build-vcpkg --target hermeneutic_aggregator_client
+# <address> <bbo|l2|both> <duration_seconds> <symbol1> [symbol2 ...]
+# duration_seconds <= 0 runs until interrupted or the server ends the stream.
+./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 both 60 BTCUSDT.SPOT BTCUSDT.PERP
+```
+
 `hermeneutic_aggregator_service_test` exercises it over a real (in-process)
 gRPC connection; it only builds when both `HERMENEUTIC_BUILD_SERVICE` and
 `HERMENEUTIC_BUILD_TESTS` are `ON`:
