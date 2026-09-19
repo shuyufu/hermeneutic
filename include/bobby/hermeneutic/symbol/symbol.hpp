@@ -69,10 +69,11 @@ struct Asset {
 // naming rule for writing a symbol unambiguously (never the canonical
 // book key it produces below - see book_key()): splitting a concatenated
 // ticker like "BTCUSDT" back into base/quote is fundamentally ambiguous
-// without a maintained quote-asset dictionary (okx_canonical() in
-// okx_feed.hpp hits exactly this wall going the other direction and
-// deliberately declines to guess), so this pushes that boundary onto
-// whoever writes the symbol instead of guessing at it.
+// without a maintained quote-asset dictionary (recovering OKX's own
+// dash-separated instId from one, e.g., would require guessing where
+// "BTCUSDT" splits into "BTC"/"USDT" without OKX itself having marked the
+// boundary), so this pushes that boundary onto whoever writes the symbol
+// instead of guessing at it.
 struct BaseQuote {
     Asset base;
     Asset quote;
@@ -93,9 +94,8 @@ inline std::optional<BaseQuote> split_base_quote(std::string_view token) {
 
 // The canonical, venue-neutral SymbolBook key: concatenated, no
 // underscore, exactly what AggregatorService::book()/apps/aggregator/
-// main.cpp's book_symbols have always used ("BTCUSDT.SPOT"/"BTCUSDT.PERP" -
-// see okx_canonical()'s doc comment for the existing convention this
-// matches). Unaffected by the "BASE_QUOTE" input spelling any particular
+// main.cpp's book_symbols have always used ("BTCUSDT.SPOT"/"BTCUSDT.PERP").
+// Unaffected by the "BASE_QUOTE" input spelling any particular
 // caller (e.g. bobby::hermeneutic::ingestion's subscription config) uses:
 // a gRPC client already subscribed to "BTCUSDT.PERP" keeps working with it
 // unchanged no matter how a symbol was written on the way in.
@@ -124,12 +124,12 @@ inline std::string venue_id(Venue venue, BookType type) {
 // use the same concatenated spelling for both spot and their derivatives
 // market ("BTCUSDT" either way - see apps/aggregator/main.cpp's registry-
 // building loop, which relies on this); OKX separates base/quote with its
-// own dash and tags a swap with "-SWAP" (see okx_feed.hpp's is_swap()/
-// okx_canonical()). This is that OKX mapping's other direction, made
-// unambiguous by construction - `symbol` already carries the base/quote
+// own dash and tags a swap with "-SWAP" (matching the instId shape
+// OkxFeed::parse_message() reads back verbatim - see okx_feed.hpp).
+// Unambiguous by construction - `symbol` already carries the base/quote
 // boundary the caller supplied, rather than this having to recover it
-// from a concatenated string the way okx_canonical() explicitly declines
-// to.
+// from a concatenated string the way split_base_quote()'s own comment
+// explains this project avoids.
 inline std::string native_symbol(Venue venue, const BaseQuote& symbol, BookType type) {
     switch (venue) {
         case Venue::Binance:

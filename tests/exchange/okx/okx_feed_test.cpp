@@ -175,35 +175,5 @@ TEST(OkxFeedTest, SnapshotIsNotFetchedViaRest) {
     EXPECT_FALSE(OkxFeed::kSnapshotViaRest);
 }
 
-TEST(OkxCanonicalTest, SpotInstIdMapsToDotSpotSuffix) {
-    auto canonical = okx_canonical("BTC-USDT");
-    ASSERT_TRUE(canonical.has_value());
-    EXPECT_EQ(*canonical, "BTCUSDT.SPOT");
-    EXPECT_FALSE(is_swap("BTC-USDT"));
-}
-
-TEST(OkxCanonicalTest, SwapInstIdMapsToDotPerpSuffix) {
-    auto canonical = okx_canonical("BTC-USDT-SWAP");
-    ASSERT_TRUE(canonical.has_value());
-    EXPECT_EQ(*canonical, "BTCUSDT.PERP");
-    EXPECT_TRUE(is_swap("BTC-USDT-SWAP"));
-}
-
-TEST(OkxCanonicalTest, SpotAndSwapOfTheSameBaseQuotePairShareNoCanonicalKey) {
-    // Deliberately different: spot and perp are independent SymbolBooks
-    // (see docs/ingestion_design.md's OKX section), not merged.
-    EXPECT_NE(okx_canonical("BTC-USDT"), okx_canonical("BTC-USDT-SWAP"));
-}
-
-TEST(OkxCanonicalTest, DatedFuturesShapeIsNotSupported) {
-    // More than one dash left after stripping any -SWAP suffix - not a
-    // plain BASE-QUOTE spot/swap instId this project models yet.
-    EXPECT_FALSE(okx_canonical("BTC-USDT-250328").has_value());
-}
-
-TEST(OkxCanonicalTest, MalformedInstIdWithNoDashIsNotSupported) {
-    EXPECT_FALSE(okx_canonical("BTCUSDT").has_value());
-}
-
 }  // namespace
 }  // namespace bobby::hermeneutic::ingestion

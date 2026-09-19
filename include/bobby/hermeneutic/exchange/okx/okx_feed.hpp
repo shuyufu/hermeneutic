@@ -19,42 +19,6 @@ namespace bobby::hermeneutic::ingestion {
 
 using ParsedMessage = std::optional<std::variant<SnapshotMessage, DepthUpdate>>;
 
-// OKX's own instId format tells the caller unambiguously whether an
-// instrument is a perpetual swap ("BTC-USDT-SWAP") - anything else with
-// exactly one dash is treated as spot ("BTC-USDT"). Dated futures/options
-// (an instId with a different shape entirely, e.g. an expiry-date or
-// strike/option-type suffix) aren't modeled - not supported this pass.
-inline bool is_swap(std::string_view instid) { return instid.ends_with("-SWAP"); }
-
-// Maps an OKX instId to the canonical, venue-neutral symbol key used across
-// this project's SymbolBooks (see docs/ingestion_design.md's OKX section):
-// "BTC-USDT-SWAP" -> "BTCUSDT.PERP" (shares Binance/Bybit's perpetual book),
-// "BTC-USDT" -> "BTCUSDT.SPOT" (shares their spot book). Only this direction
-// (OKX-native -> canonical) is implemented: it's an unambiguous string
-// operation (removing characters OKX itself put there). The reverse
-// (canonical -> OKX-native) would require guessing where the quote asset
-// starts (USDT/USDC/BUSD/...), which this project deliberately doesn't
-// attempt - callers supply OKX-native instId strings directly.
-// std::nullopt means an instId shape this function doesn't recognize
-// (dated futures, options, or anything malformed) - not supported this pass.
-inline std::optional<std::string> okx_canonical(std::string_view instid) {
-    bool swap = is_swap(instid);
-    if (swap) instid.remove_suffix(std::string_view("-SWAP").size());
-
-    auto dash = instid.find('-');
-    if (dash == std::string_view::npos || instid.find('-', dash + 1) != std::string_view::npos) {
-        return std::nullopt;  // not a plain BASE-QUOTE shape after stripping -SWAP
-    }
-
-    std::string canonical;
-    canonical.reserve(instid.size());
-    for (char c : instid) {
-        if (c != '-') canonical += c;
-    }
-    canonical += swap ? ".PERP" : ".SPOT";
-    return canonical;
-}
-
 // VenueFeed for OKX's v5 public `books` channel: parse/encode only, no I/O.
 // Serves both spot and perpetual-swap instIds - OKX's `books` channel is
 // identical at the protocol level for both (same endpoint, same channel
@@ -97,7 +61,8 @@ class OkxFeed {
     // every symbol's `books` channel. `symbols` are OKX-native instId
     // strings (e.g. "BTC-USDT", "BTC-USDT-SWAP") - used verbatim, no
     // transformation - matching what OkxFeed::parse_message() reads back
-    // out of `arg.instId` and what okx_canonical() expects as input.
+    // out of `arg.instId` (dispatch below matches on this same native
+    // spelling, via VenueSession's symbol_syncs_ - see venue_session.hpp).
     std::string subscribe_message(std::span<const SymbolId> symbols) const {
         std::string args;
         for (std::size_t i = 0; i < symbols.size(); ++i) {
