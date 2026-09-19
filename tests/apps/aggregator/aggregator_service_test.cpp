@@ -22,16 +22,16 @@ namespace {
 
 using bobby::hermeneutic::symbol::BaseQuote;
 using bobby::hermeneutic::symbol::BookId;
+using bobby::hermeneutic::symbol::Exchange;
 using bobby::hermeneutic::symbol::MarketType;
-using bobby::hermeneutic::symbol::Venue;
 
 // Two arbitrary, distinct VenueIds - these tests only need "two different
 // venues" to exercise per-venue isolation on the underlying
-// AggregateOrderBook, never the real venue_id()/to_string(VenueId)
-// spelling, so MarketType::Spot on both is an arbitrary (but fixed)
-// choice, not a claim about what market either actually covers.
-constexpr bobby::hermeneutic::VenueId kBinance{Venue::Binance, MarketType::Spot};
-constexpr bobby::hermeneutic::VenueId kOkx{Venue::Okx, MarketType::Spot};
+// AggregateOrderBook, never the real to_string(VenueId) spelling, so
+// MarketType::Spot on both is an arbitrary (but fixed) choice, not a
+// claim about what market either actually covers.
+constexpr bobby::hermeneutic::VenueId kBinance{Exchange::Binance, MarketType::Spot};
+constexpr bobby::hermeneutic::VenueId kOkx{Exchange::Okx, MarketType::Spot};
 
 SubscribeL2DiffRequest subscribe_l2_diff_request(const BookId& book_id) {
     SubscribeL2DiffRequest request;

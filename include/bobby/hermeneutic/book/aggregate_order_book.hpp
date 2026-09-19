@@ -13,9 +13,10 @@
 
 namespace bobby::hermeneutic {
 
-// A venue's identity, keyed by (Venue, MarketType) - see symbol.hpp's own
-// comment on why this is a structured type, not a hand-spelled string, and
-// std::hash<VenueId> there for why venues_ below can be unordered_map.
+// A venue's identity, keyed by (Exchange, MarketType) - see symbol.hpp's
+// own comment on why this is a structured type, not a hand-spelled
+// string, and std::hash<VenueId> there for why venues_ below can be
+// unordered_map.
 using VenueId = bobby::hermeneutic::symbol::VenueId;
 
 enum class Side { Bid, Ask };

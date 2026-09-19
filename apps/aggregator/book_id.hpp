@@ -32,7 +32,7 @@ inline std::optional<symbol::BookId> to_symbol_book_id(const BookId& wire) {
         case MarketType::SPOT: type = symbol::MarketType::Spot; break;
         case MarketType::PERP: type = symbol::MarketType::Perp; break;
         // Deliberately not the exhaustive, compiler-enforced switch pattern
-        // symbol.hpp's own venue_id()/native_symbol() use (see this
+        // symbol.hpp's own to_string(VenueId)/native_symbol() use (see this
         // project's docs/ingestion_design.md 第10節第10項): proto3 enums
         // are open on the wire - a newer client can send a MarketType this
         // server's generated code doesn't even know the name of yet - so a

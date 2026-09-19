@@ -41,8 +41,8 @@ namespace net = boost::asio;
 
 using bobby::hermeneutic::aggregator::SymbolBook;
 using bobby::hermeneutic::ingestion::VenueSubscription;
+using bobby::hermeneutic::symbol::Exchange;
 using bobby::hermeneutic::symbol::MarketType;
-using bobby::hermeneutic::symbol::Venue;
 using bobby::hermeneutic::symbol::VenueId;
 
 // Every venue's contribution, gathered from the flat VenueSubscription
@@ -54,12 +54,12 @@ struct VenueGroup {
     bobby::hermeneutic::ingestion::SymbolRegistry<SymbolBook> registry;
 };
 
-// Keyed by VenueId (not a hand-rolled std::pair<Venue, MarketType>, which
-// would be a second, independent spelling of the exact same pairing
-// VenueId already exists to own - see symbol.hpp's own comment on why
-// that duplication is the thing this type was introduced to remove).
-// unordered_map, not map: same "nothing needs to sort this" rationale as
-// AggregateOrderBook's venues_.
+// Keyed by VenueId (not a hand-rolled std::pair<Exchange, MarketType>,
+// which would be a second, independent spelling of the exact same
+// pairing VenueId already exists to own - see symbol.hpp's own comment
+// on why that duplication is the thing this type was introduced to
+// remove). unordered_map, not map: same "nothing needs to sort this"
+// rationale as AggregateOrderBook's venues_.
 using VenueGroups = std::unordered_map<VenueId, VenueGroup>;
 
 VenueGroup* find_group(VenueGroups& groups, const VenueId& venue_id) {
@@ -212,22 +212,22 @@ int main(int argc, char** argv) {
     std::vector<std::string> wired_venues;
 
     wire_venue<bobby::hermeneutic::ingestion::BinanceSpotFeed, bobby::hermeneutic::BinanceSpotSequencePolicy>(
-        runner, groups, VenueId{Venue::Binance, MarketType::Spot}, wired_venues, io.get_executor(), &ssl_ctx);
+        runner, groups, VenueId{Exchange::Binance, MarketType::Spot}, wired_venues, io.get_executor(), &ssl_ctx);
     wire_venue<bobby::hermeneutic::ingestion::BinanceFuturesFeed, bobby::hermeneutic::BinanceFuturesSequencePolicy>(
-        runner, groups, VenueId{Venue::Binance, MarketType::Perp}, wired_venues, io.get_executor(), &ssl_ctx);
+        runner, groups, VenueId{Exchange::Binance, MarketType::Perp}, wired_venues, io.get_executor(), &ssl_ctx);
     wire_venue<bobby::hermeneutic::ingestion::BybitSpotFeed, bobby::hermeneutic::BybitSequencePolicy>(
-        runner, groups, VenueId{Venue::Bybit, MarketType::Spot}, wired_venues, io.get_executor(), &ssl_ctx);
+        runner, groups, VenueId{Exchange::Bybit, MarketType::Spot}, wired_venues, io.get_executor(), &ssl_ctx);
     wire_venue<bobby::hermeneutic::ingestion::BybitLinearFeed, bobby::hermeneutic::BybitSequencePolicy>(
-        runner, groups, VenueId{Venue::Bybit, MarketType::Perp}, wired_venues, io.get_executor(), &ssl_ctx);
+        runner, groups, VenueId{Exchange::Bybit, MarketType::Perp}, wired_venues, io.get_executor(), &ssl_ctx);
     // OKX is a single Feed/Policy pair covering both spot and perpetual
     // swap instIds (the `books` channel is protocol-identical for both -
     // see okx_feed.hpp); "okx_spot"/"okx_swap" are two independent
     // VenueSessions of that same Feed type, one per book type, matching
     // every other venue's shape here.
     wire_venue<bobby::hermeneutic::ingestion::OkxFeed, bobby::hermeneutic::OkxSequencePolicy>(
-        runner, groups, VenueId{Venue::Okx, MarketType::Spot}, wired_venues, io.get_executor(), &ssl_ctx);
+        runner, groups, VenueId{Exchange::Okx, MarketType::Spot}, wired_venues, io.get_executor(), &ssl_ctx);
     wire_venue<bobby::hermeneutic::ingestion::OkxFeed, bobby::hermeneutic::OkxSequencePolicy>(
-        runner, groups, VenueId{Venue::Okx, MarketType::Perp}, wired_venues, io.get_executor(), &ssl_ctx);
+        runner, groups, VenueId{Exchange::Okx, MarketType::Perp}, wired_venues, io.get_executor(), &ssl_ctx);
 
     runner.start_all();
     std::thread io_thread([&io] { io.run(); });

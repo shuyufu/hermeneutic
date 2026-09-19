@@ -31,23 +31,23 @@ enum class MarketType { Spot, Perp };
 // enum, never a Feed type: this header (and anything that parses a
 // venue list against it, e.g. bobby::hermeneutic::ingestion's subscription
 // config) stays usable - and unit-testable - without linking simdjson or
-// gRPC at all. Adding a venue means adding a case to native_symbol()/
-// to_string(VenueId)/parse_venue() below, and separately wiring its
+// gRPC at all. Adding an exchange means adding a case to native_symbol()/
+// to_string(VenueId)/parse_exchange() below, and separately wiring its
 // Feed/Policy into apps/aggregator/server_main.cpp's own dispatch.
-enum class Venue { Binance, Bybit, Okx };
+enum class Exchange { Binance, Bybit, Okx };
 
-inline std::optional<Venue> parse_venue(std::string_view token) {
-    if (token == "BINANCE") return Venue::Binance;
-    if (token == "BYBIT") return Venue::Bybit;
-    if (token == "OKX") return Venue::Okx;
+inline std::optional<Exchange> parse_exchange(std::string_view token) {
+    if (token == "BINANCE") return Exchange::Binance;
+    if (token == "BYBIT") return Exchange::Bybit;
+    if (token == "OKX") return Exchange::Okx;
     return std::nullopt;
 }
 
-inline std::string_view venue_name(Venue venue) {
-    switch (venue) {
-        case Venue::Binance: return "BINANCE";
-        case Venue::Bybit: return "BYBIT";
-        case Venue::Okx: return "OKX";
+inline std::string_view exchange_name(Exchange exchange) {
+    switch (exchange) {
+        case Exchange::Binance: return "BINANCE";
+        case Exchange::Bybit: return "BYBIT";
+        case Exchange::Okx: return "OKX";
     }
     return "";  // unreachable - silences -Wreturn-type on an exhaustive switch
 }
@@ -160,16 +160,21 @@ inline std::optional<BookId> parse_book_id(std::string_view token) {
 // A venue's identity as a structured value - which VenueSession/
 // AggregateOrderBook actually key their per-venue bookkeeping by (see
 // aggregate_order_book.hpp's apply_delta()/apply_snapshot()/apply_batch()/
-// invalidate_venue()). Replaces a hand-spelled std::string that used to be
-// the map key directly: nothing stopped that string from drifting out of
-// sync with the real (Venue, MarketType) pair it was supposed to represent
-// (a typo, or a second caller inventing its own spelling), the same
-// "identity in the type system, not a string convention" reasoning that
-// replaced book_key() with BookId above.
+// invalidate_venue()). This is the real "venue" concept this project
+// means everywhere else it says "venue": an Exchange scoped to a market
+// (e.g. "binance_spot" and "binance_futures" are two different venues
+// even though the same company runs both) - see Exchange's own comment
+// above for why the bare exchange enum isn't this. Replaces a
+// hand-spelled std::string that used to be the map key directly: nothing
+// stopped that string from drifting out of sync with the real (Exchange,
+// MarketType) pair it was supposed to represent (a typo, or a second
+// caller inventing its own spelling), the same "identity in the type
+// system, not a string convention" reasoning that replaced book_key()
+// with BookId above.
 //
 // Equality/hash only, not ordered (same rationale as BookId's own comment).
 struct VenueId {
-    Venue venue;
+    Exchange exchange;
     MarketType type;
 
     bool operator==(const VenueId&) const = default;
@@ -186,10 +191,10 @@ struct VenueId {
 // to_string(BookId) above - nothing parses this back into a VenueId, and
 // nothing needs to: nothing constructs a VenueId from a string any more.
 inline std::string to_string(const VenueId& id) {
-    switch (id.venue) {
-        case Venue::Binance: return id.type == MarketType::Spot ? "binance_spot" : "binance_futures";
-        case Venue::Bybit: return id.type == MarketType::Spot ? "bybit_spot" : "bybit_linear";
-        case Venue::Okx: return id.type == MarketType::Spot ? "okx_spot" : "okx_swap";
+    switch (id.exchange) {
+        case Exchange::Binance: return id.type == MarketType::Spot ? "binance_spot" : "binance_futures";
+        case Exchange::Bybit: return id.type == MarketType::Spot ? "bybit_spot" : "bybit_linear";
+        case Exchange::Okx: return id.type == MarketType::Spot ? "okx_spot" : "okx_swap";
     }
     return "";  // unreachable - silences -Wreturn-type on an exhaustive switch
 }
@@ -204,12 +209,12 @@ inline std::string to_string(const VenueId& id) {
 // boundary the caller supplied, rather than this having to recover it
 // from a concatenated string the way split_base_quote()'s own comment
 // explains this project avoids.
-inline std::string native_symbol(Venue venue, const BaseQuote& symbol, MarketType type) {
-    switch (venue) {
-        case Venue::Binance:
-        case Venue::Bybit:
+inline std::string native_symbol(Exchange exchange, const BaseQuote& symbol, MarketType type) {
+    switch (exchange) {
+        case Exchange::Binance:
+        case Exchange::Bybit:
             return symbol.base.code + symbol.quote.code;
-        case Venue::Okx:
+        case Exchange::Okx:
             return symbol.base.code + "-" + symbol.quote.code + (type == MarketType::Perp ? "-SWAP" : "");
     }
     return "";  // unreachable - silences -Wreturn-type on an exhaustive switch
@@ -244,7 +249,7 @@ struct std::hash<bobby::hermeneutic::symbol::BookId> {
 template <>
 struct std::hash<bobby::hermeneutic::symbol::VenueId> {
     std::size_t operator()(const bobby::hermeneutic::symbol::VenueId& id) const noexcept {
-        std::size_t seed = std::hash<int>{}(static_cast<int>(id.venue));
+        std::size_t seed = std::hash<int>{}(static_cast<int>(id.exchange));
         seed ^= std::hash<int>{}(static_cast<int>(id.type)) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
         return seed;
     }

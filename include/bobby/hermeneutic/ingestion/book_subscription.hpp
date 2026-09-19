@@ -13,8 +13,8 @@
 namespace bobby::hermeneutic::ingestion {
 
 using bobby::hermeneutic::symbol::BookId;
+using bobby::hermeneutic::symbol::Exchange;
 using bobby::hermeneutic::symbol::MarketType;
-using bobby::hermeneutic::symbol::Venue;
 using bobby::hermeneutic::symbol::VenueId;
 
 // One venue's contribution to one book: everything apps/aggregator/server_main.cpp
@@ -24,10 +24,11 @@ using bobby::hermeneutic::symbol::VenueId;
 // bobby/hermeneutic/symbol/symbol.hpp) - it exists because this ingestion
 // config, specifically, resolves a venue list into concrete subscriptions.
 //
-// `venue_id` (not separate `Venue venue; MarketType type;` fields): the
-// pairing IS what VenueId exists to own - see symbol.hpp's own comment -
-// so spelling it out as two fields here would just be a second,
-// independent place for the exact same pairing to drift out of sync.
+// `venue_id` (not separate `Exchange exchange; MarketType type;` fields):
+// the pairing IS what VenueId exists to own - see symbol.hpp's own
+// comment - so spelling it out as two fields here would just be a
+// second, independent place for the exact same pairing to drift out of
+// sync.
 struct VenueSubscription {
     VenueId venue_id;
     BookId book_id;              // AggregatorService::book()'s key
@@ -109,7 +110,7 @@ inline std::expected<std::vector<VenueSubscription>, std::string> parse_book_sub
                 return std::unexpected("book \"" + key_str + "\" is configured more than once");
             }
 
-            std::unordered_set<Venue> seen_venues;
+            std::unordered_set<Exchange> seen_exchanges;
             bool any_venue = false;
             for (auto venue_value : venues_field) {
                 std::string_view venue_token;
@@ -119,19 +120,20 @@ inline std::expected<std::vector<VenueSubscription>, std::string> parse_book_sub
                     return std::unexpected("\"venues\" for \"" + key_str + "\" must be an array of strings");
                 }
 
-                auto venue = bobby::hermeneutic::symbol::parse_venue(venue_token);
-                if (!venue) {
+                auto exchange = bobby::hermeneutic::symbol::parse_exchange(venue_token);
+                if (!exchange) {
                     return std::unexpected("unknown venue \"" + std::string(venue_token) + "\" for \"" + key_str +
                                             "\"");
                 }
-                if (!seen_venues.insert(*venue).second) {
-                    return std::unexpected("venue " + std::string(bobby::hermeneutic::symbol::venue_name(*venue)) +
+                if (!seen_exchanges.insert(*exchange).second) {
+                    return std::unexpected("venue " +
+                                            std::string(bobby::hermeneutic::symbol::exchange_name(*exchange)) +
                                             " listed twice for \"" + key_str + "\"");
                 }
 
                 any_venue = true;
-                result.push_back(VenueSubscription{
-                    VenueId{*venue, type}, id, bobby::hermeneutic::symbol::native_symbol(*venue, *symbol, type)});
+                result.push_back(VenueSubscription{VenueId{*exchange, type}, id,
+                                                     bobby::hermeneutic::symbol::native_symbol(*exchange, *symbol, type)});
             }
 
             if (!any_venue) {

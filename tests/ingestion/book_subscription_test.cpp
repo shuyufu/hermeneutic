@@ -7,9 +7,9 @@
 namespace bobby::hermeneutic::ingestion {
 namespace {
 
+using bobby::hermeneutic::symbol::Exchange;
 using bobby::hermeneutic::symbol::MarketType;
 using bobby::hermeneutic::symbol::to_string;
-using bobby::hermeneutic::symbol::Venue;
 
 TEST(ParseBookSubscriptions, ParsesTheMotivatingExample) {
     auto result = parse_book_subscriptions(R"({
@@ -21,26 +21,26 @@ TEST(ParseBookSubscriptions, ParsesTheMotivatingExample) {
     ASSERT_TRUE(result.has_value()) << result.error();
     ASSERT_EQ(result->size(), 5u);
 
-    EXPECT_EQ((*result)[0].venue_id.venue, Venue::Binance);
+    EXPECT_EQ((*result)[0].venue_id.exchange, Exchange::Binance);
     EXPECT_EQ((*result)[0].venue_id.type, MarketType::Spot);
     EXPECT_EQ(to_string((*result)[0].book_id), "BTC_USDT.SPOT");
     EXPECT_EQ((*result)[0].native_symbol, "BTCUSDT");
 
-    EXPECT_EQ((*result)[1].venue_id.venue, Venue::Okx);
+    EXPECT_EQ((*result)[1].venue_id.exchange, Exchange::Okx);
     EXPECT_EQ((*result)[1].venue_id.type, MarketType::Spot);
     EXPECT_EQ(to_string((*result)[1].book_id), "BTC_USDT.SPOT");
     EXPECT_EQ((*result)[1].native_symbol, "BTC-USDT");
 
-    EXPECT_EQ((*result)[2].venue_id.venue, Venue::Bybit);
+    EXPECT_EQ((*result)[2].venue_id.exchange, Exchange::Bybit);
     EXPECT_EQ(to_string((*result)[2].book_id), "BTC_USDT.SPOT");
     EXPECT_EQ((*result)[2].native_symbol, "BTCUSDT");
 
-    EXPECT_EQ((*result)[3].venue_id.venue, Venue::Binance);
+    EXPECT_EQ((*result)[3].venue_id.exchange, Exchange::Binance);
     EXPECT_EQ((*result)[3].venue_id.type, MarketType::Perp);
     EXPECT_EQ(to_string((*result)[3].book_id), "BTC_USDT.PERP");
     EXPECT_EQ((*result)[3].native_symbol, "BTCUSDT");
 
-    EXPECT_EQ((*result)[4].venue_id.venue, Venue::Okx);
+    EXPECT_EQ((*result)[4].venue_id.exchange, Exchange::Okx);
     EXPECT_EQ((*result)[4].venue_id.type, MarketType::Perp);
     EXPECT_EQ(to_string((*result)[4].book_id), "BTC_USDT.PERP");
     EXPECT_EQ((*result)[4].native_symbol, "BTC-USDT-SWAP");

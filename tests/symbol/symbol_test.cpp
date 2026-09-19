@@ -32,22 +32,22 @@ TEST(SplitBaseQuote, RejectsEmptyBaseOrQuote) {
     EXPECT_FALSE(split_base_quote("BTC_").has_value());
 }
 
-TEST(ParseVenue, RecognizesKnownVenues) {
-    EXPECT_EQ(parse_venue("BINANCE"), Venue::Binance);
-    EXPECT_EQ(parse_venue("BYBIT"), Venue::Bybit);
-    EXPECT_EQ(parse_venue("OKX"), Venue::Okx);
+TEST(ParseExchange, RecognizesKnownExchanges) {
+    EXPECT_EQ(parse_exchange("BINANCE"), Exchange::Binance);
+    EXPECT_EQ(parse_exchange("BYBIT"), Exchange::Bybit);
+    EXPECT_EQ(parse_exchange("OKX"), Exchange::Okx);
 }
 
-TEST(ParseVenue, RejectsUnknownOrWrongCase) {
-    EXPECT_FALSE(parse_venue("BINANCEX").has_value());
-    EXPECT_FALSE(parse_venue("binance").has_value());
-    EXPECT_FALSE(parse_venue("").has_value());
+TEST(ParseExchange, RejectsUnknownOrWrongCase) {
+    EXPECT_FALSE(parse_exchange("BINANCEX").has_value());
+    EXPECT_FALSE(parse_exchange("binance").has_value());
+    EXPECT_FALSE(parse_exchange("").has_value());
 }
 
-TEST(VenueName, RoundTripsThroughParseVenue) {
-    EXPECT_EQ(venue_name(Venue::Binance), "BINANCE");
-    EXPECT_EQ(venue_name(Venue::Bybit), "BYBIT");
-    EXPECT_EQ(venue_name(Venue::Okx), "OKX");
+TEST(ExchangeName, RoundTripsThroughParseExchange) {
+    EXPECT_EQ(exchange_name(Exchange::Binance), "BINANCE");
+    EXPECT_EQ(exchange_name(Exchange::Bybit), "BYBIT");
+    EXPECT_EQ(exchange_name(Exchange::Okx), "OKX");
 }
 
 TEST(BookIdToString, IsUnderscoreSeparatedWithTypeSuffix) {
@@ -109,12 +109,12 @@ TEST(BookIdHash, UsableAsUnorderedSetKey) {
 }
 
 TEST(VenueIdString, UsesEachExchangesOwnDerivativesTerm) {
-    EXPECT_EQ(to_string(VenueId{Venue::Binance, MarketType::Spot}), "binance_spot");
-    EXPECT_EQ(to_string(VenueId{Venue::Binance, MarketType::Perp}), "binance_futures");
-    EXPECT_EQ(to_string(VenueId{Venue::Bybit, MarketType::Spot}), "bybit_spot");
-    EXPECT_EQ(to_string(VenueId{Venue::Bybit, MarketType::Perp}), "bybit_linear");
-    EXPECT_EQ(to_string(VenueId{Venue::Okx, MarketType::Spot}), "okx_spot");
-    EXPECT_EQ(to_string(VenueId{Venue::Okx, MarketType::Perp}), "okx_swap");
+    EXPECT_EQ(to_string(VenueId{Exchange::Binance, MarketType::Spot}), "binance_spot");
+    EXPECT_EQ(to_string(VenueId{Exchange::Binance, MarketType::Perp}), "binance_futures");
+    EXPECT_EQ(to_string(VenueId{Exchange::Bybit, MarketType::Spot}), "bybit_spot");
+    EXPECT_EQ(to_string(VenueId{Exchange::Bybit, MarketType::Perp}), "bybit_linear");
+    EXPECT_EQ(to_string(VenueId{Exchange::Okx, MarketType::Spot}), "okx_spot");
+    EXPECT_EQ(to_string(VenueId{Exchange::Okx, MarketType::Perp}), "okx_swap");
 }
 
 // Same rationale as BookIdHash.UsableAsUnorderedSetKey above - proves
@@ -123,25 +123,25 @@ TEST(VenueIdString, UsesEachExchangesOwnDerivativesTerm) {
 // VenueId, L2OrderBook>) now requires.
 TEST(VenueIdHash, UsableAsUnorderedSetKey) {
     std::unordered_set<VenueId> seen;
-    EXPECT_TRUE(seen.insert(VenueId{Venue::Binance, MarketType::Spot}).second);
-    EXPECT_TRUE(seen.insert(VenueId{Venue::Binance, MarketType::Perp}).second);
-    EXPECT_TRUE(seen.insert(VenueId{Venue::Okx, MarketType::Spot}).second);
-    EXPECT_FALSE(seen.insert(VenueId{Venue::Binance, MarketType::Spot}).second);
+    EXPECT_TRUE(seen.insert(VenueId{Exchange::Binance, MarketType::Spot}).second);
+    EXPECT_TRUE(seen.insert(VenueId{Exchange::Binance, MarketType::Perp}).second);
+    EXPECT_TRUE(seen.insert(VenueId{Exchange::Okx, MarketType::Spot}).second);
+    EXPECT_FALSE(seen.insert(VenueId{Exchange::Binance, MarketType::Spot}).second);
     EXPECT_EQ(seen.size(), 3u);
 }
 
 TEST(NativeSymbol, BinanceAndBybitAreConcatenatedRegardlessOfType) {
     BaseQuote btc_usdt{"BTC", "USDT"};
-    EXPECT_EQ(native_symbol(Venue::Binance, btc_usdt, MarketType::Spot), "BTCUSDT");
-    EXPECT_EQ(native_symbol(Venue::Binance, btc_usdt, MarketType::Perp), "BTCUSDT");
-    EXPECT_EQ(native_symbol(Venue::Bybit, btc_usdt, MarketType::Spot), "BTCUSDT");
-    EXPECT_EQ(native_symbol(Venue::Bybit, btc_usdt, MarketType::Perp), "BTCUSDT");
+    EXPECT_EQ(native_symbol(Exchange::Binance, btc_usdt, MarketType::Spot), "BTCUSDT");
+    EXPECT_EQ(native_symbol(Exchange::Binance, btc_usdt, MarketType::Perp), "BTCUSDT");
+    EXPECT_EQ(native_symbol(Exchange::Bybit, btc_usdt, MarketType::Spot), "BTCUSDT");
+    EXPECT_EQ(native_symbol(Exchange::Bybit, btc_usdt, MarketType::Perp), "BTCUSDT");
 }
 
 TEST(NativeSymbol, OkxUsesDashAndSwapSuffix) {
     BaseQuote btc_usdt{"BTC", "USDT"};
-    EXPECT_EQ(native_symbol(Venue::Okx, btc_usdt, MarketType::Spot), "BTC-USDT");
-    EXPECT_EQ(native_symbol(Venue::Okx, btc_usdt, MarketType::Perp), "BTC-USDT-SWAP");
+    EXPECT_EQ(native_symbol(Exchange::Okx, btc_usdt, MarketType::Spot), "BTC-USDT");
+    EXPECT_EQ(native_symbol(Exchange::Okx, btc_usdt, MarketType::Perp), "BTC-USDT-SWAP");
 }
 
 }  // namespace

@@ -11,15 +11,15 @@
 namespace bobby::hermeneutic {
 namespace {
 
+using bobby::hermeneutic::symbol::Exchange;
 using bobby::hermeneutic::symbol::MarketType;
-using bobby::hermeneutic::symbol::Venue;
 
 // Two arbitrary, distinct VenueIds - these tests only need "two different
-// venues" to exercise per-venue isolation, never the real venue_id()/
-// to_string(VenueId) spelling, so MarketType::Spot on both is an arbitrary
-// (but fixed) choice, not a claim about what market either actually covers.
-constexpr VenueId kBinance{Venue::Binance, MarketType::Spot};
-constexpr VenueId kOkx{Venue::Okx, MarketType::Spot};
+// venues" to exercise per-venue isolation, never the real to_string(VenueId)
+// spelling, so MarketType::Spot on both is an arbitrary (but fixed) choice,
+// not a claim about what market either actually covers.
+constexpr VenueId kBinance{Exchange::Binance, MarketType::Spot};
+constexpr VenueId kOkx{Exchange::Okx, MarketType::Spot};
 
 TEST(AggregateOrderBook, SingleVenueAddUpdateRemove) {
     AggregateOrderBook book;

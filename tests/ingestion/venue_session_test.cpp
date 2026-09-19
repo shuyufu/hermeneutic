@@ -38,13 +38,13 @@ using bobby::hermeneutic::aggregator::L2Update;
 using bobby::hermeneutic::aggregator::SymbolBook;
 using bobby::hermeneutic::symbol::BaseQuote;
 using bobby::hermeneutic::symbol::BookId;
+using bobby::hermeneutic::symbol::Exchange;
 using bobby::hermeneutic::symbol::MarketType;
-using bobby::hermeneutic::symbol::Venue;
 
 // An arbitrary VenueId - these tests exercise VenueSession's own behavior
 // (start/stop/resync/gap-handling), never AggregateOrderBook's per-venue
 // isolation, so which real venue/market this names doesn't matter.
-constexpr bobby::hermeneutic::VenueId kFakeVenue{Venue::Binance, MarketType::Spot};
+constexpr bobby::hermeneutic::VenueId kFakeVenue{Exchange::Binance, MarketType::Spot};
 
 // The one book every AggregatorService in this file is constructed with -
 // these tests are about VenueSession's own mechanics (backoff/stop/snapshot

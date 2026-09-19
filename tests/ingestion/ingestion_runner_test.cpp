@@ -25,14 +25,14 @@
 namespace bobby::hermeneutic::ingestion {
 namespace {
 
+using bobby::hermeneutic::symbol::Exchange;
 using bobby::hermeneutic::symbol::MarketType;
-using bobby::hermeneutic::symbol::Venue;
 
 // Two arbitrary, distinct VenueIds - this test is about IngestionRunner
 // driving differently-typed VenueSessions uniformly, not about venue/
 // market identity, so any two distinct values would do.
-constexpr bobby::hermeneutic::VenueId kVenueA{Venue::Binance, MarketType::Spot};
-constexpr bobby::hermeneutic::VenueId kVenueB{Venue::Binance, MarketType::Perp};
+constexpr bobby::hermeneutic::VenueId kVenueA{Exchange::Binance, MarketType::Spot};
+constexpr bobby::hermeneutic::VenueId kVenueB{Exchange::Binance, MarketType::Perp};
 
 // A minimal VenueFeed test double: no snapshot/HTTP path at all
 // (kSnapshotViaRest=false), no messages ever parsed. This test is about
