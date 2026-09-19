@@ -21,6 +21,58 @@ add_library(hermeneutic_core INTERFACE)
 target_include_directories(hermeneutic_core INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 add_library(hermeneutic::core ALIAS hermeneutic_core)
 
+# Warning flags applied once here, not per-target: every hermeneutic_*
+# target below traces back to hermeneutic::core (directly or
+# transitively - book/symbol/net/ingestion/exchange_policy/exchange all
+# link it, see each one's own comment), so an INTERFACE compile option
+# here reaches every line of this project's own code without needing to
+# repeat it on each target. Deliberately does NOT reach FetchContent'd
+# dependencies (googletest, simdjson) or the generated proto/gRPC code
+# (hermeneutic_proto) - none of those link hermeneutic::core, so their
+# own warnings (not this project's to fix) stay unaffected. Turning
+# this on surfaced real -Wmissing-braces warnings at 20 call sites
+# across three test files (BaseQuote{"BTC", "USDT"} needs the inner
+# Asset sub-objects braced too: BaseQuote{{"BTC"}, {"USDT"}}) - fixed
+# rather than suppressed, since a repo-wide check found the unbraced
+# form confined to exactly those 20 sites in those three files, not
+# pervasive enough to be "this project's own idiom the warning just
+# doesn't understand". No -Werror: turning every warning into a hard build
+# failure is a separate, deliberately not-yet-made decision - this
+# project's own build is verified clean under -Wall -Wextra as of
+# adding this option, but that's a snapshot, not an ongoing guarantee,
+# and -Werror should be adopted (or not) as its own choice once staying
+# warning-free is actually an enforced practice, not bundled into "add
+# warnings at all".
+if(NOT MSVC)
+    target_compile_options(hermeneutic_core INTERFACE -Wall -Wextra)
+endif()
+
+# Reproducible, one-flag sanitizer builds - the previous way to run
+# ASan/UBSan against this project was a manually-created, one-off
+# build-asan directory (see docs/ingestion_design.md's OKX
+# verification section), not something `cmake -B build
+# -DHERMENEUTIC_ASAN=ON` could reproduce on demand. Applied the same
+# way as the warning flags above (via hermeneutic::core, so it reaches
+# this project's own code but not vcpkg's prebuilt gRPC/Protobuf
+# static libraries, which aren't ASan-instrumented) - a translation
+# unit built with ASan that links against one built without it is
+# exactly the mismatch docs/ingestion_design.md's OKX section hit
+# (a container-overflow false positive from libc++'s container
+# annotations disagreeing between the two), worked around there with
+# `ASAN_OPTIONS=detect_container_overflow=0` at run time - the same
+# workaround still applies here, this option does not remove the need
+# for it.
+option(HERMENEUTIC_ASAN "Build with AddressSanitizer (implies -fno-omit-frame-pointer)" OFF)
+option(HERMENEUTIC_UBSAN "Build with UndefinedBehaviorSanitizer (implies -fno-omit-frame-pointer)" OFF)
+if(HERMENEUTIC_ASAN)
+    target_compile_options(hermeneutic_core INTERFACE -fsanitize=address -fno-omit-frame-pointer)
+    target_link_options(hermeneutic_core INTERFACE -fsanitize=address)
+endif()
+if(HERMENEUTIC_UBSAN)
+    target_compile_options(hermeneutic_core INTERFACE -fsanitize=undefined -fno-omit-frame-pointer)
+    target_link_options(hermeneutic_core INTERFACE -fsanitize=undefined)
+endif()
+
 # This project's own symbol/venue naming rules (BASE_QUOTE splitting, book
 # keys, per-venue native symbol formats - see symbol.hpp's own class
 # comment): zero dependency beyond the standard library, so any future
@@ -142,6 +194,23 @@ endif()
 option(HERMENEUTIC_BUILD_SERVICE "Build gRPC service targets (requires vcpkg toolchain, see README)" OFF)
 
 if(HERMENEUTIC_BUILD_SERVICE)
+    # hermeneutic_aggregator_service/hermeneutic_aggregator_client below
+    # link hermeneutic::exchange (the real Binance/Bybit/OKX Feed
+    # parsers) unconditionally - that alias only exists under
+    # HERMENEUTIC_BUILD_INGESTION (default ON, so this combination is
+    # rare in practice, but silently falls through to a confusing
+    # "target hermeneutic::exchange was not found" CMake error rather
+    # than explaining the actual constraint). Genuinely required, not
+    # just currently coupled: an aggregator service with no Feed
+    # implementations to wire up isn't a smaller, valid configuration,
+    # it's a nonfunctional one.
+    if(NOT HERMENEUTIC_BUILD_INGESTION)
+        message(FATAL_ERROR
+            "HERMENEUTIC_BUILD_SERVICE requires HERMENEUTIC_BUILD_INGESTION=ON "
+            "(the aggregator service/client need real Feed implementations "
+            "from hermeneutic::exchange to do anything).")
+    endif()
+
     find_package(Protobuf CONFIG REQUIRED)
     find_package(gRPC CONFIG REQUIRED)
     find_package(boost_asio CONFIG REQUIRED)

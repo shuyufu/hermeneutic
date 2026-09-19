@@ -51,8 +51,8 @@ TEST(ExchangeName, RoundTripsThroughParseExchange) {
 }
 
 TEST(BookIdToString, IsUnderscoreSeparatedWithTypeSuffix) {
-    BookId btc_usdt_spot{BaseQuote{"BTC", "USDT"}, MarketType::Spot};
-    BookId btc_usdt_perp{BaseQuote{"BTC", "USDT"}, MarketType::Perp};
+    BookId btc_usdt_spot{BaseQuote{{"BTC"}, {"USDT"}}, MarketType::Spot};
+    BookId btc_usdt_perp{BaseQuote{{"BTC"}, {"USDT"}}, MarketType::Perp};
     EXPECT_EQ(to_string(btc_usdt_spot), "BTC_USDT.SPOT");
     EXPECT_EQ(to_string(btc_usdt_perp), "BTC_USDT.PERP");
 }
@@ -80,18 +80,18 @@ TEST(ParseBookId, RejectsMalformedBaseQuote) {
 }
 
 TEST(ParseBookId, IsTheExactInverseOfToString) {
-    for (BookId id : {BookId{BaseQuote{"BTC", "USDT"}, MarketType::Spot},
-                       BookId{BaseQuote{"BTC", "USDT"}, MarketType::Perp},
-                       BookId{BaseQuote{"ETH", "USDC"}, MarketType::Perp}}) {
+    for (BookId id : {BookId{BaseQuote{{"BTC"}, {"USDT"}}, MarketType::Spot},
+                       BookId{BaseQuote{{"BTC"}, {"USDT"}}, MarketType::Perp},
+                       BookId{BaseQuote{{"ETH"}, {"USDC"}}, MarketType::Perp}}) {
         EXPECT_EQ(parse_book_id(to_string(id)), id);
     }
 }
 
 TEST(BookIdEquality, ComparesBothBaseQuoteAndType) {
-    BookId btc_usdt_spot{BaseQuote{"BTC", "USDT"}, MarketType::Spot};
-    EXPECT_EQ(btc_usdt_spot, (BookId{BaseQuote{"BTC", "USDT"}, MarketType::Spot}));
-    EXPECT_NE(btc_usdt_spot, (BookId{BaseQuote{"BTC", "USDT"}, MarketType::Perp}));
-    EXPECT_NE(btc_usdt_spot, (BookId{BaseQuote{"ETH", "USDT"}, MarketType::Spot}));
+    BookId btc_usdt_spot{BaseQuote{{"BTC"}, {"USDT"}}, MarketType::Spot};
+    EXPECT_EQ(btc_usdt_spot, (BookId{BaseQuote{{"BTC"}, {"USDT"}}, MarketType::Spot}));
+    EXPECT_NE(btc_usdt_spot, (BookId{BaseQuote{{"BTC"}, {"USDT"}}, MarketType::Perp}));
+    EXPECT_NE(btc_usdt_spot, (BookId{BaseQuote{{"ETH"}, {"USDT"}}, MarketType::Spot}));
 }
 
 // Exercises usability as an unordered_set key (compiles/links only if
@@ -101,10 +101,10 @@ TEST(BookIdEquality, ComparesBothBaseQuoteAndType) {
 // usable as a key at all, which is the actual requirement here.
 TEST(BookIdHash, UsableAsUnorderedSetKey) {
     std::unordered_set<BookId> seen;
-    EXPECT_TRUE(seen.insert(BookId{BaseQuote{"BTC", "USDT"}, MarketType::Spot}).second);
-    EXPECT_TRUE(seen.insert(BookId{BaseQuote{"BTC", "USDT"}, MarketType::Perp}).second);
-    EXPECT_TRUE(seen.insert(BookId{BaseQuote{"BT", "CUSDT"}, MarketType::Spot}).second);
-    EXPECT_FALSE(seen.insert(BookId{BaseQuote{"BTC", "USDT"}, MarketType::Spot}).second);
+    EXPECT_TRUE(seen.insert(BookId{BaseQuote{{"BTC"}, {"USDT"}}, MarketType::Spot}).second);
+    EXPECT_TRUE(seen.insert(BookId{BaseQuote{{"BTC"}, {"USDT"}}, MarketType::Perp}).second);
+    EXPECT_TRUE(seen.insert(BookId{BaseQuote{{"BT"}, {"CUSDT"}}, MarketType::Spot}).second);
+    EXPECT_FALSE(seen.insert(BookId{BaseQuote{{"BTC"}, {"USDT"}}, MarketType::Spot}).second);
     EXPECT_EQ(seen.size(), 3u);
 }
 
@@ -131,7 +131,7 @@ TEST(VenueIdHash, UsableAsUnorderedSetKey) {
 }
 
 TEST(NativeSymbol, BinanceAndBybitAreConcatenatedRegardlessOfType) {
-    BaseQuote btc_usdt{"BTC", "USDT"};
+    BaseQuote btc_usdt{{"BTC"}, {"USDT"}};
     EXPECT_EQ(native_symbol(Exchange::Binance, btc_usdt, MarketType::Spot), "BTCUSDT");
     EXPECT_EQ(native_symbol(Exchange::Binance, btc_usdt, MarketType::Perp), "BTCUSDT");
     EXPECT_EQ(native_symbol(Exchange::Bybit, btc_usdt, MarketType::Spot), "BTCUSDT");
@@ -139,7 +139,7 @@ TEST(NativeSymbol, BinanceAndBybitAreConcatenatedRegardlessOfType) {
 }
 
 TEST(NativeSymbol, OkxUsesDashAndSwapSuffix) {
-    BaseQuote btc_usdt{"BTC", "USDT"};
+    BaseQuote btc_usdt{{"BTC"}, {"USDT"}};
     EXPECT_EQ(native_symbol(Exchange::Okx, btc_usdt, MarketType::Spot), "BTC-USDT");
     EXPECT_EQ(native_symbol(Exchange::Okx, btc_usdt, MarketType::Perp), "BTC-USDT-SWAP");
 }
