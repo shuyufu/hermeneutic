@@ -27,6 +27,7 @@
 #include "apps/aggregator/book_id.hpp"
 #include "bobby/hermeneutic/aggregator/aggregator.grpc.pb.h"
 #include "bobby/hermeneutic/exchange/binance/binance_futures_sequence_policy.hpp"
+#include "bobby/hermeneutic/exchange/bybit/bybit_sequence_policy.hpp"
 #include "bobby/hermeneutic/symbol/symbol.hpp"
 
 namespace bobby::hermeneutic::ingestion {
@@ -146,6 +147,69 @@ class FakeFeed {
     std::string http_port_;
 };
 
+// Minimal test double for the *other* VenueFeed shape: kSnapshotViaRest ==
+// false, matching Bybit/OKX - the exchange pushes its own snapshot as the
+// first message on the WS connection instead of the client racing a
+// separate REST fetch against the already-flowing diff stream. No
+// snapshot_request()/parse_snapshot_response() at all: VenueSession's
+// handle_request_snapshot() never calls either for a Feed shaped like
+// this - see its own `if constexpr (!Feed::kSnapshotViaRest)` branch -
+// so there is nothing here for those methods' absence to break, and no
+// fake HTTP server is needed for any test using this Feed (a real one
+// existing that this test never talks to still wouldn't prove anything;
+// not existing at all is what actually proves REST is never touched).
+class FakeFeedNoRest {
+  public:
+    static constexpr bool kSnapshotViaRest = false;
+
+    explicit FakeFeedNoRest(std::string ws_port) : ws_port_(std::move(ws_port)) {}
+
+    std::string_view ws_host() const { return "127.0.0.1"; }
+    std::string_view ws_port() const { return ws_port_; }
+    std::string_view ws_target() const { return "/"; }
+
+    std::string subscribe_message(std::span<const SymbolId>) const { return "SUBSCRIBE"; }
+
+    // "SNAPSHOT:<symbol>:<last_update_id>:<bid_price>:<bid_size>" (pushed
+    // by the exchange, unprompted - not a response to any request this
+    // Feed ever makes) or "DEPTH:<symbol>:<first_id>:<final_id>:
+    // <prev_final_id>:<bid_price>:<bid_size>" (same shape FakeFeed above
+    // uses, matching Bybit's real wire shape of one update id serving as
+    // both first_id and final_id - see BybitSequencePolicy's own comment).
+    std::expected<std::optional<std::variant<SnapshotMessage, DepthUpdate>>, std::errc> parse_message(
+        std::string_view text) const {
+        if (text == "PING") return std::optional<std::variant<SnapshotMessage, DepthUpdate>>{std::nullopt};
+
+        if (text.starts_with("SNAPSHOT:")) {
+            auto fields = split(text.substr(9), ':');
+            if (fields.size() != 4) return std::unexpected(std::errc::bad_message);
+            SnapshotMessage snapshot;
+            snapshot.symbol = std::string(fields[0]);
+            snapshot.last_update_id = parse_u64(fields[1]);
+            snapshot.bids = {{Price(parse_double(fields[2])), Size(parse_double(fields[3]))}};
+            return std::optional<std::variant<SnapshotMessage, DepthUpdate>>{std::in_place,
+                                                                              std::move(snapshot)};
+        }
+
+        if (text.starts_with("DEPTH:")) {
+            auto fields = split(text.substr(6), ':');
+            if (fields.size() != 6) return std::unexpected(std::errc::bad_message);
+            DepthUpdate update;
+            update.symbol = std::string(fields[0]);
+            update.first_id = parse_u64(fields[1]);
+            update.final_id = parse_u64(fields[2]);
+            update.prev_final_id = parse_u64(fields[3]);
+            update.bids = {{Price(parse_double(fields[4])), Size(parse_double(fields[5]))}};
+            return std::optional<std::variant<SnapshotMessage, DepthUpdate>>{std::in_place,
+                                                                              std::move(update)};
+        }
+        return std::unexpected(std::errc::bad_message);
+    }
+
+  private:
+    std::string ws_port_;
+};
+
 net::awaitable<void> run_fake_ws_server(net::ip::tcp::acceptor acceptor, std::string depth_message) {
     auto socket = co_await acceptor.async_accept(net::use_awaitable);
     websocket::stream<net::ip::tcp::socket> ws(std::move(socket));
@@ -210,6 +274,68 @@ net::awaitable<void> run_flaky_ws_server(net::ip::tcp::acceptor acceptor, std::a
         boost::system::error_code ec;
         co_await ws.async_read(buffer, net::redirect_error(net::use_awaitable, ec));
     }
+}
+
+// Like run_fake_ws_server above, but sends two messages in sequence
+// rather than one - what SnapshotPushedAsFirstMessage... below needs to
+// prove both halves of the WS-push-snapshot path: the pushed snapshot
+// itself applying correctly as literally the first message this symbol
+// ever sees, and a live diff right after it applying correctly on top -
+// not just the first half.
+net::awaitable<void> run_fake_ws_server_two_messages(net::ip::tcp::acceptor acceptor,
+                                                       std::string first_message,
+                                                       std::string second_message) {
+    auto socket = co_await acceptor.async_accept(net::use_awaitable);
+    websocket::stream<net::ip::tcp::socket> ws(std::move(socket));
+    co_await ws.async_accept(net::use_awaitable);
+
+    beast::flat_buffer buffer;
+    co_await ws.async_read(buffer, net::use_awaitable);  // the SUBSCRIBE message; content unchecked
+
+    co_await ws.async_write(net::buffer(first_message), net::use_awaitable);
+    co_await ws.async_write(net::buffer(second_message), net::use_awaitable);
+
+    // Same reasoning as run_fake_ws_server's own trailing idle read:
+    // keeps the connection open so a disconnect-triggered invalidate/
+    // reset isn't what this particular test is exercising.
+    beast::flat_buffer idle_buffer;
+    boost::system::error_code ec;
+    co_await ws.async_read(idle_buffer, net::redirect_error(net::use_awaitable, ec));
+}
+
+// First connection: sends `first_snapshot`, then drops (the socket/ws go
+// out of scope at the end of the inner block, closing the connection
+// right after that write - before any diff could arrive). Second
+// connection (after VenueSession's own backoff+reconnect): sends
+// `second_snapshot`, then holds the connection open. Proves VenueSession
+// redoes the whole connect->subscribe->on_connected->snapshot-pushed-
+// first flow correctly *again* after a reconnect, not just once.
+// run_flaky_ws_server (below) already drops connections mid-stream - see
+// StopAbortsBackoffWaitAndDoesNotReconnect, which relies on exactly that -
+// but no existing test checks *book state* after a reconnect, and none
+// does so for a kSnapshotViaRest=false feed at all.
+net::awaitable<void> run_fake_ws_server_drop_then_reconnect(net::ip::tcp::acceptor acceptor,
+                                                              std::string first_snapshot,
+                                                              std::string second_snapshot) {
+    {
+        auto socket = co_await acceptor.async_accept(net::use_awaitable);
+        websocket::stream<net::ip::tcp::socket> ws(std::move(socket));
+        co_await ws.async_accept(net::use_awaitable);
+        beast::flat_buffer buffer;
+        co_await ws.async_read(buffer, net::use_awaitable);
+        co_await ws.async_write(net::buffer(first_snapshot), net::use_awaitable);
+    }  // ws/socket destroyed here - the connection drops.
+
+    auto socket = co_await acceptor.async_accept(net::use_awaitable);
+    websocket::stream<net::ip::tcp::socket> ws(std::move(socket));
+    co_await ws.async_accept(net::use_awaitable);
+    beast::flat_buffer buffer;
+    co_await ws.async_read(buffer, net::use_awaitable);
+    co_await ws.async_write(net::buffer(second_snapshot), net::use_awaitable);
+
+    beast::flat_buffer idle_buffer;
+    boost::system::error_code ec;
+    co_await ws.async_read(idle_buffer, net::redirect_error(net::use_awaitable, ec));
 }
 
 auto fail_test_on_exception(std::string_view label) {
@@ -577,6 +703,208 @@ TEST(VenueSessionTest, StopBeforeStartPreventsConnecting) {
 
     io.stop();
     io_thread.join();
+}
+
+// Everything above drives FakeFeed (kSnapshotViaRest = true), Binance's
+// REST-race shape: SymbolSync starts Buffering, RequestSnapshot fires a
+// REST fetch, and on_snapshot() bridges whatever depth events arrived
+// while that fetch was in flight. None of it exercises the other real
+// shape - Bybit/OKX, kSnapshotViaRest = false - where the exchange pushes
+// its own snapshot as the first message on the same ordered WS
+// connection and RequestSnapshot is a no-op. on_snapshot()'s
+// empty-buffer branch (see BybitSequencePolicy's own comment for the
+// live bug this caused before it was fixed) is only reachable that way,
+// and only a real VenueSession/AggregatorService/SymbolBook wiring - not
+// SymbolSyncTest's unit tests - proves this project drives it correctly
+// end to end.
+TEST(VenueSessionTest, SnapshotPushedAsFirstMessageGoesLiveDirectlyForTrustConnectionOrderVenue) {
+    std::vector<std::string> symbols{"BTCUSDT"};
+    AggregatorService service(std::vector<BookId>{TestBookId()});
+
+    grpc::ServerBuilder builder;
+    int grpc_port = 0;
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &grpc_port);
+    builder.RegisterService(&service);
+    auto server = builder.BuildAndStart();
+    ASSERT_NE(server, nullptr);
+
+    auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(grpc_port),
+                                        grpc::InsecureChannelCredentials());
+    auto stub = bobby::hermeneutic::aggregator::Aggregator::NewStub(channel);
+    grpc::ClientContext context;
+    bobby::hermeneutic::aggregator::SubscribeL2DiffRequest request;
+    fill_wire_book_id(request.mutable_book(), TestBookId());
+    auto reader = stub->SubscribeL2Diff(&context, request);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<L2Update> updates;
+    std::thread reader_thread([&] {
+        L2Update update;
+        while (reader->Read(&update)) {
+            std::lock_guard lock(mutex);
+            updates.push_back(update);
+            cv.notify_all();
+        }
+    });
+    struct ReaderThreadGuard {
+        grpc::ClientContext& context;
+        std::thread& thread;
+        ~ReaderThreadGuard() {
+            context.TryCancel();
+            if (thread.joinable()) thread.join();
+        }
+    } reader_guard{context, reader_thread};
+
+    auto wait_for = [&](std::size_t index) -> L2Update {
+        std::unique_lock lock(mutex);
+        cv.wait_for(lock, std::chrono::seconds(5), [&] { return updates.size() > index; });
+        return updates.at(index);
+    };
+    wait_for(0);  // initial (empty) snapshot
+
+    // No HTTP server anywhere in this test - part of the proof that this
+    // path never does a REST fetch. Snapshot (last_update_id=100, bid
+    // 100.0 -> 5.0) arrives first; a contiguous depth update
+    // (final_id=101, bid 100.0 -> 7.0) right behind it on the same
+    // connection.
+    net::io_context io;
+    net::ip::tcp::acceptor ws_acceptor(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    unsigned short ws_port = ws_acceptor.local_endpoint().port();
+    net::co_spawn(io,
+                  run_fake_ws_server_two_messages(std::move(ws_acceptor), "SNAPSHOT:BTCUSDT:100:100.0:5.0",
+                                                   "DEPTH:BTCUSDT:101:101:0:100.0:7.0"),
+                  fail_test_on_exception("ws server"));
+
+    FakeFeedNoRest feed(std::to_string(ws_port));
+    SymbolRegistry<SymbolBook> registry;
+    registry.add("BTCUSDT", service.book(TestBookId()));
+    VenueSession<FakeFeedNoRest, BybitSequencePolicy, beast::tcp_stream, SymbolBook> session(
+        std::move(feed), kFakeVenue, symbols, std::move(registry), io.get_executor());
+    session.start(fail_test_on_exception("session"));
+
+    io.run_for(std::chrono::seconds(2));
+
+    // seq 1: ApplySnapshot from the pushed snapshot (bid 100.0 -> 5.0);
+    // seq 2: ApplyDelta from the contiguous depth update right after it
+    // (bid 100.0 -> 7.0) - both applied straight, no RequestSnapshot/REST
+    // round trip in between.
+    L2Update after_snapshot = wait_for(1);
+    ASSERT_TRUE(after_snapshot.has_diff());
+    ASSERT_EQ(after_snapshot.diff().bids_size(), 1);
+    EXPECT_EQ(after_snapshot.diff().bids(0).size_raw(), Size(5.0).raw());
+
+    L2Update after_delta = wait_for(2);
+    ASSERT_TRUE(after_delta.has_diff());
+    ASSERT_EQ(after_delta.diff().bids_size(), 1);
+    EXPECT_EQ(after_delta.diff().bids(0).price_raw(), Price(100.0).raw());
+    EXPECT_EQ(after_delta.diff().bids(0).size_raw(), Size(7.0).raw());
+
+    context.TryCancel();
+    if (reader_thread.joinable()) reader_thread.join();
+    server->Shutdown();
+}
+
+// Proves the snapshot-pushed-as-first-message flow above isn't a
+// one-shot fluke of connect()/subscribe()/on_connected() happening to
+// run once correctly - it must also be redone correctly after a
+// reconnect, the same on_disconnected() + backoff + reconnect contract
+// every other venue shape already has covered.
+TEST(VenueSessionTest, ReconnectRepeatsSnapshotPushedAsFirstMessageFlow) {
+    std::vector<std::string> symbols{"BTCUSDT"};
+    AggregatorService service(std::vector<BookId>{TestBookId()});
+
+    grpc::ServerBuilder builder;
+    int grpc_port = 0;
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &grpc_port);
+    builder.RegisterService(&service);
+    auto server = builder.BuildAndStart();
+    ASSERT_NE(server, nullptr);
+
+    auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(grpc_port),
+                                        grpc::InsecureChannelCredentials());
+    auto stub = bobby::hermeneutic::aggregator::Aggregator::NewStub(channel);
+    grpc::ClientContext context;
+    bobby::hermeneutic::aggregator::SubscribeL2DiffRequest request;
+    fill_wire_book_id(request.mutable_book(), TestBookId());
+    auto reader = stub->SubscribeL2Diff(&context, request);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<L2Update> updates;
+    std::thread reader_thread([&] {
+        L2Update update;
+        while (reader->Read(&update)) {
+            std::lock_guard lock(mutex);
+            updates.push_back(update);
+            cv.notify_all();
+        }
+    });
+    struct ReaderThreadGuard {
+        grpc::ClientContext& context;
+        std::thread& thread;
+        ~ReaderThreadGuard() {
+            context.TryCancel();
+            if (thread.joinable()) thread.join();
+        }
+    } reader_guard{context, reader_thread};
+
+    auto wait_for = [&](std::size_t index) -> L2Update {
+        std::unique_lock lock(mutex);
+        cv.wait_for(lock, std::chrono::seconds(10), [&] { return updates.size() > index; });
+        return updates.at(index);
+    };
+    wait_for(0);  // initial (empty) snapshot
+
+    // First connection pushes a snapshot (last_update_id=100, bid
+    // 100.0 -> 5.0) then drops. Second connection (after VenueSession's
+    // own backoff+reconnect) pushes a different snapshot
+    // (last_update_id=200, bid 100.0 -> 9.0).
+    net::io_context io;
+    net::ip::tcp::acceptor ws_acceptor(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    unsigned short ws_port = ws_acceptor.local_endpoint().port();
+    net::co_spawn(
+        io,
+        run_fake_ws_server_drop_then_reconnect(std::move(ws_acceptor), "SNAPSHOT:BTCUSDT:100:100.0:5.0",
+                                                "SNAPSHOT:BTCUSDT:200:100.0:9.0"),
+        fail_test_on_exception("ws server"));
+
+    FakeFeedNoRest feed(std::to_string(ws_port));
+    SymbolRegistry<SymbolBook> registry;
+    registry.add("BTCUSDT", service.book(TestBookId()));
+    VenueSession<FakeFeedNoRest, BybitSequencePolicy, beast::tcp_stream, SymbolBook> session(
+        std::move(feed), kFakeVenue, symbols, std::move(registry), io.get_executor());
+    session.start(fail_test_on_exception("session"));
+
+    // >=1s reconnect backoff (see StopAbortsBackoffWaitAndDoesNotReconnect's
+    // own comment on that minimum) plus both connections' round trips.
+    io.run_for(std::chrono::seconds(4));
+
+    // seq 1: ApplySnapshot from the first pushed snapshot (bid 5.0).
+    L2Update first_snapshot = wait_for(1);
+    ASSERT_TRUE(first_snapshot.has_diff());
+    ASSERT_EQ(first_snapshot.diff().bids_size(), 1);
+    EXPECT_EQ(first_snapshot.diff().bids(0).size_raw(), Size(5.0).raw());
+
+    // seq 2: InvalidateVenue from the drop - this venue's only
+    // contribution (bid @100.0) is reported removed (size_raw 0).
+    L2Update invalidated = wait_for(2);
+    ASSERT_TRUE(invalidated.has_diff());
+    ASSERT_EQ(invalidated.diff().bids_size(), 1);
+    EXPECT_EQ(invalidated.diff().bids(0).price_raw(), Price(100.0).raw());
+    EXPECT_EQ(invalidated.diff().bids(0).size_raw(), 0);
+
+    // seq 3: ApplySnapshot from the reconnect's pushed snapshot (bid
+    // 9.0) - proves connect->subscribe->on_connected->snapshot-pushed-
+    // first runs correctly a second time, not just once.
+    L2Update second_snapshot = wait_for(3);
+    ASSERT_TRUE(second_snapshot.has_diff());
+    ASSERT_EQ(second_snapshot.diff().bids_size(), 1);
+    EXPECT_EQ(second_snapshot.diff().bids(0).size_raw(), Size(9.0).raw());
+
+    context.TryCancel();
+    if (reader_thread.joinable()) reader_thread.join();
+    server->Shutdown();
 }
 
 }  // namespace
