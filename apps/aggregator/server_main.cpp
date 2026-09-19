@@ -12,11 +12,11 @@
 #include <condition_variable>
 #include <exception>
 #include <iostream>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -43,24 +43,31 @@ using bobby::hermeneutic::aggregator::SymbolBook;
 using bobby::hermeneutic::ingestion::VenueSubscription;
 using bobby::hermeneutic::symbol::MarketType;
 using bobby::hermeneutic::symbol::Venue;
+using bobby::hermeneutic::symbol::VenueId;
 
-// Every (venue, book type) pair's contribution, gathered from the flat
-// VenueSubscription list into what IngestionRunner::add() actually wants:
-// one native-symbol list plus one SymbolRegistry per venue, not one per
-// symbol. See the grouping loop in main() below.
+// Every venue's contribution, gathered from the flat VenueSubscription
+// list into what IngestionRunner::add() actually wants: one native-symbol
+// list plus one SymbolRegistry per venue, not one per symbol. See the
+// grouping loop in main() below.
 struct VenueGroup {
     std::vector<std::string> native_symbols;
     bobby::hermeneutic::ingestion::SymbolRegistry<SymbolBook> registry;
 };
 
-using VenueGroups = std::map<std::pair<Venue, MarketType>, VenueGroup>;
+// Keyed by VenueId (not a hand-rolled std::pair<Venue, MarketType>, which
+// would be a second, independent spelling of the exact same pairing
+// VenueId already exists to own - see symbol.hpp's own comment on why
+// that duplication is the thing this type was introduced to remove).
+// unordered_map, not map: same "nothing needs to sort this" rationale as
+// AggregateOrderBook's venues_.
+using VenueGroups = std::unordered_map<VenueId, VenueGroup>;
 
-VenueGroup* find_group(VenueGroups& groups, Venue venue, MarketType type) {
-    auto it = groups.find({venue, type});
+VenueGroup* find_group(VenueGroups& groups, const VenueId& venue_id) {
+    auto it = groups.find(venue_id);
     return it == groups.end() ? nullptr : &it->second;
 }
 
-// Registers (venue, type)'s group with `runner`, if the config actually
+// Registers `venue_id`'s group with `runner`, if the config actually
 // asked for it - a no-op otherwise (e.g. a config with no OKX venues at
 // all never touches OkxFeed). One instantiation of this per (Feed, Policy)
 // pair replaces what used to be six near-identical inline blocks in
@@ -69,15 +76,18 @@ VenueGroup* find_group(VenueGroups& groups, Venue venue, MarketType type) {
 // `groups` isn't read again afterward - and `wired_venues` is grown here
 // so the caller's startup log line can list only what was actually wired.
 template <typename Feed, typename Policy>
-void wire_venue(bobby::hermeneutic::ingestion::IngestionRunner& runner, VenueGroups& groups, Venue venue,
-                 MarketType type, std::vector<std::string>& wired_venues, net::any_io_executor executor,
+void wire_venue(bobby::hermeneutic::ingestion::IngestionRunner& runner, VenueGroups& groups,
+                 const VenueId& venue_id, std::vector<std::string>& wired_venues, net::any_io_executor executor,
                  net::ssl::context* ssl_ctx) {
-    auto* group = find_group(groups, venue, type);
+    auto* group = find_group(groups, venue_id);
     if (!group) return;
-    wired_venues.push_back(bobby::hermeneutic::symbol::venue_id(venue, type));
+    // to_string() is only for wired_venues, this function's own
+    // startup-log contribution - `venue_id` itself, not its string form,
+    // is what actually gets wired into IngestionRunner/VenueSession/
+    // AggregateOrderBook below.
+    wired_venues.push_back(bobby::hermeneutic::symbol::to_string(venue_id));
     runner.add<Feed, Policy, net::ssl::stream<boost::beast::tcp_stream>, SymbolBook>(
-        Feed{}, wired_venues.back(), std::move(group->native_symbols), std::move(group->registry), executor,
-        ssl_ctx);
+        Feed{}, venue_id, std::move(group->native_symbols), std::move(group->registry), executor, ssl_ctx);
 }
 
 }  // namespace
@@ -186,7 +196,7 @@ int main(int argc, char** argv) {
     // venue_session.hpp), pointing at the book its BookId resolves to.
     ::VenueGroups groups;
     for (const auto& sub : subscriptions) {
-        auto& group = groups[{sub.venue, sub.type}];
+        auto& group = groups[sub.venue_id];
         group.native_symbols.push_back(sub.native_symbol);
         // book_symbols above is derived from this same `subscriptions` list,
         // so this can never miss - asserted, not runtime-checked, the same
@@ -202,22 +212,22 @@ int main(int argc, char** argv) {
     std::vector<std::string> wired_venues;
 
     wire_venue<bobby::hermeneutic::ingestion::BinanceSpotFeed, bobby::hermeneutic::BinanceSpotSequencePolicy>(
-        runner, groups, Venue::Binance, MarketType::Spot, wired_venues, io.get_executor(), &ssl_ctx);
+        runner, groups, VenueId{Venue::Binance, MarketType::Spot}, wired_venues, io.get_executor(), &ssl_ctx);
     wire_venue<bobby::hermeneutic::ingestion::BinanceFuturesFeed, bobby::hermeneutic::BinanceFuturesSequencePolicy>(
-        runner, groups, Venue::Binance, MarketType::Perp, wired_venues, io.get_executor(), &ssl_ctx);
+        runner, groups, VenueId{Venue::Binance, MarketType::Perp}, wired_venues, io.get_executor(), &ssl_ctx);
     wire_venue<bobby::hermeneutic::ingestion::BybitSpotFeed, bobby::hermeneutic::BybitSequencePolicy>(
-        runner, groups, Venue::Bybit, MarketType::Spot, wired_venues, io.get_executor(), &ssl_ctx);
+        runner, groups, VenueId{Venue::Bybit, MarketType::Spot}, wired_venues, io.get_executor(), &ssl_ctx);
     wire_venue<bobby::hermeneutic::ingestion::BybitLinearFeed, bobby::hermeneutic::BybitSequencePolicy>(
-        runner, groups, Venue::Bybit, MarketType::Perp, wired_venues, io.get_executor(), &ssl_ctx);
+        runner, groups, VenueId{Venue::Bybit, MarketType::Perp}, wired_venues, io.get_executor(), &ssl_ctx);
     // OKX is a single Feed/Policy pair covering both spot and perpetual
     // swap instIds (the `books` channel is protocol-identical for both -
     // see okx_feed.hpp); "okx_spot"/"okx_swap" are two independent
     // VenueSessions of that same Feed type, one per book type, matching
     // every other venue's shape here.
     wire_venue<bobby::hermeneutic::ingestion::OkxFeed, bobby::hermeneutic::OkxSequencePolicy>(
-        runner, groups, Venue::Okx, MarketType::Spot, wired_venues, io.get_executor(), &ssl_ctx);
+        runner, groups, VenueId{Venue::Okx, MarketType::Spot}, wired_venues, io.get_executor(), &ssl_ctx);
     wire_venue<bobby::hermeneutic::ingestion::OkxFeed, bobby::hermeneutic::OkxSequencePolicy>(
-        runner, groups, Venue::Okx, MarketType::Perp, wired_venues, io.get_executor(), &ssl_ctx);
+        runner, groups, VenueId{Venue::Okx, MarketType::Perp}, wired_venues, io.get_executor(), &ssl_ctx);
 
     runner.start_all();
     std::thread io_thread([&io] { io.run(); });

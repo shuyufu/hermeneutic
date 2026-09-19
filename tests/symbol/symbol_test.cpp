@@ -109,12 +109,25 @@ TEST(BookIdHash, UsableAsUnorderedSetKey) {
 }
 
 TEST(VenueIdString, UsesEachExchangesOwnDerivativesTerm) {
-    EXPECT_EQ(venue_id(Venue::Binance, MarketType::Spot), "binance_spot");
-    EXPECT_EQ(venue_id(Venue::Binance, MarketType::Perp), "binance_futures");
-    EXPECT_EQ(venue_id(Venue::Bybit, MarketType::Spot), "bybit_spot");
-    EXPECT_EQ(venue_id(Venue::Bybit, MarketType::Perp), "bybit_linear");
-    EXPECT_EQ(venue_id(Venue::Okx, MarketType::Spot), "okx_spot");
-    EXPECT_EQ(venue_id(Venue::Okx, MarketType::Perp), "okx_swap");
+    EXPECT_EQ(to_string(VenueId{Venue::Binance, MarketType::Spot}), "binance_spot");
+    EXPECT_EQ(to_string(VenueId{Venue::Binance, MarketType::Perp}), "binance_futures");
+    EXPECT_EQ(to_string(VenueId{Venue::Bybit, MarketType::Spot}), "bybit_spot");
+    EXPECT_EQ(to_string(VenueId{Venue::Bybit, MarketType::Perp}), "bybit_linear");
+    EXPECT_EQ(to_string(VenueId{Venue::Okx, MarketType::Spot}), "okx_spot");
+    EXPECT_EQ(to_string(VenueId{Venue::Okx, MarketType::Perp}), "okx_swap");
+}
+
+// Same rationale as BookIdHash.UsableAsUnorderedSetKey above - proves
+// std::hash<VenueId> makes VenueId usable as a hash-container key at all,
+// which is exactly what AggregateOrderBook's venues_ (std::unordered_map<
+// VenueId, L2OrderBook>) now requires.
+TEST(VenueIdHash, UsableAsUnorderedSetKey) {
+    std::unordered_set<VenueId> seen;
+    EXPECT_TRUE(seen.insert(VenueId{Venue::Binance, MarketType::Spot}).second);
+    EXPECT_TRUE(seen.insert(VenueId{Venue::Binance, MarketType::Perp}).second);
+    EXPECT_TRUE(seen.insert(VenueId{Venue::Okx, MarketType::Spot}).second);
+    EXPECT_FALSE(seen.insert(VenueId{Venue::Binance, MarketType::Spot}).second);
+    EXPECT_EQ(seen.size(), 3u);
 }
 
 TEST(NativeSymbol, BinanceAndBybitAreConcatenatedRegardlessOfType) {

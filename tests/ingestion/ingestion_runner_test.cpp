@@ -20,9 +20,19 @@
 
 #include "bobby/hermeneutic/book/aggregate_order_book.hpp"
 #include "bobby/hermeneutic/exchange/binance/binance_futures_sequence_policy.hpp"
+#include "bobby/hermeneutic/symbol/symbol.hpp"
 
 namespace bobby::hermeneutic::ingestion {
 namespace {
+
+using bobby::hermeneutic::symbol::MarketType;
+using bobby::hermeneutic::symbol::Venue;
+
+// Two arbitrary, distinct VenueIds - this test is about IngestionRunner
+// driving differently-typed VenueSessions uniformly, not about venue/
+// market identity, so any two distinct values would do.
+constexpr bobby::hermeneutic::VenueId kVenueA{Venue::Binance, MarketType::Spot};
+constexpr bobby::hermeneutic::VenueId kVenueB{Venue::Binance, MarketType::Perp};
 
 // A minimal VenueFeed test double: no snapshot/HTTP path at all
 // (kSnapshotViaRest=false), no messages ever parsed. This test is about
@@ -110,10 +120,10 @@ TEST(IngestionRunnerTest, StopAllLetsIoContextFinishWithoutIoStop) {
 
     IngestionRunner runner;
     runner.add<FakeFeedA, BinanceFuturesSequencePolicy, beast::tcp_stream, AggregateOrderBook>(
-        FakeFeedA(std::to_string(port_a)), "venue_a", symbols, SymbolRegistry<AggregateOrderBook>{},
+        FakeFeedA(std::to_string(port_a)), kVenueA, symbols, SymbolRegistry<AggregateOrderBook>{},
         io.get_executor());
     runner.add<FakeFeedB, BinanceFuturesSequencePolicy, beast::tcp_stream, AggregateOrderBook>(
-        FakeFeedB(std::to_string(port_b)), "venue_b", symbols, SymbolRegistry<AggregateOrderBook>{},
+        FakeFeedB(std::to_string(port_b)), kVenueB, symbols, SymbolRegistry<AggregateOrderBook>{},
         io.get_executor());
     runner.start_all();
 

@@ -6,27 +6,39 @@
 #include <system_error>
 #include <utility>
 
+#include "bobby/hermeneutic/symbol/symbol.hpp"
+
 namespace bobby::hermeneutic {
 namespace {
+
+using bobby::hermeneutic::symbol::MarketType;
+using bobby::hermeneutic::symbol::Venue;
+
+// Two arbitrary, distinct VenueIds - these tests only need "two different
+// venues" to exercise per-venue isolation, never the real venue_id()/
+// to_string(VenueId) spelling, so MarketType::Spot on both is an arbitrary
+// (but fixed) choice, not a claim about what market either actually covers.
+constexpr VenueId kBinance{Venue::Binance, MarketType::Spot};
+constexpr VenueId kOkx{Venue::Okx, MarketType::Spot};
 
 TEST(AggregateOrderBook, SingleVenueAddUpdateRemove) {
     AggregateOrderBook book;
 
-    book.apply_delta("binance", Side::Bid, Price(100.0), Size(1.0));
+    book.apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0));
     EXPECT_EQ(book.aggregate().bids.at(Price(100.0)), Size(1.0));
 
-    book.apply_delta("binance", Side::Bid, Price(100.0), Size(2.5));
+    book.apply_delta(kBinance, Side::Bid, Price(100.0), Size(2.5));
     EXPECT_EQ(book.aggregate().bids.at(Price(100.0)), Size(2.5));
 
-    book.apply_delta("binance", Side::Bid, Price(100.0), Size(0.0));
+    book.apply_delta(kBinance, Side::Bid, Price(100.0), Size(0.0));
     EXPECT_EQ(book.aggregate().bids.count(Price(100.0)), 0u);
 }
 
 TEST(AggregateOrderBook, MultipleVenuesAtSamePriceSum) {
     AggregateOrderBook book;
 
-    book.apply_delta("binance", Side::Ask, Price(101.0), Size(1.0));
-    book.apply_delta("okx", Side::Ask, Price(101.0), Size(2.0));
+    book.apply_delta(kBinance, Side::Ask, Price(101.0), Size(1.0));
+    book.apply_delta(kOkx, Side::Ask, Price(101.0), Size(2.0));
 
     EXPECT_EQ(book.aggregate().asks.at(Price(101.0)), Size(3.0));
 }
@@ -34,27 +46,27 @@ TEST(AggregateOrderBook, MultipleVenuesAtSamePriceSum) {
 TEST(AggregateOrderBook, RemovingOneVenueKeepsOthersContribution) {
     AggregateOrderBook book;
 
-    book.apply_delta("binance", Side::Ask, Price(101.0), Size(1.0));
-    book.apply_delta("okx", Side::Ask, Price(101.0), Size(2.0));
+    book.apply_delta(kBinance, Side::Ask, Price(101.0), Size(1.0));
+    book.apply_delta(kOkx, Side::Ask, Price(101.0), Size(2.0));
 
-    book.apply_delta("binance", Side::Ask, Price(101.0), Size(0.0));
+    book.apply_delta(kBinance, Side::Ask, Price(101.0), Size(0.0));
 
     EXPECT_EQ(book.aggregate().asks.at(Price(101.0)), Size(2.0));
 
-    book.apply_delta("okx", Side::Ask, Price(101.0), Size(0.0));
+    book.apply_delta(kOkx, Side::Ask, Price(101.0), Size(0.0));
     EXPECT_EQ(book.aggregate().asks.count(Price(101.0)), 0u);
 }
 
 TEST(AggregateOrderBook, PerVenueBookIsIndependentlyQueryable) {
     AggregateOrderBook book;
 
-    book.apply_delta("binance", Side::Bid, Price(99.0), Size(1.0));
-    book.apply_delta("okx", Side::Bid, Price(99.5), Size(2.0));
+    book.apply_delta(kBinance, Side::Bid, Price(99.0), Size(1.0));
+    book.apply_delta(kOkx, Side::Bid, Price(99.5), Size(2.0));
 
-    ASSERT_EQ(book.venues().count("binance"), 1u);
-    ASSERT_EQ(book.venues().count("okx"), 1u);
-    EXPECT_EQ(book.venues().at("binance").bids.at(Price(99.0)), Size(1.0));
-    EXPECT_EQ(book.venues().at("okx").bids.at(Price(99.5)), Size(2.0));
+    ASSERT_EQ(book.venues().count(kBinance), 1u);
+    ASSERT_EQ(book.venues().count(kOkx), 1u);
+    EXPECT_EQ(book.venues().at(kBinance).bids.at(Price(99.0)), Size(1.0));
+    EXPECT_EQ(book.venues().at(kOkx).bids.at(Price(99.5)), Size(2.0));
 
     // Aggregate keeps the same ordering guarantees as a single L2OrderBook.
     EXPECT_EQ(book.aggregate().bids.begin()->first, Price(99.5));
@@ -63,13 +75,13 @@ TEST(AggregateOrderBook, PerVenueBookIsIndependentlyQueryable) {
 TEST(AggregateOrderBook, AggregateAsksAscendingBidsDescendingAcrossVenues) {
     AggregateOrderBook book;
 
-    book.apply_delta("binance", Side::Ask, Price(101.0), Size(1.0));
-    book.apply_delta("okx", Side::Ask, Price(100.5), Size(1.0));
-    book.apply_delta("binance", Side::Ask, Price(102.0), Size(1.0));
+    book.apply_delta(kBinance, Side::Ask, Price(101.0), Size(1.0));
+    book.apply_delta(kOkx, Side::Ask, Price(100.5), Size(1.0));
+    book.apply_delta(kBinance, Side::Ask, Price(102.0), Size(1.0));
 
-    book.apply_delta("binance", Side::Bid, Price(99.0), Size(1.0));
-    book.apply_delta("okx", Side::Bid, Price(99.5), Size(1.0));
-    book.apply_delta("binance", Side::Bid, Price(98.0), Size(1.0));
+    book.apply_delta(kBinance, Side::Bid, Price(99.0), Size(1.0));
+    book.apply_delta(kOkx, Side::Bid, Price(99.5), Size(1.0));
+    book.apply_delta(kBinance, Side::Bid, Price(98.0), Size(1.0));
 
     auto ask_it = book.aggregate().asks.begin();
     EXPECT_EQ(ask_it->first, Price(100.5));
@@ -89,36 +101,36 @@ TEST(AggregateOrderBook, AggregateAsksAscendingBidsDescendingAcrossVenues) {
 TEST(AggregateOrderBook, InvalidateSoleVenueClearsAggregateLevels) {
     AggregateOrderBook book;
 
-    book.apply_delta("binance", Side::Bid, Price(99.0), Size(1.0));
-    book.apply_delta("binance", Side::Ask, Price(101.0), Size(2.0));
+    book.apply_delta(kBinance, Side::Bid, Price(99.0), Size(1.0));
+    book.apply_delta(kBinance, Side::Ask, Price(101.0), Size(2.0));
 
-    book.invalidate_venue("binance");
+    book.invalidate_venue(kBinance);
 
     EXPECT_TRUE(book.aggregate().bids.empty());
     EXPECT_TRUE(book.aggregate().asks.empty());
-    EXPECT_EQ(book.venues().count("binance"), 0u);
+    EXPECT_EQ(book.venues().count(kBinance), 0u);
 }
 
 TEST(AggregateOrderBook, InvalidateVenueKeepsOtherVenuesContribution) {
     AggregateOrderBook book;
 
-    book.apply_delta("binance", Side::Ask, Price(101.0), Size(1.0));
-    book.apply_delta("okx", Side::Ask, Price(101.0), Size(2.0));
-    book.apply_delta("okx", Side::Ask, Price(102.0), Size(5.0));
+    book.apply_delta(kBinance, Side::Ask, Price(101.0), Size(1.0));
+    book.apply_delta(kOkx, Side::Ask, Price(101.0), Size(2.0));
+    book.apply_delta(kOkx, Side::Ask, Price(102.0), Size(5.0));
 
-    book.invalidate_venue("binance");
+    book.invalidate_venue(kBinance);
 
     EXPECT_EQ(book.aggregate().asks.at(Price(101.0)), Size(2.0));
     EXPECT_EQ(book.aggregate().asks.at(Price(102.0)), Size(5.0));
-    EXPECT_EQ(book.venues().count("binance"), 0u);
-    ASSERT_EQ(book.venues().count("okx"), 1u);
+    EXPECT_EQ(book.venues().count(kBinance), 0u);
+    ASSERT_EQ(book.venues().count(kOkx), 1u);
 }
 
 TEST(AggregateOrderBook, InvalidateUnknownVenueIsNoOp) {
     AggregateOrderBook book;
-    book.apply_delta("okx", Side::Bid, Price(99.0), Size(1.0));
+    book.apply_delta(kOkx, Side::Bid, Price(99.0), Size(1.0));
 
-    book.invalidate_venue("binance");
+    book.invalidate_venue(kBinance);
 
     EXPECT_EQ(book.aggregate().bids.at(Price(99.0)), Size(1.0));
 }
@@ -127,17 +139,17 @@ TEST(AggregateOrderBook, ApplySnapshotReplacesVenueSideWholesale) {
     AggregateOrderBook book;
 
     // Stale state before resync: 100.0 and 101.0 from a diff stream.
-    book.apply_delta("binance", Side::Ask, Price(100.0), Size(1.0));
-    book.apply_delta("binance", Side::Ask, Price(101.0), Size(2.0));
-    book.apply_delta("okx", Side::Ask, Price(100.0), Size(4.0));
+    book.apply_delta(kBinance, Side::Ask, Price(100.0), Size(1.0));
+    book.apply_delta(kBinance, Side::Ask, Price(101.0), Size(2.0));
+    book.apply_delta(kOkx, Side::Ask, Price(100.0), Size(4.0));
 
     // REST snapshot: 100.0 unchanged, 101.0 gone, 102.0 new.
     const std::array snapshot = {std::pair{Price(100.0), Size(1.0)}, std::pair{Price(102.0), Size(3.0)}};
-    book.apply_snapshot("binance", Side::Ask, snapshot);
+    book.apply_snapshot(kBinance, Side::Ask, snapshot);
 
-    EXPECT_EQ(book.venues().at("binance").asks.count(Price(101.0)), 0u);
-    EXPECT_EQ(book.venues().at("binance").asks.at(Price(100.0)), Size(1.0));
-    EXPECT_EQ(book.venues().at("binance").asks.at(Price(102.0)), Size(3.0));
+    EXPECT_EQ(book.venues().at(kBinance).asks.count(Price(101.0)), 0u);
+    EXPECT_EQ(book.venues().at(kBinance).asks.at(Price(100.0)), Size(1.0));
+    EXPECT_EQ(book.venues().at(kBinance).asks.at(Price(102.0)), Size(3.0));
 
     // okx's share at 100.0 must be untouched by binance's resync.
     EXPECT_EQ(book.aggregate().asks.at(Price(100.0)), Size(5.0));
@@ -148,16 +160,16 @@ TEST(AggregateOrderBook, ApplySnapshotReplacesVenueSideWholesale) {
 TEST(AggregateOrderBook, InvalidateThenApplySnapshotResyncsCleanly) {
     AggregateOrderBook book;
 
-    book.apply_delta("binance", Side::Bid, Price(99.0), Size(1.0));
-    book.apply_delta("binance", Side::Bid, Price(98.5), Size(2.0));
+    book.apply_delta(kBinance, Side::Bid, Price(99.0), Size(1.0));
+    book.apply_delta(kBinance, Side::Bid, Price(98.5), Size(2.0));
 
     // Disconnect: drop everything binance had contributed.
-    book.invalidate_venue("binance");
+    book.invalidate_venue(kBinance);
     ASSERT_TRUE(book.aggregate().bids.empty());
 
     // Resync from a fresh REST snapshot.
     const std::array snapshot = {std::pair{Price(99.0), Size(1.5)}, std::pair{Price(97.0), Size(1.0)}};
-    book.apply_snapshot("binance", Side::Bid, snapshot);
+    book.apply_snapshot(kBinance, Side::Bid, snapshot);
 
     EXPECT_EQ(book.aggregate().bids.at(Price(99.0)), Size(1.5));
     EXPECT_EQ(book.aggregate().bids.at(Price(97.0)), Size(1.0));
@@ -166,9 +178,9 @@ TEST(AggregateOrderBook, InvalidateThenApplySnapshotResyncsCleanly) {
 
 TEST(AggregateOrderBook, ApplyDeltaRejectsNegativeSize) {
     AggregateOrderBook book;
-    book.apply_delta("binance", Side::Bid, Price(99.0), Size(1.0));
+    book.apply_delta(kBinance, Side::Bid, Price(99.0), Size(1.0));
 
-    auto result = book.apply_delta("binance", Side::Bid, Price(98.0), Size(-1.0));
+    auto result = book.apply_delta(kBinance, Side::Bid, Price(98.0), Size(-1.0));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), std::errc::invalid_argument);
 
@@ -179,18 +191,18 @@ TEST(AggregateOrderBook, ApplyDeltaRejectsNegativeSize) {
 
 TEST(AggregateOrderBook, ApplySnapshotRejectsNegativeSizeAtomically) {
     AggregateOrderBook book;
-    book.apply_delta("binance", Side::Ask, Price(100.0), Size(1.0));
+    book.apply_delta(kBinance, Side::Ask, Price(100.0), Size(1.0));
 
     const std::array snapshot = {std::pair{Price(100.0), Size(2.0)},
                                   std::pair{Price(101.0), Size(-1.0)}};
-    auto result = book.apply_snapshot("binance", Side::Ask, snapshot);
+    auto result = book.apply_snapshot(kBinance, Side::Ask, snapshot);
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), std::errc::invalid_argument);
 
     // Validation must run before any level is touched.
-    EXPECT_EQ(book.venues().at("binance").asks.at(Price(100.0)), Size(1.0));
+    EXPECT_EQ(book.venues().at(kBinance).asks.at(Price(100.0)), Size(1.0));
     EXPECT_EQ(book.aggregate().asks.at(Price(100.0)), Size(1.0));
-    EXPECT_EQ(book.venues().at("binance").asks.count(Price(101.0)), 0u);
+    EXPECT_EQ(book.venues().at(kBinance).asks.count(Price(101.0)), 0u);
 }
 
 }  // namespace

@@ -23,6 +23,15 @@ namespace {
 using bobby::hermeneutic::symbol::BaseQuote;
 using bobby::hermeneutic::symbol::BookId;
 using bobby::hermeneutic::symbol::MarketType;
+using bobby::hermeneutic::symbol::Venue;
+
+// Two arbitrary, distinct VenueIds - these tests only need "two different
+// venues" to exercise per-venue isolation on the underlying
+// AggregateOrderBook, never the real venue_id()/to_string(VenueId)
+// spelling, so MarketType::Spot on both is an arbitrary (but fixed)
+// choice, not a claim about what market either actually covers.
+constexpr bobby::hermeneutic::VenueId kBinance{Venue::Binance, MarketType::Spot};
+constexpr bobby::hermeneutic::VenueId kOkx{Venue::Okx, MarketType::Spot};
 
 SubscribeL2DiffRequest subscribe_l2_diff_request(const BookId& book_id) {
     SubscribeL2DiffRequest request;
@@ -225,7 +234,7 @@ TEST_F(AggregatorServiceTest, SubscribingToEmptyBookYieldsEmptySnapshot) {
 TEST_F(AggregatorServiceTest, ApplyDeltaAfterSubscribeProducesDiff) {
     updates_.wait_for(0);  // initial snapshot
 
-    auto result = book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0));
+    auto result = book().apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0));
     ASSERT_TRUE(result.has_value());
 
     L2Update msg = updates_.wait_for(1);
@@ -240,13 +249,13 @@ TEST_F(AggregatorServiceTest, ApplyDeltaAfterSubscribeProducesDiff) {
 TEST_F(AggregatorServiceTest, MultipleVenuesAggregateAndPartialRemovalKeepsRemainder) {
     updates_.wait_for(0);  // initial snapshot
 
-    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0)).has_value());
     EXPECT_EQ(updates_.wait_for(1).diff().bids(0).size_raw(), Size(1.0).raw());
 
-    ASSERT_TRUE(book().apply_delta("okx", Side::Bid, Price(100.0), Size(2.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kOkx, Side::Bid, Price(100.0), Size(2.0)).has_value());
     EXPECT_EQ(updates_.wait_for(2).diff().bids(0).size_raw(), Size(3.0).raw());
 
-    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(0.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Bid, Price(100.0), Size(0.0)).has_value());
     L2Update msg = updates_.wait_for(3);
     ASSERT_EQ(msg.diff().bids_size(), 1);
     // okx's remaining size, not a removal (binance's own contribution was
@@ -257,14 +266,14 @@ TEST_F(AggregatorServiceTest, MultipleVenuesAggregateAndPartialRemovalKeepsRemai
 TEST_F(AggregatorServiceTest, InvalidateVenueRemovesOnlyItsExclusiveLevels) {
     updates_.wait_for(0);  // initial snapshot
 
-    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0)).has_value());
     updates_.wait_for(1);
-    ASSERT_TRUE(book().apply_delta("okx", Side::Bid, Price(100.0), Size(2.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kOkx, Side::Bid, Price(100.0), Size(2.0)).has_value());
     updates_.wait_for(2);
-    ASSERT_TRUE(book().apply_delta("binance", Side::Ask, Price(101.0), Size(5.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Ask, Price(101.0), Size(5.0)).has_value());
     updates_.wait_for(3);
 
-    book().invalidate_venue("binance");
+    book().invalidate_venue(kBinance);
     L2Update msg = updates_.wait_for(4);
     ASSERT_TRUE(msg.has_diff());
     EXPECT_EQ(msg.diff().book_seq(), 4u);
@@ -281,11 +290,11 @@ TEST_F(AggregatorServiceTest, ApplySnapshotDiffsAgainstAggregateNotJustThatVenue
     updates_.wait_for(0);  // initial snapshot
 
     // binance holds two bid levels; okx also contributes at 100.
-    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0)).has_value());
     updates_.wait_for(1);
-    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(103.0), Size(2.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Bid, Price(103.0), Size(2.0)).has_value());
     updates_.wait_for(2);
-    ASSERT_TRUE(book().apply_delta("okx", Side::Bid, Price(100.0), Size(5.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kOkx, Side::Bid, Price(100.0), Size(5.0)).has_value());
     updates_.wait_for(3);
 
     // Replace binance's entire bid side: 100 changes size, 103 is dropped
@@ -294,7 +303,7 @@ TEST_F(AggregatorServiceTest, ApplySnapshotDiffsAgainstAggregateNotJustThatVenue
         {Price(100.0), Size(3.0)},
         {Price(102.0), Size(4.0)},
     }};
-    auto result = book().apply_snapshot("binance", Side::Bid, levels);
+    auto result = book().apply_snapshot(kBinance, Side::Bid, levels);
     ASSERT_TRUE(result.has_value());
 
     L2Update msg = updates_.wait_for(4);
@@ -316,9 +325,9 @@ TEST_F(AggregatorServiceTest, ApplySnapshotDiffsAgainstAggregateNotJustThatVenue
 TEST_F(AggregatorServiceTest, ApplySnapshotOnAskSideProducesAscendingDiff) {
     updates_.wait_for(0);  // initial snapshot
 
-    ASSERT_TRUE(book().apply_delta("binance", Side::Ask, Price(101.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Ask, Price(101.0), Size(1.0)).has_value());
     updates_.wait_for(1);
-    ASSERT_TRUE(book().apply_delta("binance", Side::Ask, Price(105.0), Size(2.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Ask, Price(105.0), Size(2.0)).has_value());
     updates_.wait_for(2);
 
     // Replace binance's entire ask side: 101 changes size, 105 is dropped,
@@ -327,7 +336,7 @@ TEST_F(AggregatorServiceTest, ApplySnapshotOnAskSideProducesAscendingDiff) {
         {Price(101.0), Size(4.0)},
         {Price(103.0), Size(3.0)},
     }};
-    ASSERT_TRUE(book().apply_snapshot("binance", Side::Ask, levels).has_value());
+    ASSERT_TRUE(book().apply_snapshot(kBinance, Side::Ask, levels).has_value());
 
     L2Update msg = updates_.wait_for(3);
     ASSERT_TRUE(msg.has_diff());
@@ -345,17 +354,17 @@ TEST_F(AggregatorServiceTest, ApplySnapshotOnAskSideProducesAscendingDiff) {
 TEST_F(AggregatorServiceTest, SnapshotOrderingMatchesBookConvention) {
     updates_.wait_for(0);  // initial (empty) snapshot for the fixture's own subscriber
 
-    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0)).has_value());
     updates_.wait_for(1);
-    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(102.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Bid, Price(102.0), Size(1.0)).has_value());
     updates_.wait_for(2);
-    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(101.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Bid, Price(101.0), Size(1.0)).has_value());
     updates_.wait_for(3);
-    ASSERT_TRUE(book().apply_delta("binance", Side::Ask, Price(105.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Ask, Price(105.0), Size(1.0)).has_value());
     updates_.wait_for(4);
-    ASSERT_TRUE(book().apply_delta("binance", Side::Ask, Price(103.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Ask, Price(103.0), Size(1.0)).has_value());
     updates_.wait_for(5);
-    ASSERT_TRUE(book().apply_delta("binance", Side::Ask, Price(104.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Ask, Price(104.0), Size(1.0)).has_value());
     updates_.wait_for(6);
 
     // A second, independent subscriber joining now must see the book's own
@@ -382,11 +391,11 @@ TEST_F(AggregatorServiceTest, SnapshotOrderingMatchesBookConvention) {
 TEST_F(AggregatorServiceTest, FailedApplyDoesNotBroadcast) {
     updates_.wait_for(0);  // initial snapshot
 
-    auto bad = book().apply_delta("binance", Side::Bid, Price(100.0), Size(-1.0));
+    auto bad = book().apply_delta(kBinance, Side::Bid, Price(100.0), Size(-1.0));
     ASSERT_FALSE(bad.has_value());
     EXPECT_EQ(bad.error(), std::errc::invalid_argument);
 
-    auto good = book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0));
+    auto good = book().apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0));
     ASSERT_TRUE(good.has_value());
 
     // If the failed call had broadcast anything, this would be seq 2 / the
@@ -401,13 +410,13 @@ TEST_F(AggregatorServiceTest, FailedApplyDoesNotBroadcast) {
 TEST_F(AggregatorServiceTest, NoOpApplyDeltaDoesNotBroadcast) {
     updates_.wait_for(0);  // initial snapshot
 
-    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0)).has_value());
     updates_.wait_for(1);
 
     // Re-applying the exact same size changes nothing in the aggregate.
-    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0)).has_value());
 
-    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(2.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Bid, Price(100.0), Size(2.0)).has_value());
 
     // If the no-op call had broadcast anything, this would be seq 3 / the
     // third message overall instead of seq 2 / the second.
@@ -428,7 +437,7 @@ TEST_F(AggregatorServiceTest, HeartbeatIsDeliveredAndDoesNotAdvanceSeq) {
 
     // A real book change right after must still be seq 1 / the third
     // message overall - proof the heartbeat above didn't touch seq_.
-    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0)).has_value());
     L2Update diff_msg = updates_.wait_for(2);
     ASSERT_TRUE(diff_msg.has_diff());
     EXPECT_EQ(diff_msg.diff().book_seq(), 1u);
@@ -444,7 +453,7 @@ TEST_F(AggregatorServiceTest, ApplyBatchProducesOneSeqBumpForMultipleLevels) {
     std::array<std::pair<Price, Size>, 1> asks{{
         {Price(101.0), Size(3.0)},
     }};
-    ASSERT_TRUE(book().apply_batch("binance", bids, asks).has_value());
+    ASSERT_TRUE(book().apply_batch(kBinance, bids, asks).has_value());
 
     // One message, seq 1 - not three separate diffs the way three
     // apply_delta() calls for the same levels would have produced.
@@ -469,7 +478,7 @@ TEST_F(AggregatorServiceTest, ApplyBatchProducesOneSeqBumpForMultipleLevels) {
 TEST_F(AggregatorServiceTest, ApplyBatchAggregatesAcrossVenuesLikeApplyDelta) {
     updates_.wait_for(0);  // initial snapshot
 
-    ASSERT_TRUE(book().apply_delta("okx", Side::Bid, Price(100.0), Size(5.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kOkx, Side::Bid, Price(100.0), Size(5.0)).has_value());
     updates_.wait_for(1);
 
     // binance's batch touches the same price okx already holds, plus a
@@ -478,7 +487,7 @@ TEST_F(AggregatorServiceTest, ApplyBatchAggregatesAcrossVenuesLikeApplyDelta) {
         {Price(100.0), Size(3.0)},
         {Price(99.0), Size(1.0)},
     }};
-    ASSERT_TRUE(book().apply_batch("binance", bids, {}).has_value());
+    ASSERT_TRUE(book().apply_batch(kBinance, bids, {}).has_value());
 
     L2Update msg = updates_.wait_for(2);
     ASSERT_TRUE(msg.has_diff());
@@ -496,13 +505,13 @@ TEST_F(AggregatorServiceTest, ApplyBatchRejectsNegativeSizeWithoutMutatingOrBroa
         {Price(100.0), Size(1.0)},
         {Price(99.0), Size(-1.0)},
     }};
-    auto bad = book().apply_batch("binance", bad_bids, {});
+    auto bad = book().apply_batch(kBinance, bad_bids, {});
     ASSERT_FALSE(bad.has_value());
     EXPECT_EQ(bad.error(), std::errc::invalid_argument);
 
     // Neither level from the rejected batch was applied: a good call right
     // after must be seq 1 / the second message, not seq 2 / the third.
-    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0)).has_value());
     L2Update msg = updates_.wait_for(1);
     ASSERT_TRUE(msg.has_diff());
     EXPECT_EQ(msg.diff().book_seq(), 1u);
@@ -532,7 +541,7 @@ TEST_F(AggregatorServiceTest, StuckSubscriberDoesNotBlockIngestionOrOtherSubscri
     constexpr int kUpdates = 100;
     auto start = std::chrono::steady_clock::now();
     for (int i = 0; i < kUpdates; ++i) {
-        ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(1.0 + i * 0.01), Size(1.0))
+        ASSERT_TRUE(book().apply_delta(kBinance, Side::Bid, Price(1.0 + i * 0.01), Size(1.0))
                         .has_value());
     }
     auto elapsed = std::chrono::steady_clock::now() - start;
@@ -557,9 +566,9 @@ TEST_F(AggregatorServiceTest, SubscribeBboOnEmptyBookHasNeitherSide) {
 TEST_F(AggregatorServiceTest, SubscribeBboYieldsCurrentCompleteState) {
     updates_.wait_for(0);  // initial L2 snapshot
 
-    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0)).has_value());
     updates_.wait_for(1);
-    ASSERT_TRUE(book().apply_delta("binance", Side::Ask, Price(101.0), Size(2.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Ask, Price(101.0), Size(2.0)).has_value());
     updates_.wait_for(2);
 
     // A fresh BBO subscription's first message is the complete current top
@@ -584,7 +593,7 @@ TEST_F(AggregatorServiceTest, DeepBookChangeDoesNotEmitBbo) {
     bbo_sub->updates.wait_for(0);  // initial (empty) Bbo
 
     // Establishes a best bid at 100 - this DOES move the top of book.
-    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0)).has_value());
     updates_.wait_for(1);  // corresponding L2Diff, book_seq=1
     BboUpdate first_bbo = bbo_sub->updates.wait_for(1);
     ASSERT_TRUE(first_bbo.has_bbo());
@@ -594,7 +603,7 @@ TEST_F(AggregatorServiceTest, DeepBookChangeDoesNotEmitBbo) {
     // A worse (deeper) bid level doesn't change the best bid, so this
     // revision (book_seq=2) must produce an L2Diff but no new Bbo at all -
     // Bbo.book_seq is allowed to skip book_seq=2 entirely.
-    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(99.0), Size(5.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Bid, Price(99.0), Size(5.0)).has_value());
     updates_.wait_for(2);  // corresponding L2Diff did arrive on the L2 stream
 
     // A heartbeat proves the absence of a second Bbo message isn't just
@@ -608,7 +617,7 @@ TEST_F(AggregatorServiceTest, DeepBookChangeDoesNotEmitBbo) {
 TEST_F(AggregatorServiceTest, BestPriceSizeChangeEmitsNewBbo) {
     updates_.wait_for(0);  // initial snapshot
 
-    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0)).has_value());
     updates_.wait_for(1);
 
     auto bbo_sub = subscribe_bbo();
@@ -617,7 +626,7 @@ TEST_F(AggregatorServiceTest, BestPriceSizeChangeEmitsNewBbo) {
 
     // Same best price, different size (a second venue joins at the same
     // level) - still a top-of-book change, not just a deep-book one.
-    ASSERT_TRUE(book().apply_delta("okx", Side::Bid, Price(100.0), Size(2.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kOkx, Side::Bid, Price(100.0), Size(2.0)).has_value());
     updates_.wait_for(2);
     BboUpdate second = bbo_sub->updates.wait_for(1);
     ASSERT_TRUE(second.has_bbo());
@@ -627,7 +636,7 @@ TEST_F(AggregatorServiceTest, BestPriceSizeChangeEmitsNewBbo) {
 TEST_F(AggregatorServiceTest, BestSideDisappearingIsReportedAsAbsent) {
     updates_.wait_for(0);  // initial snapshot
 
-    ASSERT_TRUE(book().apply_delta("binance", Side::Ask, Price(101.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Ask, Price(101.0), Size(1.0)).has_value());
     updates_.wait_for(1);
 
     auto bbo_sub = subscribe_bbo();
@@ -637,7 +646,7 @@ TEST_F(AggregatorServiceTest, BestSideDisappearingIsReportedAsAbsent) {
     // Zeroing out the only ask level removes it entirely - the resulting
     // Bbo must represent "no ask" via message-field absence, not a sentinel
     // price or a zero size.
-    ASSERT_TRUE(book().apply_delta("binance", Side::Ask, Price(101.0), Size(0.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Ask, Price(101.0), Size(0.0)).has_value());
     updates_.wait_for(2);
     BboUpdate second = bbo_sub->updates.wait_for(1);
     ASSERT_TRUE(second.has_bbo());
@@ -650,17 +659,17 @@ TEST_F(AggregatorServiceTest, BboBookSeqCorrelatesWithL2DiffBookSeqAndSkipsNonTo
     auto bbo_sub = subscribe_bbo();
     bbo_sub->updates.wait_for(0);  // initial (empty) Bbo
 
-    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(100.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0)).has_value());
     updates_.wait_for(1);  // book_seq=1, top-of-book change
     bbo_sub->updates.wait_for(1);
 
     // book_seq=2: a deeper bid, doesn't touch the top on either side.
-    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(90.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Bid, Price(90.0), Size(1.0)).has_value());
     L2Update deep_diff = updates_.wait_for(2);
     EXPECT_EQ(deep_diff.diff().book_seq(), 2u);
 
     // book_seq=3: a new best bid.
-    ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(101.0), Size(1.0)).has_value());
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Bid, Price(101.0), Size(1.0)).has_value());
     L2Update top_diff = updates_.wait_for(3);
     EXPECT_EQ(top_diff.diff().book_seq(), 3u);
 
@@ -690,7 +699,7 @@ TEST_F(AggregatorServiceTest, StuckBboSubscriberDoesNotBlockIngestionOrOtherSubs
     constexpr int kUpdates = 100;
     auto start = std::chrono::steady_clock::now();
     for (int i = 0; i < kUpdates; ++i) {
-        ASSERT_TRUE(book().apply_delta("binance", Side::Bid, Price(1.0 + i * 0.01), Size(1.0))
+        ASSERT_TRUE(book().apply_delta(kBinance, Side::Bid, Price(1.0 + i * 0.01), Size(1.0))
                         .has_value());
     }
     auto elapsed = std::chrono::steady_clock::now() - start;
@@ -758,14 +767,14 @@ TEST_F(MultiSymbolAggregatorServiceTest, SymbolsAreFullyIsolated) {
     // interface a real ingestion dispatch layer would use to reach the
     // right SymbolBook directly.
     ASSERT_TRUE(service_->book(BtcBook())
-                    ->apply_delta("binance", Side::Bid, Price(100.0), Size(1.0))
+                    ->apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0))
                     .has_value());
     L2Update btc_diff = btc_updates.wait_for(1);
     ASSERT_TRUE(btc_diff.has_diff());
     EXPECT_EQ(btc_diff.diff().book_seq(), 1u);
 
     ASSERT_TRUE(service_->book(EthBook())
-                    ->apply_delta("binance", Side::Ask, Price(2000.0), Size(3.0))
+                    ->apply_delta(kBinance, Side::Ask, Price(2000.0), Size(3.0))
                     .has_value());
     L2Update eth_diff = eth_updates.wait_for(1);
     ASSERT_TRUE(eth_diff.has_diff());

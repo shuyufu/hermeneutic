@@ -39,6 +39,12 @@ using bobby::hermeneutic::aggregator::SymbolBook;
 using bobby::hermeneutic::symbol::BaseQuote;
 using bobby::hermeneutic::symbol::BookId;
 using bobby::hermeneutic::symbol::MarketType;
+using bobby::hermeneutic::symbol::Venue;
+
+// An arbitrary VenueId - these tests exercise VenueSession's own behavior
+// (start/stop/resync/gap-handling), never AggregateOrderBook's per-venue
+// isolation, so which real venue/market this names doesn't matter.
+constexpr bobby::hermeneutic::VenueId kFakeVenue{Venue::Binance, MarketType::Spot};
 
 // The one book every AggregatorService in this file is constructed with -
 // these tests are about VenueSession's own mechanics (backoff/stop/snapshot
@@ -296,7 +302,7 @@ TEST(VenueSessionTest, SnapshotFetchOverlapsReadingSoBufferedLiveEventBridgesIt)
     SymbolRegistry<SymbolBook> registry;
     registry.add("BTCUSDT", service.book(TestBookId()));
     VenueSession<FakeFeed, BinanceFuturesSequencePolicy, beast::tcp_stream, SymbolBook> session(
-        std::move(feed), "fake_venue", symbols, std::move(registry), io.get_executor());
+        std::move(feed), kFakeVenue, symbols, std::move(registry), io.get_executor());
     session.start(fail_test_on_exception("session"));
 
     io.run_for(std::chrono::seconds(2));
@@ -345,7 +351,7 @@ TEST(VenueSessionTest, StopAbortsBackoffWaitAndDoesNotReconnect) {
     SymbolRegistry<SymbolBook> registry;
     registry.add("BTCUSDT", service.book(TestBookId()));
     VenueSession<FakeFeed, BinanceFuturesSequencePolicy, beast::tcp_stream, SymbolBook> session(
-        std::move(feed), "fake_venue", symbols, std::move(registry), io.get_executor());
+        std::move(feed), kFakeVenue, symbols, std::move(registry), io.get_executor());
 
     std::mutex mutex;
     std::condition_variable cv;
@@ -415,7 +421,7 @@ TEST(VenueSessionTest, StopDrainsInFlightSnapshotFetch) {
     SymbolRegistry<SymbolBook> registry;
     registry.add("BTCUSDT", service.book(TestBookId()));
     VenueSession<FakeFeed, BinanceFuturesSequencePolicy, beast::tcp_stream, SymbolBook> session(
-        std::move(feed), "fake_venue", symbols, std::move(registry), io.get_executor());
+        std::move(feed), kFakeVenue, symbols, std::move(registry), io.get_executor());
 
     std::mutex mutex;
     std::condition_variable cv;
@@ -485,7 +491,7 @@ TEST(VenueSessionTest, StopWhileConnectedAndReadingReturnsCleanly) {
     SymbolRegistry<SymbolBook> registry;
     registry.add("BTCUSDT", service.book(TestBookId()));
     VenueSession<FakeFeed, BinanceFuturesSequencePolicy, beast::tcp_stream, SymbolBook> session(
-        std::move(feed), "fake_venue", symbols, std::move(registry), io.get_executor());
+        std::move(feed), kFakeVenue, symbols, std::move(registry), io.get_executor());
 
     std::mutex mutex;
     std::condition_variable cv;
@@ -543,7 +549,7 @@ TEST(VenueSessionTest, StopBeforeStartPreventsConnecting) {
     SymbolRegistry<SymbolBook> registry;
     registry.add("BTCUSDT", service.book(TestBookId()));
     VenueSession<FakeFeed, BinanceFuturesSequencePolicy, beast::tcp_stream, SymbolBook> session(
-        std::move(feed), "fake_venue", symbols, std::move(registry), io.get_executor());
+        std::move(feed), kFakeVenue, symbols, std::move(registry), io.get_executor());
 
     session.stop();  // before start() - this is what's under test
 

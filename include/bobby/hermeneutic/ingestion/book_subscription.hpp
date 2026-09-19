@@ -15,16 +15,21 @@ namespace bobby::hermeneutic::ingestion {
 using bobby::hermeneutic::symbol::BookId;
 using bobby::hermeneutic::symbol::MarketType;
 using bobby::hermeneutic::symbol::Venue;
+using bobby::hermeneutic::symbol::VenueId;
 
 // One venue's contribution to one book: everything apps/aggregator/server_main.cpp
 // needs to add this (venue, symbol, type) triple to the right
-// SymbolRegistry and, grouped by (venue, type), to IngestionRunner. This is
+// SymbolRegistry and, grouped by venue_id, to IngestionRunner. This is
 // a parsing *result*, not part of the symbol domain model itself (see
 // bobby/hermeneutic/symbol/symbol.hpp) - it exists because this ingestion
 // config, specifically, resolves a venue list into concrete subscriptions.
+//
+// `venue_id` (not separate `Venue venue; MarketType type;` fields): the
+// pairing IS what VenueId exists to own - see symbol.hpp's own comment -
+// so spelling it out as two fields here would just be a second,
+// independent place for the exact same pairing to drift out of sync.
 struct VenueSubscription {
-    Venue venue;
-    MarketType type;
+    VenueId venue_id;
     BookId book_id;              // AggregatorService::book()'s key
     std::string native_symbol;   // e.g. "BTC-USDT-SWAP" - what this venue's Feed subscribes with
 };
@@ -126,7 +131,7 @@ inline std::expected<std::vector<VenueSubscription>, std::string> parse_book_sub
 
                 any_venue = true;
                 result.push_back(VenueSubscription{
-                    *venue, type, id, bobby::hermeneutic::symbol::native_symbol(*venue, *symbol, type)});
+                    VenueId{*venue, type}, id, bobby::hermeneutic::symbol::native_symbol(*venue, *symbol, type)});
             }
 
             if (!any_venue) {

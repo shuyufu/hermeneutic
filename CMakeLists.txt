@@ -5,9 +5,10 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Target layout mirrors include/bobby/hermeneutic/<tier>/ and tracks the
-# actual dependency graph, not just the directory names: core/book/
+# actual dependency graph, not just the directory names: core/symbol/book/
 # exchange_policy are always available (zero third-party dependency beyond
-# each other); exchange (real Feed parsers) needs simdjson
+# each other - book links symbol for VenueId, symbol itself stays
+# std-library-only); exchange (real Feed parsers) needs simdjson
 # (HERMENEUTIC_BUILD_INGESTION); net/service/ingestion need gRPC/Boost/
 # OpenSSL (HERMENEUTIC_BUILD_SERVICE). Every target is an INTERFACE library
 # (this project is header-only outside the generated proto/gRPC code and
@@ -20,20 +21,26 @@ add_library(hermeneutic_core INTERFACE)
 target_include_directories(hermeneutic_core INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 add_library(hermeneutic::core ALIAS hermeneutic_core)
 
-add_library(hermeneutic_book INTERFACE)
-target_link_libraries(hermeneutic_book INTERFACE hermeneutic::core)
-add_library(hermeneutic::book ALIAS hermeneutic_book)
-
 # This project's own symbol/venue naming rules (BASE_QUOTE splitting, book
 # keys, per-venue native symbol formats - see symbol.hpp's own class
 # comment): zero dependency beyond the standard library, so any future
 # consumer beyond apps/aggregator/server_main.cpp's ingestion config - a client
 # config, a REST surface - can depend on this alone. Links hermeneutic::core
 # purely for the include/ root, the same as hermeneutic_net does below -
-# not a real dependency on anything core actually defines.
+# not a real dependency on anything core actually defines. Declared before
+# hermeneutic_book below (which links this) rather than after.
 add_library(hermeneutic_symbol INTERFACE)
 target_link_libraries(hermeneutic_symbol INTERFACE hermeneutic::core)
 add_library(hermeneutic::symbol ALIAS hermeneutic_symbol)
+
+# Links hermeneutic::symbol for aggregate_order_book.hpp's VenueId, which
+# is symbol::VenueId (see that header's own comment) rather than a
+# hand-spelled std::string - still zero *real* new dependency added on top
+# of symbol's own (symbol.hpp is itself header-only, zero dependency beyond
+# the standard library).
+add_library(hermeneutic_book INTERFACE)
+target_link_libraries(hermeneutic_book INTERFACE hermeneutic::core hermeneutic::symbol)
+add_library(hermeneutic::book ALIAS hermeneutic_book)
 
 # The per-venue *SequencePolicy structs (exchange/<venue>/*_sequence_policy.hpp)
 # are deliberately split out from their venue's Feed header: a Policy only

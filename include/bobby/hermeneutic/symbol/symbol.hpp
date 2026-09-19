@@ -32,8 +32,8 @@ enum class MarketType { Spot, Perp };
 // venue list against it, e.g. bobby::hermeneutic::ingestion's subscription
 // config) stays usable - and unit-testable - without linking simdjson or
 // gRPC at all. Adding a venue means adding a case to native_symbol()/
-// venue_id()/parse_venue() below, and separately wiring its Feed/Policy
-// into apps/aggregator/server_main.cpp's own dispatch.
+// to_string(VenueId)/parse_venue() below, and separately wiring its
+// Feed/Policy into apps/aggregator/server_main.cpp's own dispatch.
 enum class Venue { Binance, Bybit, Okx };
 
 inline std::optional<Venue> parse_venue(std::string_view token) {
@@ -157,19 +157,39 @@ inline std::optional<BookId> parse_book_id(std::string_view token) {
     return BookId{*symbol, type};
 }
 
-// The VenueId string a wired-up VenueSession is tagged with - venue-native
-// vocabulary ("futures"/"linear"/"swap", each exchange's own term for its
-// derivatives market), not the venue-neutral "SPOT"/"PERP" BookId uses.
-// Deliberately not unified with BookId's vocabulary: a log line or
-// SymbolBook::apply_batch's per-VenueId bookkeeping should still read the
-// way each exchange's own docs do, and BookId only gets to stay
-// venue-agnostic because it doesn't have to pick one exchange's term as
-// "the" answer.
-inline std::string venue_id(Venue venue, MarketType type) {
-    switch (venue) {
-        case Venue::Binance: return type == MarketType::Spot ? "binance_spot" : "binance_futures";
-        case Venue::Bybit: return type == MarketType::Spot ? "bybit_spot" : "bybit_linear";
-        case Venue::Okx: return type == MarketType::Spot ? "okx_spot" : "okx_swap";
+// A venue's identity as a structured value - which VenueSession/
+// AggregateOrderBook actually key their per-venue bookkeeping by (see
+// aggregate_order_book.hpp's apply_delta()/apply_snapshot()/apply_batch()/
+// invalidate_venue()). Replaces a hand-spelled std::string that used to be
+// the map key directly: nothing stopped that string from drifting out of
+// sync with the real (Venue, MarketType) pair it was supposed to represent
+// (a typo, or a second caller inventing its own spelling), the same
+// "identity in the type system, not a string convention" reasoning that
+// replaced book_key() with BookId above.
+//
+// Equality/hash only, not ordered (same rationale as BookId's own comment).
+struct VenueId {
+    Venue venue;
+    MarketType type;
+
+    bool operator==(const VenueId&) const = default;
+};
+
+// The human-readable form of a VenueId - venue-native vocabulary
+// ("futures"/"linear"/"swap", each exchange's own term for its derivatives
+// market), not the venue-neutral "SPOT"/"PERP" BookId's own to_string()
+// uses. Deliberately not unified with BookId's vocabulary: a log line or
+// AggregateOrderBook's per-venue bookkeeping (when dumped for debugging)
+// should still read the way each exchange's own docs do, and BookId only
+// gets to stay venue-agnostic because it doesn't have to pick one
+// exchange's term as "the" answer. For display only, same as
+// to_string(BookId) above - nothing parses this back into a VenueId, and
+// nothing needs to: nothing constructs a VenueId from a string any more.
+inline std::string to_string(const VenueId& id) {
+    switch (id.venue) {
+        case Venue::Binance: return id.type == MarketType::Spot ? "binance_spot" : "binance_futures";
+        case Venue::Bybit: return id.type == MarketType::Spot ? "bybit_spot" : "bybit_linear";
+        case Venue::Okx: return id.type == MarketType::Spot ? "okx_spot" : "okx_swap";
     }
     return "";  // unreachable - silences -Wreturn-type on an exhaustive switch
 }
@@ -213,6 +233,19 @@ struct std::hash<bobby::hermeneutic::symbol::BookId> {
         };
         combine(std::hash<std::string>{}(id.symbol.quote.code));
         combine(std::hash<int>{}(static_cast<int>(id.type)));
+        return seed;
+    }
+};
+
+// Specialized so VenueId can be an std::unordered_map key directly
+// (AggregateOrderBook's per-venue book map) without every call site
+// supplying its own hasher - same reasoning as std::hash<BookId> above,
+// just combining two enums instead of two strings + an enum.
+template <>
+struct std::hash<bobby::hermeneutic::symbol::VenueId> {
+    std::size_t operator()(const bobby::hermeneutic::symbol::VenueId& id) const noexcept {
+        std::size_t seed = std::hash<int>{}(static_cast<int>(id.venue));
+        seed ^= std::hash<int>{}(static_cast<int>(id.type)) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
         return seed;
     }
 };

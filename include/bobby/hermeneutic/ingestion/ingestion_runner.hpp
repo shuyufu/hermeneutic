@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "bobby/hermeneutic/ingestion/venue_session.hpp"
+#include "bobby/hermeneutic/symbol/symbol.hpp"
 
 namespace bobby::hermeneutic::ingestion {
 
@@ -46,8 +47,11 @@ class VenueSessionAdapter : public IVenueSession {
         // or - the expected path - once stop() has finished draining it.
         // Either way there's nothing generic left to do beyond logging
         // which venue this was; that's the one thing this adapter adds
-        // over calling VenueSession::start() directly.
-        session_.start([venue = session_.venue()](std::exception_ptr e) {
+        // over calling VenueSession::start() directly. Formatted to a
+        // string once here, at capture time, rather than capturing the
+        // VenueId itself and formatting on every call - log_exception()
+        // only ever wants a display string, never the structured value.
+        session_.start([venue = bobby::hermeneutic::symbol::to_string(session_.venue())](std::exception_ptr e) {
             log_exception(venue, "ingestion session ended", e);
         });
     }

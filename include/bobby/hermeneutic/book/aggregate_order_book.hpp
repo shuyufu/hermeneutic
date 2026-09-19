@@ -4,15 +4,19 @@
 #include <map>
 #include <new>
 #include <span>
-#include <string>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 
 #include "bobby/hermeneutic/book/l2_order_book.hpp"
+#include "bobby/hermeneutic/symbol/symbol.hpp"
 
 namespace bobby::hermeneutic {
 
-using VenueId = std::string;
+// A venue's identity, keyed by (Venue, MarketType) - see symbol.hpp's own
+// comment on why this is a structured type, not a hand-spelled string, and
+// std::hash<VenueId> there for why venues_ below can be unordered_map.
+using VenueId = bobby::hermeneutic::symbol::VenueId;
 
 enum class Side { Bid, Ask };
 
@@ -117,7 +121,7 @@ class AggregateOrderBook {
     }
 
     const L2OrderBook& aggregate() const noexcept { return aggregate_; }
-    const std::map<VenueId, L2OrderBook>& venues() const noexcept { return venues_; }
+    const std::unordered_map<VenueId, L2OrderBook>& venues() const noexcept { return venues_; }
 
   private:
     static std::expected<void, std::errc> require_non_negative_size(Size size) noexcept {
@@ -187,7 +191,7 @@ class AggregateOrderBook {
         }
     }
 
-    std::map<VenueId, L2OrderBook> venues_;
+    std::unordered_map<VenueId, L2OrderBook> venues_;
     L2OrderBook aggregate_;
 };
 
