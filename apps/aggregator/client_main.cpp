@@ -28,6 +28,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <iomanip>
@@ -89,24 +90,35 @@ constexpr std::array<Notional, 5> kVolumeBandThresholds = {
 constexpr std::array<int, 5> kPriceBandBps = {50, 100, 200, 500, 1000};
 constexpr std::array<const char*, 5> kPriceBandLabels = {"50bps", "100bps", "200bps", "500bps", "1000bps+"};
 
-std::string format_level(const PriceLevel& level) {
-    std::ostringstream out;
-    out << (level.price_raw() / 1e9) << "@" << (level.size_raw() / 1e6);
-    return out.str();
-}
-
 // BasicFixedPoint's own operator<< streams to_double() through the
 // ostream's ambient (default) precision, which is only 6 significant
 // digits - fine for a Price/Size around 80000.5, but a Notional in this
 // tool's own 1M-50M+ band range overflows that into scientific notation
 // ("1.23457e+07"), defeating the readability these two publisher modes
-// exist for. Used for every fixed-point value volume-bands/price-bands
-// print, not just Notional, so a VWAP/size prints with the same fixed,
-// two-decimal style rather than mixing formatting conventions.
+// exist for. Precision is FixedPoint::decimals (Price/Notional=9,
+// Size=6) rather than a fixed "2" - that's the exact number of decimal
+// digits the type's raw scale actually stores, so it prints losslessly
+// for a small value (e.g. a sub-cent VWAP) instead of a fixed "2"
+// truncating it to "0.00", while std::fixed still keeps a large Notional
+// out of scientific notation. Used for every fixed-point value
+// volume-bands/price-bands print, not just Notional, so a VWAP/size
+// prints with the same style rather than mixing formatting conventions.
 template <typename FixedPoint>
 std::string format_fixed(FixedPoint value) {
     std::ostringstream out;
-    out << std::fixed << std::setprecision(2) << value.to_double();
+    out << std::fixed << std::setprecision(FixedPoint::decimals) << value.to_double();
+    return out.str();
+}
+
+// Raw wire values reconstructed into their real fixed-point types before
+// formatting (rather than the raw int64 divided by a literal 1e9/1e6 and
+// streamed at ostream's default precision) so this shares format_fixed()'s
+// fix for the same scientific-notation risk - this is the bbo mode's own
+// price/size display and every mode's DONE line, not just volume-bands/
+// price-bands.
+std::string format_level(const PriceLevel& level) {
+    std::ostringstream out;
+    out << format_fixed(Price::from_raw(level.price_raw())) << "@" << format_fixed(Size::from_raw(level.size_raw()));
     return out.str();
 }
 
@@ -119,8 +131,17 @@ std::string format_fixed(FixedPoint value) {
 // the lock covers the entire write.
 void print_line(const std::string& line) {
     static std::mutex out_mutex;
-    std::lock_guard lock(out_mutex);
-    std::cout << line << std::endl;
+    {
+        std::lock_guard lock(out_mutex);
+        std::cout << line << '\n';
+    }
+    // Flushed outside the lock: the write above (the part that must not
+    // interleave with another thread's line) is already complete once the
+    // lock is released, so the flush syscall's cost no longer serializes
+    // across every symbol thread - only actual writes to std::cout do,
+    // which the standard library's own stream synchronization still
+    // protects against corruption.
+    std::cout.flush();
 }
 
 // One band's worth of `label=value`. `bands` is expected to line up
@@ -170,22 +191,66 @@ void apply_levels(Map& side, const Levels& levels) {
     }
 }
 
-// Cancels `context` once `stop` flips (the caller-supplied duration
-// elapsed - see main()'s `stop` watcher) or once `done` flips (this call's
-// own read loop is finished on its own - see publish_bbo()/
-// publish_l2_bands()). `done` matters even for duration_seconds <= 0 ("run
-// until interrupted or the server ends the stream"): without it, this
-// thread would only ever watch the shared, process-wide `stop`, which
-// nothing sets in that mode - so a read loop that exits early for a
-// reason local to this one call (a book_seq gap; the stream ending on its
-// own) would leave this thread sleeping forever, and the caller's
-// `canceller.join()` right after would hang the whole process.
-std::thread make_canceller(grpc::ClientContext& context, std::atomic<bool>* stop, std::atomic<bool>* done) {
-    return std::thread([&context, stop, done] {
-        while (!*stop && !*done) std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        context.TryCancel();
-    });
+// Shared by every StreamCanceller and by main()'s `stop` watcher below:
+// one mutex/condition_variable pair the whole process waits on and
+// notifies through, rather than each canceller thread polling on a timer
+// (the old behavior cost every stream teardown up to 200ms of needless
+// wait). Contention is a non-issue - each thread touches this only once
+// to wait and once (from the other side) to notify.
+std::mutex& cancel_mutex() {
+    static std::mutex m;
+    return m;
 }
+std::condition_variable& cancel_cv() {
+    static std::condition_variable cv;
+    return cv;
+}
+
+// RAII owner of the background thread that cancels `context` if the
+// caller-supplied duration elapses (`*stop` flips - see main()) while
+// this call's read loop is still running. Construct it, run the read
+// loop, then let it go out of scope (or destroy it explicitly) as soon as
+// the read loop ends *for any reason* - a clean/natural stream
+// completion, a book_seq gap triggering an early `break`, or the `stop`
+// deadline itself - before calling `reader->Finish()`.
+//
+// Deliberately does NOT call TryCancel() just because the read loop
+// ended: if it ended on its own (not because `stop` fired), the stream is
+// already over and there is nothing to cancel - calling TryCancel()
+// anyway would race with the client library's own handling of that
+// already-finished call, and risks Finish() misreporting a real OK
+// completion as CANCELLED. Only `*stop` becoming true is a reason to
+// cancel.
+class StreamCanceller {
+  public:
+    StreamCanceller(grpc::ClientContext& context, std::atomic<bool>* stop)
+        : stop_(stop), thread_([this, &context] { run(context); }) {}
+
+    ~StreamCanceller() {
+        {
+            std::lock_guard<std::mutex> lock(cancel_mutex());
+            read_loop_done_ = true;
+        }
+        cancel_cv().notify_all();
+        thread_.join();
+    }
+
+    StreamCanceller(const StreamCanceller&) = delete;
+    StreamCanceller& operator=(const StreamCanceller&) = delete;
+
+  private:
+    void run(grpc::ClientContext& context) {
+        std::unique_lock<std::mutex> lock(cancel_mutex());
+        cancel_cv().wait(lock, [this] { return stop_->load() || read_loop_done_; });
+        bool should_cancel = stop_->load();
+        lock.unlock();
+        if (should_cancel) context.TryCancel();
+    }
+
+    std::atomic<bool>* stop_;
+    bool read_loop_done_ = false;
+    std::thread thread_;
+};
 
 void publish_bbo(const std::string& address, const BookId& book_id, std::atomic<bool>* stop) {
     std::string label = to_string(book_id);
@@ -196,27 +261,27 @@ void publish_bbo(const std::string& address, const BookId& book_id, std::atomic<
     SubscribeBboRequest request;
     fill_wire_book_id(request.mutable_book(), book_id);
     auto reader = stub->SubscribeBbo(&context, request);
-    std::atomic<bool> done{false};
-    std::thread canceller = make_canceller(context, stop, &done);
 
     BboUpdate update;
     long bbo_count = 0, heartbeat_count = 0;
     std::string last_line;
-    while (reader->Read(&update)) {
-        if (update.has_bbo()) {
-            ++bbo_count;
-            const auto& bbo = update.bbo();
-            std::ostringstream line;
-            line << "book_seq=" << bbo.book_seq() << " bid=" << (bbo.has_bid() ? format_level(bbo.bid()) : "(none)")
-                 << " ask=" << (bbo.has_ask() ? format_level(bbo.ask()) : "(none)");
-            last_line = line.str();
-            print_line("[" + label + " BBO] " + last_line);
-        } else if (update.has_heartbeat()) {
-            ++heartbeat_count;
+    {
+        StreamCanceller canceller(context, stop);
+        while (reader->Read(&update)) {
+            if (update.has_bbo()) {
+                ++bbo_count;
+                const auto& bbo = update.bbo();
+                std::ostringstream line;
+                line << "book_seq=" << bbo.book_seq()
+                     << " bid=" << (bbo.has_bid() ? format_level(bbo.bid()) : "(none)")
+                     << " ask=" << (bbo.has_ask() ? format_level(bbo.ask()) : "(none)");
+                last_line = line.str();
+                print_line("[" + label + " BBO] " + last_line);
+            } else if (update.has_heartbeat()) {
+                ++heartbeat_count;
+            }
         }
-    }
-    done = true;
-    canceller.join();
+    }  // canceller destroyed here: joins its thread before Finish() below.
     auto status = reader->Finish();
     std::ostringstream done_line;
     done_line << "[" << label << " BBO] DONE bbo_count=" << bbo_count << " heartbeat_count=" << heartbeat_count
@@ -237,8 +302,6 @@ void publish_l2_bands(Mode mode, const std::string& address, const BookId& book_
     SubscribeL2DiffRequest request;
     fill_wire_book_id(request.mutable_book(), book_id);
     auto reader = stub->SubscribeL2Diff(&context, request);
-    std::atomic<bool> done{false};
-    std::thread canceller = make_canceller(context, stop, &done);
 
     const char* mode_tag = mode == Mode::VolumeBands ? "VOLUME_BANDS" : "PRICE_BANDS";
     L2OrderBook book;
@@ -264,47 +327,48 @@ void publish_l2_bands(Mode mode, const std::string& address, const BookId& book_
     long snapshot_count = 0, diff_count = 0, heartbeat_count = 0, gap_count = 0;
     std::optional<std::uint64_t> last_seq;
     std::string last_line;
-    while (reader->Read(&update)) {
-        if (update.has_snapshot()) {
-            ++snapshot_count;
-            const auto& snapshot = update.snapshot();
-            book.bids.clear();
-            book.asks.clear();
-            apply_levels(book.bids, snapshot.bids());
-            apply_levels(book.asks, snapshot.asks());
-            last_seq = snapshot.book_seq();
-            last_line = print_bands(snapshot.book_seq());
-        } else if (update.has_diff()) {
-            ++diff_count;
-            const auto& diff = update.diff();
-            // book_seq is contiguous by contract on this stream (unlike
-            // Bbo's) - see aggregator.proto's L2Diff.book_seq comment. A
-            // gap means a revision was missed, and per that same comment
-            // the locally reconstructed book is no longer valid - so this
-            // stops applying/publishing immediately rather than computing
-            // bands off a book that's silently wrong from here on. This
-            // tool doesn't resubscribe to recover (that needs a whole new
-            // RPC, not just a fresh snapshot on this one) - a GAP line is
-            // the operator's signal to restart it.
-            if (last_seq && diff.book_seq() != *last_seq + 1) {
-                ++gap_count;
-                std::ostringstream gap_line;
-                gap_line << "[" << label << " " << mode_tag << "] GAP: expected book_seq="
-                          << (*last_seq + 1) << " got " << diff.book_seq()
-                          << " - local book invalid, stopping this stream";
-                print_line(gap_line.str());
-                break;
+    {
+        StreamCanceller canceller(context, stop);
+        while (reader->Read(&update)) {
+            if (update.has_snapshot()) {
+                ++snapshot_count;
+                const auto& snapshot = update.snapshot();
+                book.bids.clear();
+                book.asks.clear();
+                apply_levels(book.bids, snapshot.bids());
+                apply_levels(book.asks, snapshot.asks());
+                last_seq = snapshot.book_seq();
+                last_line = print_bands(snapshot.book_seq());
+            } else if (update.has_diff()) {
+                ++diff_count;
+                const auto& diff = update.diff();
+                // book_seq is contiguous by contract on this stream (unlike
+                // Bbo's) - see aggregator.proto's L2Diff.book_seq comment. A
+                // gap means a revision was missed, and per that same comment
+                // the locally reconstructed book is no longer valid - so this
+                // stops applying/publishing immediately rather than computing
+                // bands off a book that's silently wrong from here on. This
+                // tool doesn't resubscribe to recover (that needs a whole new
+                // RPC, not just a fresh snapshot on this one) - a GAP line is
+                // the operator's signal to restart it.
+                if (last_seq && diff.book_seq() != *last_seq + 1) {
+                    ++gap_count;
+                    std::ostringstream gap_line;
+                    gap_line << "[" << label << " " << mode_tag << "] GAP: expected book_seq="
+                              << (*last_seq + 1) << " got " << diff.book_seq()
+                              << " - local book invalid, stopping this stream";
+                    print_line(gap_line.str());
+                    break;
+                }
+                last_seq = diff.book_seq();
+                apply_levels(book.bids, diff.bids());
+                apply_levels(book.asks, diff.asks());
+                last_line = print_bands(diff.book_seq());
+            } else if (update.has_heartbeat()) {
+                ++heartbeat_count;
             }
-            last_seq = diff.book_seq();
-            apply_levels(book.bids, diff.bids());
-            apply_levels(book.asks, diff.asks());
-            last_line = print_bands(diff.book_seq());
-        } else if (update.has_heartbeat()) {
-            ++heartbeat_count;
         }
-    }
-    done = true;
-    canceller.join();
+    }  // canceller destroyed here: joins its thread before Finish() below.
     auto status = reader->Finish();
     std::ostringstream done_line;
     done_line << "[" << label << " " << mode_tag << "] DONE snapshot_count=" << snapshot_count
@@ -335,11 +399,28 @@ int main(int argc, char** argv) {
     }
     std::string address = argv[1];
     std::string mode_str = argv[2];
+    std::string duration_str = argv[3];
     int duration_s;
     try {
-        duration_s = std::stoi(argv[3]);
-    } catch (const std::exception&) {
-        std::cerr << "invalid duration_seconds \"" << argv[3] << "\" (expected an integer)\n";
+        std::size_t consumed = 0;
+        duration_s = std::stoi(duration_str, &consumed);
+        // std::stoi is a partial parse by design (stops at the first
+        // non-digit and returns what it has, e.g. "10abc" -> 10, "5.5" ->
+        // 5, "3,600" -> 3) rather than rejecting trailing garbage - so
+        // the try/catch below alone doesn't actually validate the whole
+        // argument. `consumed` short of the full string length is that
+        // trailing-garbage case.
+        if (consumed != duration_str.size()) {
+            std::cerr << "invalid duration_seconds \"" << duration_str << "\" (trailing characters after the integer)\n";
+            print_usage();
+            return 1;
+        }
+    } catch (const std::out_of_range&) {
+        std::cerr << "invalid duration_seconds \"" << duration_str << "\" (integer out of range)\n";
+        print_usage();
+        return 1;
+    } catch (const std::invalid_argument&) {
+        std::cerr << "invalid duration_seconds \"" << duration_str << "\" (expected an integer)\n";
         print_usage();
         return 1;
     }
@@ -361,6 +442,7 @@ int main(int argc, char** argv) {
     auto mode = parse_mode(mode_str);
     if (!mode) {
         std::cerr << "unknown mode \"" << mode_str << "\" (expected bbo, volume-bands, or price-bands)\n";
+        print_usage();
         return 1;
     }
 
@@ -373,7 +455,20 @@ int main(int argc, char** argv) {
 
     if (duration_s > 0) {
         std::this_thread::sleep_for(std::chrono::seconds(duration_s));
-        stop = true;
+        // Setting `stop` while holding cancel_mutex() (not just relying on
+        // it being std::atomic) closes a lost-wakeup window: without the
+        // lock, a canceller thread could re-check its predicate (see
+        // `false`), then get preempted right before blocking on the CV -
+        // this write and the notify_all() below would then land in that
+        // gap and be missed entirely, leaving the thread asleep until its
+        // own read loop happens to end on its own. That would reintroduce
+        // the exact class of hang 2055487 fixed, just for the
+        // duration-elapsed path instead of the natural-completion one.
+        {
+            std::lock_guard<std::mutex> lock(cancel_mutex());
+            stop = true;
+        }
+        cancel_cv().notify_all();
     }
     for (auto& t : threads) t.join();
     return 0;
