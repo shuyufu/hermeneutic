@@ -10,14 +10,13 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
-#include <variant>
 
 #include "bobby/hermeneutic/book/symbol_sync.hpp"
-#include "bobby/hermeneutic/exchange/json_wire.hpp"
+#include "bobby/hermeneutic/exchange/feed_wire.hpp"
 
 namespace bobby::hermeneutic::ingestion {
 
-using ParsedMessage = std::optional<std::variant<SnapshotMessage, DepthUpdate>>;
+// ParsedMessage is defined once in feed_wire.hpp - see its own comment.
 
 namespace detail {
 

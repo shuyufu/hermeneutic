@@ -11,13 +11,11 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
-#include <variant>
 #include <vector>
 
 #include "bobby/hermeneutic/book/symbol_sync.hpp"
 #include "bobby/hermeneutic/core/fixed_point.hpp"
-#include "bobby/hermeneutic/exchange/binance/binance_futures_feed.hpp"  // for ParsedMessage - identical shape, shared rather than redefined
-#include "bobby/hermeneutic/exchange/binance/binance_wire.hpp"
+#include "bobby/hermeneutic/exchange/feed_wire.hpp"
 
 namespace bobby::hermeneutic::ingestion {
 

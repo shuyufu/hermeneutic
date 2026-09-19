@@ -11,17 +11,15 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
-#include <variant>
 #include <vector>
 
 #include "bobby/hermeneutic/book/symbol_sync.hpp"
 #include "bobby/hermeneutic/core/fixed_point.hpp"
-#include "bobby/hermeneutic/exchange/binance/binance_wire.hpp"
-#include "bobby/hermeneutic/exchange/json_wire.hpp"
+#include "bobby/hermeneutic/exchange/feed_wire.hpp"
 
 namespace bobby::hermeneutic::ingestion {
 
-using ParsedMessage = std::optional<std::variant<SnapshotMessage, DepthUpdate>>;
+// ParsedMessage is defined once in feed_wire.hpp - see its own comment.
 
 // VenueFeed for Binance USDS-M Futures: parse/encode only, no I/O. See
 // docs/ingestion_design.md for the design this implements and the primary

@@ -75,10 +75,10 @@ double parse_double(std::string_view text) {
     return value;
 }
 
-// Same shape as binance_futures_feed.hpp's HttpRequestSpec (host/port/
-// target), redeclared here so this test doesn't need to include that
-// header (and pull in simdjson, which FakeFeed's own trivial wire format
-// has no use for).
+// Same shape as feed_wire.hpp's HttpRequestSpec (host/port/target),
+// redeclared here so this test doesn't need to include that header (and
+// pull in simdjson, which FakeFeed's own trivial wire format has no use
+// for).
 struct FakeHttpRequestSpec {
     std::string host;
     std::string port;
