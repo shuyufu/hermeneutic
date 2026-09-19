@@ -38,12 +38,12 @@ using bobby::hermeneutic::aggregator::L2Update;
 using bobby::hermeneutic::aggregator::SymbolBook;
 using bobby::hermeneutic::symbol::BaseQuote;
 using bobby::hermeneutic::symbol::BookId;
-using bobby::hermeneutic::symbol::BookType;
+using bobby::hermeneutic::symbol::MarketType;
 
 // The one book every AggregatorService in this file is constructed with -
 // these tests are about VenueSession's own mechanics (backoff/stop/snapshot
 // bridging), not about book identity, so a single fixed BookId is enough.
-BookId TestBookId() { return BookId{BaseQuote{"BTC", "USDT"}, BookType::Spot}; }
+BookId TestBookId() { return BookId{BaseQuote{"BTC", "USDT"}, MarketType::Spot}; }
 
 std::vector<std::string_view> split(std::string_view text, char delimiter) {
     std::vector<std::string_view> fields;

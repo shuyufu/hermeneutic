@@ -22,7 +22,7 @@ namespace {
 
 using bobby::hermeneutic::symbol::BaseQuote;
 using bobby::hermeneutic::symbol::BookId;
-using bobby::hermeneutic::symbol::BookType;
+using bobby::hermeneutic::symbol::MarketType;
 
 SubscribeL2DiffRequest subscribe_l2_diff_request(const BookId& book_id) {
     SubscribeL2DiffRequest request;
@@ -160,7 +160,7 @@ TEST(SubscriberQueueTest, DropOldestOverflowKeepsNewestWithoutClosing) {
 
 class AggregatorServiceTest : public ::testing::Test {
   protected:
-    static BookId TestBook() { return BookId{BaseQuote{"BTC", "USDT"}, BookType::Spot}; }
+    static BookId TestBook() { return BookId{BaseQuote{"BTC", "USDT"}, MarketType::Spot}; }
 
     AggregatorServiceTest() : service_(std::vector<BookId>{TestBook()}) {}
 
@@ -708,8 +708,8 @@ TEST_F(AggregatorServiceTest, StuckBboSubscriberDoesNotBlockIngestionOrOtherSubs
 // AggregatorService instance rather than the fixture's single-symbol one.
 class MultiSymbolAggregatorServiceTest : public ::testing::Test {
   protected:
-    static BookId BtcBook() { return BookId{BaseQuote{"BTC", "USDT"}, BookType::Spot}; }
-    static BookId EthBook() { return BookId{BaseQuote{"ETH", "USDT"}, BookType::Spot}; }
+    static BookId BtcBook() { return BookId{BaseQuote{"BTC", "USDT"}, MarketType::Spot}; }
+    static BookId EthBook() { return BookId{BaseQuote{"ETH", "USDT"}, MarketType::Spot}; }
 
     void SetUp() override {
         std::vector<BookId> books{BtcBook(), EthBook()};
@@ -790,7 +790,7 @@ TEST_F(MultiSymbolAggregatorServiceTest, UnknownSymbolFailsWithNotFound) {
     // MalformedBookFailsWithInvalidArgument below.
     grpc::ClientContext context;
     auto reader = stub_->SubscribeL2Diff(
-        &context, subscribe_l2_diff_request(BookId{BaseQuote{"DOGE", "USDT"}, BookType::Spot}));
+        &context, subscribe_l2_diff_request(BookId{BaseQuote{"DOGE", "USDT"}, MarketType::Spot}));
 
     L2Update update;
     EXPECT_FALSE(reader->Read(&update));  // no snapshot ever sent - the RPC fails immediately

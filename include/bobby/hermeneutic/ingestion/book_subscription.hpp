@@ -13,7 +13,7 @@
 namespace bobby::hermeneutic::ingestion {
 
 using bobby::hermeneutic::symbol::BookId;
-using bobby::hermeneutic::symbol::BookType;
+using bobby::hermeneutic::symbol::MarketType;
 using bobby::hermeneutic::symbol::Venue;
 
 // One venue's contribution to one book: everything apps/aggregator/server_main.cpp
@@ -24,7 +24,7 @@ using bobby::hermeneutic::symbol::Venue;
 // config, specifically, resolves a venue list into concrete subscriptions.
 struct VenueSubscription {
     Venue venue;
-    BookType type;
+    MarketType type;
     BookId book_id;              // AggregatorService::book()'s key
     std::string native_symbol;   // e.g. "BTC-USDT-SWAP" - what this venue's Feed subscribes with
 };
@@ -81,11 +81,11 @@ inline std::expected<std::vector<VenueSubscription>, std::string> parse_book_sub
                     "\"venues\" (array of strings)");
             }
 
-            BookType type;
+            MarketType type;
             if (type_field == "SPOT") {
-                type = BookType::Spot;
+                type = MarketType::Spot;
             } else if (type_field == "PERP") {
-                type = BookType::Perp;
+                type = MarketType::Perp;
             } else {
                 return std::unexpected("unknown book type \"" + std::string(type_field) +
                                         "\" (expected SPOT or PERP) for symbol \"" + std::string(symbol_field) +

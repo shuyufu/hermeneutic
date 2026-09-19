@@ -19,8 +19,13 @@ namespace bobby::hermeneutic::symbol {
 
 // Which market a book covers - the suffix on a BookId's human-readable form
 // ("BTC_USDT.SPOT"/"BTC_USDT.PERP", see to_string() below) and, transitively,
-// which of a venue's feeds native_symbol() below resolves to.
-enum class BookType { Spot, Perp };
+// which of a venue's feeds native_symbol() below resolves to. Named to match
+// aggregator.proto's own MarketType enum (BookId.market) - the two are
+// distinct types in distinct namespaces (this one never depends on proto,
+// see this file's own header comment; apps/aggregator/book_id.hpp is the
+// seam that converts between them), but book_id.hpp already treats them as
+// the same concept 1:1, so there's no reason for them to spell it two ways.
+enum class MarketType { Spot, Perp };
 
 // Exchanges this project can source liquidity from. Deliberately just an
 // enum, never a Feed type: this header (and anything that parses a
@@ -111,7 +116,7 @@ inline std::optional<BaseQuote> split_base_quote(std::string_view token) {
 // nothing here needs to sort books, only to use one as a map/set key.
 struct BookId {
     BaseQuote symbol;
-    BookType type;
+    MarketType type;
 
     bool operator==(const BookId&) const = default;
 };
@@ -125,7 +130,7 @@ struct BookId {
 // spelling back at an input boundary (a CLI argument, a config value),
 // exactly once, not to round-trip internal state.
 inline std::string to_string(const BookId& id) {
-    return id.symbol.base.code + "_" + id.symbol.quote.code + (id.type == BookType::Spot ? ".SPOT" : ".PERP");
+    return id.symbol.base.code + "_" + id.symbol.quote.code + (id.type == MarketType::Spot ? ".SPOT" : ".PERP");
 }
 
 // The inverse of to_string() above for any BookId whose base/quote codes
@@ -141,10 +146,10 @@ inline std::string to_string(const BookId& id) {
 // ambiguity left to guess at.
 inline std::optional<BookId> parse_book_id(std::string_view token) {
     std::string_view suffix = ".SPOT";
-    BookType type = BookType::Spot;
+    MarketType type = MarketType::Spot;
     if (!token.ends_with(suffix)) {
         suffix = ".PERP";
-        type = BookType::Perp;
+        type = MarketType::Perp;
         if (!token.ends_with(suffix)) return std::nullopt;
     }
     auto symbol = split_base_quote(token.substr(0, token.size() - suffix.size()));
@@ -160,11 +165,11 @@ inline std::optional<BookId> parse_book_id(std::string_view token) {
 // way each exchange's own docs do, and BookId only gets to stay
 // venue-agnostic because it doesn't have to pick one exchange's term as
 // "the" answer.
-inline std::string venue_id(Venue venue, BookType type) {
+inline std::string venue_id(Venue venue, MarketType type) {
     switch (venue) {
-        case Venue::Binance: return type == BookType::Spot ? "binance_spot" : "binance_futures";
-        case Venue::Bybit: return type == BookType::Spot ? "bybit_spot" : "bybit_linear";
-        case Venue::Okx: return type == BookType::Spot ? "okx_spot" : "okx_swap";
+        case Venue::Binance: return type == MarketType::Spot ? "binance_spot" : "binance_futures";
+        case Venue::Bybit: return type == MarketType::Spot ? "bybit_spot" : "bybit_linear";
+        case Venue::Okx: return type == MarketType::Spot ? "okx_spot" : "okx_swap";
     }
     return "";  // unreachable - silences -Wreturn-type on an exhaustive switch
 }
@@ -179,13 +184,13 @@ inline std::string venue_id(Venue venue, BookType type) {
 // boundary the caller supplied, rather than this having to recover it
 // from a concatenated string the way split_base_quote()'s own comment
 // explains this project avoids.
-inline std::string native_symbol(Venue venue, const BaseQuote& symbol, BookType type) {
+inline std::string native_symbol(Venue venue, const BaseQuote& symbol, MarketType type) {
     switch (venue) {
         case Venue::Binance:
         case Venue::Bybit:
             return symbol.base.code + symbol.quote.code;
         case Venue::Okx:
-            return symbol.base.code + "-" + symbol.quote.code + (type == BookType::Perp ? "-SWAP" : "");
+            return symbol.base.code + "-" + symbol.quote.code + (type == MarketType::Perp ? "-SWAP" : "");
     }
     return "";  // unreachable - silences -Wreturn-type on an exhaustive switch
 }

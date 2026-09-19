@@ -41,7 +41,7 @@ namespace net = boost::asio;
 
 using bobby::hermeneutic::aggregator::SymbolBook;
 using bobby::hermeneutic::ingestion::VenueSubscription;
-using bobby::hermeneutic::symbol::BookType;
+using bobby::hermeneutic::symbol::MarketType;
 using bobby::hermeneutic::symbol::Venue;
 
 // Every (venue, book type) pair's contribution, gathered from the flat
@@ -53,9 +53,9 @@ struct VenueGroup {
     bobby::hermeneutic::ingestion::SymbolRegistry<SymbolBook> registry;
 };
 
-using VenueGroups = std::map<std::pair<Venue, BookType>, VenueGroup>;
+using VenueGroups = std::map<std::pair<Venue, MarketType>, VenueGroup>;
 
-VenueGroup* find_group(VenueGroups& groups, Venue venue, BookType type) {
+VenueGroup* find_group(VenueGroups& groups, Venue venue, MarketType type) {
     auto it = groups.find({venue, type});
     return it == groups.end() ? nullptr : &it->second;
 }
@@ -70,7 +70,7 @@ VenueGroup* find_group(VenueGroups& groups, Venue venue, BookType type) {
 // so the caller's startup log line can list only what was actually wired.
 template <typename Feed, typename Policy>
 void wire_venue(bobby::hermeneutic::ingestion::IngestionRunner& runner, VenueGroups& groups, Venue venue,
-                 BookType type, std::vector<std::string>& wired_venues, net::any_io_executor executor,
+                 MarketType type, std::vector<std::string>& wired_venues, net::any_io_executor executor,
                  net::ssl::context* ssl_ctx) {
     auto* group = find_group(groups, venue, type);
     if (!group) return;
@@ -202,22 +202,22 @@ int main(int argc, char** argv) {
     std::vector<std::string> wired_venues;
 
     wire_venue<bobby::hermeneutic::ingestion::BinanceSpotFeed, bobby::hermeneutic::BinanceSpotSequencePolicy>(
-        runner, groups, Venue::Binance, BookType::Spot, wired_venues, io.get_executor(), &ssl_ctx);
+        runner, groups, Venue::Binance, MarketType::Spot, wired_venues, io.get_executor(), &ssl_ctx);
     wire_venue<bobby::hermeneutic::ingestion::BinanceFuturesFeed, bobby::hermeneutic::BinanceFuturesSequencePolicy>(
-        runner, groups, Venue::Binance, BookType::Perp, wired_venues, io.get_executor(), &ssl_ctx);
+        runner, groups, Venue::Binance, MarketType::Perp, wired_venues, io.get_executor(), &ssl_ctx);
     wire_venue<bobby::hermeneutic::ingestion::BybitSpotFeed, bobby::hermeneutic::BybitSequencePolicy>(
-        runner, groups, Venue::Bybit, BookType::Spot, wired_venues, io.get_executor(), &ssl_ctx);
+        runner, groups, Venue::Bybit, MarketType::Spot, wired_venues, io.get_executor(), &ssl_ctx);
     wire_venue<bobby::hermeneutic::ingestion::BybitLinearFeed, bobby::hermeneutic::BybitSequencePolicy>(
-        runner, groups, Venue::Bybit, BookType::Perp, wired_venues, io.get_executor(), &ssl_ctx);
+        runner, groups, Venue::Bybit, MarketType::Perp, wired_venues, io.get_executor(), &ssl_ctx);
     // OKX is a single Feed/Policy pair covering both spot and perpetual
     // swap instIds (the `books` channel is protocol-identical for both -
     // see okx_feed.hpp); "okx_spot"/"okx_swap" are two independent
     // VenueSessions of that same Feed type, one per book type, matching
     // every other venue's shape here.
     wire_venue<bobby::hermeneutic::ingestion::OkxFeed, bobby::hermeneutic::OkxSequencePolicy>(
-        runner, groups, Venue::Okx, BookType::Spot, wired_venues, io.get_executor(), &ssl_ctx);
+        runner, groups, Venue::Okx, MarketType::Spot, wired_venues, io.get_executor(), &ssl_ctx);
     wire_venue<bobby::hermeneutic::ingestion::OkxFeed, bobby::hermeneutic::OkxSequencePolicy>(
-        runner, groups, Venue::Okx, BookType::Perp, wired_venues, io.get_executor(), &ssl_ctx);
+        runner, groups, Venue::Okx, MarketType::Perp, wired_venues, io.get_executor(), &ssl_ctx);
 
     runner.start_all();
     std::thread io_thread([&io] { io.run(); });

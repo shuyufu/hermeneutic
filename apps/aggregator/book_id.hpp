@@ -11,6 +11,12 @@
 // class comment) - this seam is where that boundary is crossed, once, for
 // the two places that actually need to (apps/aggregator/aggregator_service.hpp
 // on the server side, apps/aggregator/client_main.cpp on the client side).
+//
+// Below, an unqualified `MarketType` is always the proto enum
+// (aggregator.grpc.pb.h, brought into this namespace); `symbol::MarketType`
+// is this project's own C++ enum (symbol.hpp) - same name by design (see
+// symbol.hpp's own comment on MarketType), but two distinct types that only
+// ever appear qualified vs. unqualified side by side, never ambiguous.
 namespace bobby::hermeneutic::aggregator {
 
 // nullopt for anything a well-formed request could never produce:
@@ -21,10 +27,10 @@ namespace bobby::hermeneutic::aggregator {
 // this case as INVALID_ARGUMENT and that one as NOT_FOUND.
 inline std::optional<symbol::BookId> to_symbol_book_id(const BookId& wire) {
     if (wire.base().empty() || wire.quote().empty()) return std::nullopt;
-    symbol::BookType type;
+    symbol::MarketType type;
     switch (wire.market()) {
-        case MarketType::SPOT: type = symbol::BookType::Spot; break;
-        case MarketType::PERP: type = symbol::BookType::Perp; break;
+        case MarketType::SPOT: type = symbol::MarketType::Spot; break;
+        case MarketType::PERP: type = symbol::MarketType::Perp; break;
         // Deliberately not the exhaustive, compiler-enforced switch pattern
         // symbol.hpp's own venue_id()/native_symbol() use (see this
         // project's docs/ingestion_design.md 第10節第10項): proto3 enums
@@ -45,7 +51,7 @@ inline std::optional<symbol::BookId> to_symbol_book_id(const BookId& wire) {
 inline void fill_wire_book_id(BookId* wire, const symbol::BookId& id) {
     wire->set_base(id.symbol.base.code);
     wire->set_quote(id.symbol.quote.code);
-    wire->set_market(id.type == symbol::BookType::Spot ? MarketType::SPOT : MarketType::PERP);
+    wire->set_market(id.type == symbol::MarketType::Spot ? MarketType::SPOT : MarketType::PERP);
 }
 
 }  // namespace bobby::hermeneutic::aggregator
