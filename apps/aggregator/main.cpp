@@ -7,6 +7,7 @@
 #include <boost/beast/core/tcp_stream.hpp>
 
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <condition_variable>
 #include <exception>
@@ -57,6 +58,26 @@ using VenueGroups = std::map<std::pair<Venue, BookType>, VenueGroup>;
 VenueGroup* find_group(VenueGroups& groups, Venue venue, BookType type) {
     auto it = groups.find({venue, type});
     return it == groups.end() ? nullptr : &it->second;
+}
+
+// Registers (venue, type)'s group with `runner`, if the config actually
+// asked for it - a no-op otherwise (e.g. a config with no OKX venues at
+// all never touches OkxFeed). One instantiation of this per (Feed, Policy)
+// pair replaces what used to be six near-identical inline blocks in
+// main(), so a fix here (or a future venue) only has to happen once.
+// `group->native_symbols`/`group->registry` are moved out, not copied -
+// `groups` isn't read again afterward - and `wired_venues` is grown here
+// so the caller's startup log line can list only what was actually wired.
+template <typename Feed, typename Policy>
+void wire_venue(bobby::hermeneutic::ingestion::IngestionRunner& runner, VenueGroups& groups, Venue venue,
+                 BookType type, std::vector<std::string>& wired_venues, net::any_io_executor executor,
+                 net::ssl::context* ssl_ctx) {
+    auto* group = find_group(groups, venue, type);
+    if (!group) return;
+    wired_venues.push_back(bobby::hermeneutic::symbol::venue_id(venue, type));
+    runner.add<Feed, Policy, net::ssl::stream<boost::beast::tcp_stream>, SymbolBook>(
+        Feed{}, wired_venues.back(), std::move(group->native_symbols), std::move(group->registry), executor,
+        ssl_ctx);
 }
 
 }  // namespace
@@ -169,60 +190,36 @@ int main(int argc, char** argv) {
     for (const auto& sub : subscriptions) {
         auto& group = groups[{sub.venue, sub.type}];
         group.native_symbols.push_back(sub.native_symbol);
-        group.registry.add(sub.native_symbol, service.book(sub.book_key));
+        // book_symbols above is derived from this same `subscriptions` list,
+        // so this can never miss - asserted, not runtime-checked, the same
+        // startup-invariant treatment AggregatorService's own constructor
+        // gives its unique-symbols precondition.
+        auto* book = service.book(sub.book_key);
+        assert(book);
+        group.registry.add(sub.native_symbol, book);
     }
 
     net::io_context io;
     bobby::hermeneutic::ingestion::IngestionRunner runner;
     std::vector<std::string> wired_venues;
 
-    if (auto* group = find_group(groups, Venue::Binance, BookType::Spot)) {
-        wired_venues.push_back(bobby::hermeneutic::symbol::venue_id(Venue::Binance, BookType::Spot));
-        runner.add<bobby::hermeneutic::ingestion::BinanceSpotFeed, bobby::hermeneutic::BinanceSpotSequencePolicy,
-                   net::ssl::stream<boost::beast::tcp_stream>, SymbolBook>(
-            bobby::hermeneutic::ingestion::BinanceSpotFeed{}, wired_venues.back(), group->native_symbols,
-            std::move(group->registry), io.get_executor(), &ssl_ctx);
-    }
-    if (auto* group = find_group(groups, Venue::Binance, BookType::Perp)) {
-        wired_venues.push_back(bobby::hermeneutic::symbol::venue_id(Venue::Binance, BookType::Perp));
-        runner.add<bobby::hermeneutic::ingestion::BinanceFuturesFeed,
-                   bobby::hermeneutic::BinanceFuturesSequencePolicy, net::ssl::stream<boost::beast::tcp_stream>,
-                   SymbolBook>(bobby::hermeneutic::ingestion::BinanceFuturesFeed{}, wired_venues.back(),
-                               group->native_symbols, std::move(group->registry), io.get_executor(), &ssl_ctx);
-    }
-    if (auto* group = find_group(groups, Venue::Bybit, BookType::Spot)) {
-        wired_venues.push_back(bobby::hermeneutic::symbol::venue_id(Venue::Bybit, BookType::Spot));
-        runner.add<bobby::hermeneutic::ingestion::BybitSpotFeed, bobby::hermeneutic::BybitSequencePolicy,
-                   net::ssl::stream<boost::beast::tcp_stream>, SymbolBook>(
-            bobby::hermeneutic::ingestion::BybitSpotFeed{}, wired_venues.back(), group->native_symbols,
-            std::move(group->registry), io.get_executor(), &ssl_ctx);
-    }
-    if (auto* group = find_group(groups, Venue::Bybit, BookType::Perp)) {
-        wired_venues.push_back(bobby::hermeneutic::symbol::venue_id(Venue::Bybit, BookType::Perp));
-        runner.add<bobby::hermeneutic::ingestion::BybitLinearFeed, bobby::hermeneutic::BybitSequencePolicy,
-                   net::ssl::stream<boost::beast::tcp_stream>, SymbolBook>(
-            bobby::hermeneutic::ingestion::BybitLinearFeed{}, wired_venues.back(), group->native_symbols,
-            std::move(group->registry), io.get_executor(), &ssl_ctx);
-    }
+    wire_venue<bobby::hermeneutic::ingestion::BinanceSpotFeed, bobby::hermeneutic::BinanceSpotSequencePolicy>(
+        runner, groups, Venue::Binance, BookType::Spot, wired_venues, io.get_executor(), &ssl_ctx);
+    wire_venue<bobby::hermeneutic::ingestion::BinanceFuturesFeed, bobby::hermeneutic::BinanceFuturesSequencePolicy>(
+        runner, groups, Venue::Binance, BookType::Perp, wired_venues, io.get_executor(), &ssl_ctx);
+    wire_venue<bobby::hermeneutic::ingestion::BybitSpotFeed, bobby::hermeneutic::BybitSequencePolicy>(
+        runner, groups, Venue::Bybit, BookType::Spot, wired_venues, io.get_executor(), &ssl_ctx);
+    wire_venue<bobby::hermeneutic::ingestion::BybitLinearFeed, bobby::hermeneutic::BybitSequencePolicy>(
+        runner, groups, Venue::Bybit, BookType::Perp, wired_venues, io.get_executor(), &ssl_ctx);
     // OKX is a single Feed/Policy pair covering both spot and perpetual
     // swap instIds (the `books` channel is protocol-identical for both -
     // see okx_feed.hpp); "okx_spot"/"okx_swap" are two independent
     // VenueSessions of that same Feed type, one per book type, matching
     // every other venue's shape here.
-    if (auto* group = find_group(groups, Venue::Okx, BookType::Spot)) {
-        wired_venues.push_back(bobby::hermeneutic::symbol::venue_id(Venue::Okx, BookType::Spot));
-        runner.add<bobby::hermeneutic::ingestion::OkxFeed, bobby::hermeneutic::OkxSequencePolicy,
-                   net::ssl::stream<boost::beast::tcp_stream>, SymbolBook>(
-            bobby::hermeneutic::ingestion::OkxFeed{}, wired_venues.back(), group->native_symbols,
-            std::move(group->registry), io.get_executor(), &ssl_ctx);
-    }
-    if (auto* group = find_group(groups, Venue::Okx, BookType::Perp)) {
-        wired_venues.push_back(bobby::hermeneutic::symbol::venue_id(Venue::Okx, BookType::Perp));
-        runner.add<bobby::hermeneutic::ingestion::OkxFeed, bobby::hermeneutic::OkxSequencePolicy,
-                   net::ssl::stream<boost::beast::tcp_stream>, SymbolBook>(
-            bobby::hermeneutic::ingestion::OkxFeed{}, wired_venues.back(), group->native_symbols,
-            std::move(group->registry), io.get_executor(), &ssl_ctx);
-    }
+    wire_venue<bobby::hermeneutic::ingestion::OkxFeed, bobby::hermeneutic::OkxSequencePolicy>(
+        runner, groups, Venue::Okx, BookType::Spot, wired_venues, io.get_executor(), &ssl_ctx);
+    wire_venue<bobby::hermeneutic::ingestion::OkxFeed, bobby::hermeneutic::OkxSequencePolicy>(
+        runner, groups, Venue::Okx, BookType::Perp, wired_venues, io.get_executor(), &ssl_ctx);
 
     runner.start_all();
     std::thread io_thread([&io] { io.run(); });
