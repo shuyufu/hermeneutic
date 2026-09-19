@@ -310,16 +310,45 @@ class SymbolBook {
 
     // Writes the initial snapshot to `writer` and, if that succeeds,
     // registers it for subsequent updates and returns its queue. Returns
-    // nullptr (without registering anything) if the initial Write() fails -
+    // nullptr (without leaving it registered) if the initial Write() fails -
     // the caller (AggregatorService::SubscribeL2Diff()) should end the RPC
-    // without draining a queue that was never created.
+    // without draining a queue that was never meant to be used.
+    //
+    // writer->Write() is a blocking network call (gRPC flow control/TCP
+    // backpressure) - it must never run while mutex_ is held, or one new
+    // subscriber's slow/high-latency connection stalls ingestion
+    // (apply_delta/apply_batch/apply_snapshot) and every *other*
+    // subscriber's broadcast for as long as this one Write() takes. So
+    // this registers into subscribers_ *before* calling Write() (both
+    // under one lock, atomically with the snapshot itself, matching the
+    // previous single-critical-section guarantee that no update between
+    // "snapshot taken" and "registered for future updates" is ever
+    // missed), releases the lock, then writes. This is safe against a
+    // concurrent broadcast landing in that gap: broadcast_to_subscribers()
+    // only ever pushes into `queue` (a non-blocking, thread-safe
+    // enqueue - see the class comment above) and never calls Write()
+    // itself, so there is no writer->Write() vs. writer->Write() race -
+    // only this thread ever calls Write() on this particular `writer`.
+    // A registered-but-not-yet-Write()-succeeded subscriber just
+    // accumulates in its own queue like any other, ready for this
+    // function's caller to drain once it gets `queue` back. On failure,
+    // the provisional registration is undone under a second, separate
+    // critical section - `subscribers_.erase()` is safe to call even if
+    // the emplace above never happened.
     std::shared_ptr<SubscriberQueue<L2Update>> subscribe(grpc::ServerWriter<L2Update>* writer) {
-        std::lock_guard lock(mutex_);
-        if (!writer->Write(build_snapshot())) return nullptr;
         auto queue =
             std::make_shared<SubscriberQueue<L2Update>>(kSubscriberQueueCapacity, OverflowPolicy::Close);
-        subscribers_.emplace(writer, queue);
-        return queue;
+        L2Update snapshot;
+        {
+            std::lock_guard lock(mutex_);
+            snapshot = build_snapshot();
+            subscribers_.emplace(writer, queue);
+        }
+        if (writer->Write(snapshot)) return queue;
+
+        std::lock_guard lock(mutex_);
+        subscribers_.erase(writer);
+        return nullptr;
     }
 
     void unsubscribe(grpc::ServerWriter<L2Update>* writer) {
@@ -329,18 +358,28 @@ class SymbolBook {
 
     // Writes the current complete BBO state to `writer` and, if that
     // succeeds, registers it for subsequent updates and returns its queue.
-    // Returns nullptr (without registering anything) if the initial Write()
-    // fails - mirrors subscribe() above. Uses OverflowPolicy::DropOldest,
-    // not Close: see SubscriberQueue's class comment for why a slow BBO
-    // subscriber should never be disconnected for falling behind.
+    // Returns nullptr (without leaving it registered) if the initial
+    // Write() fails - mirrors subscribe() above, including why Write()
+    // must not run under mutex_ and why registering before it (rather
+    // than after) is safe - see that function's own comment. Uses
+    // OverflowPolicy::DropOldest, not Close: see SubscriberQueue's class
+    // comment for why a slow BBO subscriber should never be disconnected
+    // for falling behind.
     std::shared_ptr<SubscriberQueue<BboUpdate>> subscribe_bbo(
         grpc::ServerWriter<BboUpdate>* writer) {
-        std::lock_guard lock(mutex_);
-        if (!writer->Write(build_bbo())) return nullptr;
         auto queue = std::make_shared<SubscriberQueue<BboUpdate>>(kSubscriberQueueCapacity,
                                                                     OverflowPolicy::DropOldest);
-        bbo_subscribers_.emplace(writer, queue);
-        return queue;
+        BboUpdate bbo;
+        {
+            std::lock_guard lock(mutex_);
+            bbo = build_bbo();
+            bbo_subscribers_.emplace(writer, queue);
+        }
+        if (writer->Write(bbo)) return queue;
+
+        std::lock_guard lock(mutex_);
+        bbo_subscribers_.erase(writer);
+        return nullptr;
     }
 
     void unsubscribe_bbo(grpc::ServerWriter<BboUpdate>* writer) {
