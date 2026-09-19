@@ -115,6 +115,63 @@ class SubscriberQueue {
     bool closed_ = false;
 };
 
+// One stream's worth of subscriber bookkeeping: create a queue, broadcast
+// into every queue, drop one. Shared by SymbolBook's L2Diff and Bbo
+// streams, which were duplicating this map/broadcast/erase logic with
+// only their element type and OverflowPolicy differing (a code-review
+// finding).
+//
+// Deliberately does NOT take or store the gRPC writer: SymbolBook's own
+// subscribe()/subscribe_bbo() still need `grpc::ServerWriter<T>*` to
+// perform the initial Write() (there is no way around that - something
+// has to write the first message), but nothing about *bookkeeping* a
+// subscriber's queue needs to know what a gRPC writer is, so this class
+// doesn't. Subscribers are keyed by the queue's own address, an opaque
+// identity local to this class - not the writer pointer - so
+// unsubscribe() takes the queue itself, not a gRPC type. This is also
+// what lets a caller un-subscribe using nothing but the shared_ptr it was
+// handed back at subscribe() time, with no separate writer-to-queue
+// lookup required.
+//
+// Every method here must be called with the caller's own mutex_ held -
+// this class keeps no lock of its own on purpose. SymbolBook already has
+// exactly one mutex_ guarding book_/seq_/both fanouts together, and a
+// subscribe() registering a queue must be atomic with the snapshot/BBO
+// capture that goes with it (see SymbolBook::subscribe()'s own comment) -
+// giving Fanout a second, separate lock would only reintroduce the
+// coordination problem that one shared mutex_ already solves for free.
+template <typename T>
+class Fanout {
+  public:
+    Fanout(std::size_t capacity, OverflowPolicy overflow_policy)
+        : capacity_(capacity), overflow_policy_(overflow_policy) {}
+
+    // Must be called with the caller's mutex_ held.
+    std::shared_ptr<SubscriberQueue<T>> subscribe() {
+        auto queue = std::make_shared<SubscriberQueue<T>>(capacity_, overflow_policy_);
+        subscribers_.emplace(queue.get(), queue);
+        return queue;
+    }
+
+    // Safe to call even if `queue` was never registered (e.g. subscribe()'s
+    // own caller undoing a provisional registration after a failed initial
+    // Write() - see SymbolBook::subscribe()). Must be called with the
+    // caller's mutex_ held.
+    void unsubscribe(const std::shared_ptr<SubscriberQueue<T>>& queue) { subscribers_.erase(queue.get()); }
+
+    // Non-blocking: pushes `update` into every subscriber's own queue. The
+    // actual Write() happens later, off this thread, on that subscriber's
+    // own handler thread. Must be called with the caller's mutex_ held.
+    void broadcast(const T& update) {
+        for (auto& [ptr, queue] : subscribers_) queue->push_or_close(update);
+    }
+
+  private:
+    std::map<SubscriberQueue<T>*, std::shared_ptr<SubscriberQueue<T>>> subscribers_;
+    std::size_t capacity_;
+    OverflowPolicy overflow_policy_;
+};
+
 // Per-symbol aggregated book plus its gRPC fan-out state. Not a gRPC type
 // itself: AggregatorService (the sole grpc::Service in this file) owns one
 // SymbolBook per symbol and routes every SubscribeL2Diff()/SubscribeBbo()
@@ -301,11 +358,11 @@ class SymbolBook {
 
         L2Update l2_update;
         l2_update.mutable_heartbeat()->set_ts_ns(ts_ns);
-        broadcast_to_subscribers(l2_update);
+        l2_fanout_.broadcast(l2_update);
 
         BboUpdate bbo_update;
         bbo_update.mutable_heartbeat()->set_ts_ns(ts_ns);
-        broadcast_to_bbo_subscribers(bbo_update);
+        bbo_fanout_.broadcast(bbo_update);
     }
 
     // Writes the initial snapshot to `writer` and, if that succeeds,
@@ -319,41 +376,44 @@ class SymbolBook {
     // subscriber's slow/high-latency connection stalls ingestion
     // (apply_delta/apply_batch/apply_snapshot) and every *other*
     // subscriber's broadcast for as long as this one Write() takes. So
-    // this registers into subscribers_ *before* calling Write() (both
+    // this registers into l2_fanout_ *before* calling Write() (both
     // under one lock, atomically with the snapshot itself, matching the
     // previous single-critical-section guarantee that no update between
     // "snapshot taken" and "registered for future updates" is ever
     // missed), releases the lock, then writes. This is safe against a
-    // concurrent broadcast landing in that gap: broadcast_to_subscribers()
+    // concurrent broadcast landing in that gap: Fanout::broadcast()
     // only ever pushes into `queue` (a non-blocking, thread-safe
-    // enqueue - see the class comment above) and never calls Write()
+    // enqueue - see Fanout's own class comment) and never calls Write()
     // itself, so there is no writer->Write() vs. writer->Write() race -
     // only this thread ever calls Write() on this particular `writer`.
     // A registered-but-not-yet-Write()-succeeded subscriber just
     // accumulates in its own queue like any other, ready for this
     // function's caller to drain once it gets `queue` back. On failure,
     // the provisional registration is undone under a second, separate
-    // critical section - `subscribers_.erase()` is safe to call even if
-    // the emplace above never happened.
+    // critical section - Fanout::unsubscribe() erasing a key that isn't
+    // present is a no-op, not an error.
     std::shared_ptr<SubscriberQueue<L2Update>> subscribe(grpc::ServerWriter<L2Update>* writer) {
-        auto queue =
-            std::make_shared<SubscriberQueue<L2Update>>(kSubscriberQueueCapacity, OverflowPolicy::Close);
         L2Update snapshot;
+        std::shared_ptr<SubscriberQueue<L2Update>> queue;
         {
             std::lock_guard lock(mutex_);
             snapshot = build_snapshot();
-            subscribers_.emplace(writer, queue);
+            queue = l2_fanout_.subscribe();
         }
         if (writer->Write(snapshot)) return queue;
 
         std::lock_guard lock(mutex_);
-        subscribers_.erase(writer);
+        l2_fanout_.unsubscribe(queue);
         return nullptr;
     }
 
-    void unsubscribe(grpc::ServerWriter<L2Update>* writer) {
+    // Takes the queue subscribe() handed back, not the writer that was
+    // passed to it - see Fanout's own class comment for why: bookkeeping
+    // a subscriber never needed the gRPC writer type in the first place,
+    // only the caller's own initial Write() did.
+    void unsubscribe(const std::shared_ptr<SubscriberQueue<L2Update>>& queue) {
         std::lock_guard lock(mutex_);
-        subscribers_.erase(writer);
+        l2_fanout_.unsubscribe(queue);
     }
 
     // Writes the current complete BBO state to `writer` and, if that
@@ -367,24 +427,25 @@ class SymbolBook {
     // for falling behind.
     std::shared_ptr<SubscriberQueue<BboUpdate>> subscribe_bbo(
         grpc::ServerWriter<BboUpdate>* writer) {
-        auto queue = std::make_shared<SubscriberQueue<BboUpdate>>(kSubscriberQueueCapacity,
-                                                                    OverflowPolicy::DropOldest);
         BboUpdate bbo;
+        std::shared_ptr<SubscriberQueue<BboUpdate>> queue;
         {
             std::lock_guard lock(mutex_);
             bbo = build_bbo();
-            bbo_subscribers_.emplace(writer, queue);
+            queue = bbo_fanout_.subscribe();
         }
         if (writer->Write(bbo)) return queue;
 
         std::lock_guard lock(mutex_);
-        bbo_subscribers_.erase(writer);
+        bbo_fanout_.unsubscribe(queue);
         return nullptr;
     }
 
-    void unsubscribe_bbo(grpc::ServerWriter<BboUpdate>* writer) {
+    // See unsubscribe()'s own comment above for why this takes the queue,
+    // not the writer.
+    void unsubscribe_bbo(const std::shared_ptr<SubscriberQueue<BboUpdate>>& queue) {
         std::lock_guard lock(mutex_);
-        bbo_subscribers_.erase(writer);
+        bbo_fanout_.unsubscribe(queue);
     }
 
   private:
@@ -520,44 +581,21 @@ class SymbolBook {
             }
         }
 
-        broadcast_to_subscribers(update);
+        l2_fanout_.broadcast(update);
 
         auto bid = best_bid();
         auto ask = best_ask();
         if (bid != last_bbo_bid_ || ask != last_bbo_ask_) {
             last_bbo_bid_ = bid;
             last_bbo_ask_ = ask;
-            broadcast_to_bbo_subscribers(build_bbo());
-        }
-    }
-
-    // Must be called with mutex_ held. Non-blocking: pushes `update` into
-    // every subscriber's own queue. The actual Write() happens later, off
-    // this thread, on that subscriber's own SubscribeL2Diff() handler
-    // thread -- see the class comment. A subscriber whose queue overflows
-    // closes itself; its SubscribeL2Diff() handler notices on its own next
-    // drain and removes it from `subscribers_` then, not here.
-    void broadcast_to_subscribers(const L2Update& update) {
-        for (auto& [writer, queue] : subscribers_) {
-            queue->push_or_close(update);
-        }
-    }
-
-    // Must be called with mutex_ held. Same shape as broadcast_to_
-    // subscribers(), for the BBO stream's subscribers - see
-    // SubscriberQueue's OverflowPolicy::DropOldest for why a full queue
-    // here never closes the subscriber.
-    void broadcast_to_bbo_subscribers(const BboUpdate& update) {
-        for (auto& [writer, queue] : bbo_subscribers_) {
-            queue->push_or_close(update);
+            bbo_fanout_.broadcast(build_bbo());
         }
     }
 
     std::mutex mutex_;
     AggregateOrderBook book_;
-    std::map<grpc::ServerWriter<L2Update>*, std::shared_ptr<SubscriberQueue<L2Update>>> subscribers_;
-    std::map<grpc::ServerWriter<BboUpdate>*, std::shared_ptr<SubscriberQueue<BboUpdate>>>
-        bbo_subscribers_;
+    Fanout<L2Update> l2_fanout_{kSubscriberQueueCapacity, OverflowPolicy::Close};
+    Fanout<BboUpdate> bbo_fanout_{kSubscriberQueueCapacity, OverflowPolicy::DropOldest};
     std::uint64_t seq_ = 0;
     // Last best bid/ask actually broadcast to bbo_subscribers_, compared
     // against on every publish() to decide whether this revision touched
@@ -625,19 +663,19 @@ class AggregatorService final : public Aggregator::Service {
             batch.clear();
             auto result = queue->wait_and_drain(std::chrono::milliseconds(50), batch);
             if (result == SubscriberQueue<L2Update>::DrainResult::Closed) {
-                target->unsubscribe(writer);
+                target->unsubscribe(queue);
                 return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
                                      "subscriber fell too far behind; reconnect for a fresh "
                                      "snapshot");
             }
             for (auto& update : batch) {
                 if (!writer->Write(update)) {
-                    target->unsubscribe(writer);
+                    target->unsubscribe(queue);
                     return grpc::Status::OK;
                 }
             }
             if (context->IsCancelled()) {
-                target->unsubscribe(writer);
+                target->unsubscribe(queue);
                 return grpc::Status::OK;
             }
         }
@@ -671,17 +709,17 @@ class AggregatorService final : public Aggregator::Service {
             batch.clear();
             auto result = queue->wait_and_drain(std::chrono::milliseconds(50), batch);
             if (result == SubscriberQueue<BboUpdate>::DrainResult::Closed) {
-                target->unsubscribe_bbo(writer);
+                target->unsubscribe_bbo(queue);
                 return grpc::Status::OK;
             }
             for (auto& update : batch) {
                 if (!writer->Write(update)) {
-                    target->unsubscribe_bbo(writer);
+                    target->unsubscribe_bbo(queue);
                     return grpc::Status::OK;
                 }
             }
             if (context->IsCancelled()) {
-                target->unsubscribe_bbo(writer);
+                target->unsubscribe_bbo(queue);
                 return grpc::Status::OK;
             }
         }

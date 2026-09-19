@@ -550,7 +550,7 @@ TEST_F(AggregatorServiceTest, StuckSubscriberDoesNotBlockIngestionOrOtherSubscri
     updates_.wait_for(0);  // initial snapshot for the fixture's own (fast) subscriber
 
     // A second subscriber that never reads from its stream, simulating one
-    // that's stopped draining. broadcast_to_subscribers() only ever does a
+    // that's stopped draining. Fanout::broadcast() only ever does a
     // non-blocking push into each subscriber's own queue (see
     // SubscriberQueue::push_or_close), so ingestion and the first (fast)
     // subscriber must be unaffected by this one - regardless of whether its
