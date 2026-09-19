@@ -25,6 +25,33 @@ namespace bobby::hermeneutic::symbol {
 // see this file's own header comment; apps/aggregator/book_id.hpp is the
 // seam that converts between them), but book_id.hpp already treats them as
 // the same concept 1:1, so there's no reason for them to spell it two ways.
+//
+// No Unspecified/Invalid member: unlike aggregator.proto's MarketType,
+// which needs MARKET_TYPE_UNSPECIFIED purely because proto3 gives every
+// unset enum field an implicit zero value on the wire, this type has no
+// such requirement - a symbol::MarketType value is only ever produced by
+// something that already knows Spot or Perp (parse_book_id(),
+// book_subscription.hpp's JSON parsing, a literal at a call site).
+// "Unknown/malformed" is represented by the ABSENCE of a MarketType
+// (std::optional/std::expected returning nullopt at the parse boundary -
+// see book_id.hpp's to_symbol_book_id(), which converts
+// MARKET_TYPE_UNSPECIFIED to exactly that), the same pattern Asset/
+// BaseQuote/BookId/Exchange all use - never an extra enumerator inside
+// the type itself. Adding one would also gain nothing at that one seam:
+// its switch already keeps a default: catch-all regardless (proto enums
+// are open on the wire - see its own comment), so there's no exhaustive-
+// switch protection to symmetrize.
+//
+// Adding a market type means adding a case to every switch on this type
+// (to_string(BookId), to_string(VenueId), native_symbol(), book_id.hpp's
+// fill_wire_book_id()) - each is a real exhaustive switch (no default:),
+// not a binary ternary, specifically so a missed case is a compiler
+// warning rather than a silent misclassification. Verified empirically
+// (this project sets no -Wall/-Werror anywhere): AppleClang on this
+// machine emits -Wswitch for an uncovered enum case with no extra flags
+// needed - GCC needs -Wall for the same check, so treat this as "a
+// warning on at least one compiler in common use," not a portable
+// guarantee, let alone a hard build failure.
 enum class MarketType { Spot, Perp };
 
 // Exchanges this project can source liquidity from. Deliberately just an
@@ -130,7 +157,16 @@ struct BookId {
 // spelling back at an input boundary (a CLI argument, a config value),
 // exactly once, not to round-trip internal state.
 inline std::string to_string(const BookId& id) {
-    return id.symbol.base.code + "_" + id.symbol.quote.code + (id.type == MarketType::Spot ? ".SPOT" : ".PERP");
+    // Exhaustive switch (see MarketType's own comment on extensibility),
+    // not `id.type == MarketType::Spot ? ".SPOT" : ".PERP"` - that ternary
+    // would silently mismatch a future third MarketType value instead of
+    // getting an unhandled-enumerator warning at the switch itself.
+    std::string_view suffix = "";
+    switch (id.type) {
+        case MarketType::Spot: suffix = ".SPOT"; break;
+        case MarketType::Perp: suffix = ".PERP"; break;
+    }
+    return id.symbol.base.code + "_" + id.symbol.quote.code + std::string(suffix);
 }
 
 // The inverse of to_string() above for any BookId whose base/quote codes
@@ -191,10 +227,29 @@ struct VenueId {
 // to_string(BookId) above - nothing parses this back into a VenueId, and
 // nothing needs to: nothing constructs a VenueId from a string any more.
 inline std::string to_string(const VenueId& id) {
+    // Nested exhaustive switch, not `id.type == MarketType::Spot ? X : Y`
+    // per exchange - see MarketType's own comment on why a missed future
+    // value needs to be a compiler warning at every switch over it, not a
+    // silently-wrong ternary fallthrough.
     switch (id.exchange) {
-        case Exchange::Binance: return id.type == MarketType::Spot ? "binance_spot" : "binance_futures";
-        case Exchange::Bybit: return id.type == MarketType::Spot ? "bybit_spot" : "bybit_linear";
-        case Exchange::Okx: return id.type == MarketType::Spot ? "okx_spot" : "okx_swap";
+        case Exchange::Binance:
+            switch (id.type) {
+                case MarketType::Spot: return "binance_spot";
+                case MarketType::Perp: return "binance_futures";
+            }
+            break;
+        case Exchange::Bybit:
+            switch (id.type) {
+                case MarketType::Spot: return "bybit_spot";
+                case MarketType::Perp: return "bybit_linear";
+            }
+            break;
+        case Exchange::Okx:
+            switch (id.type) {
+                case MarketType::Spot: return "okx_spot";
+                case MarketType::Perp: return "okx_swap";
+            }
+            break;
     }
     return "";  // unreachable - silences -Wreturn-type on an exhaustive switch
 }
@@ -214,8 +269,18 @@ inline std::string native_symbol(Exchange exchange, const BaseQuote& symbol, Mar
         case Exchange::Binance:
         case Exchange::Bybit:
             return symbol.base.code + symbol.quote.code;
-        case Exchange::Okx:
-            return symbol.base.code + "-" + symbol.quote.code + (type == MarketType::Perp ? "-SWAP" : "");
+        case Exchange::Okx: {
+            // Exhaustive switch, not `type == MarketType::Perp ? "-SWAP" :
+            // ""` - see MarketType's own comment on why every switch over
+            // it (not a ternary) is what makes a missed future value a
+            // compiler warning instead of a silent wrong suffix.
+            std::string_view suffix = "";
+            switch (type) {
+                case MarketType::Spot: suffix = ""; break;
+                case MarketType::Perp: suffix = "-SWAP"; break;
+            }
+            return symbol.base.code + "-" + symbol.quote.code + std::string(suffix);
+        }
     }
     return "";  // unreachable - silences -Wreturn-type on an exhaustive switch
 }

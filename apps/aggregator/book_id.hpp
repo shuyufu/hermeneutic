@@ -51,7 +51,17 @@ inline std::optional<symbol::BookId> to_symbol_book_id(const BookId& wire) {
 inline void fill_wire_book_id(BookId* wire, const symbol::BookId& id) {
     wire->set_base(id.symbol.base.code);
     wire->set_quote(id.symbol.quote.code);
-    wire->set_market(id.type == symbol::MarketType::Spot ? MarketType::SPOT : MarketType::PERP);
+    // Exhaustive switch, not `id.type == symbol::MarketType::Spot ?
+    // MarketType::SPOT : MarketType::PERP` - see symbol::MarketType's own
+    // comment on why every switch over it, here included, is what turns a
+    // missed future value into a compiler warning instead of silently
+    // wiring the wrong market.
+    MarketType market;
+    switch (id.type) {
+        case symbol::MarketType::Spot: market = MarketType::SPOT; break;
+        case symbol::MarketType::Perp: market = MarketType::PERP; break;
+    }
+    wire->set_market(market);
 }
 
 }  // namespace bobby::hermeneutic::aggregator
