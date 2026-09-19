@@ -181,6 +181,16 @@ if(HERMENEUTIC_BUILD_INGESTION)
             hermeneutic::exchange GTest::gtest_main)
         gtest_discover_tests(hermeneutic_okx_feed_test)
 
+        # feed_wire.hpp's parse_decimal_string_to_fixed() directly, not
+        # through any one venue's fixtures - the venue feed tests above
+        # exercise it incidentally with well-formed real data, but none
+        # of them cover its parsing edge cases (rounding boundaries,
+        # overflow, malformed input) on their own.
+        add_executable(hermeneutic_feed_wire_test tests/exchange/feed_wire_test.cpp)
+        target_link_libraries(hermeneutic_feed_wire_test PRIVATE
+            hermeneutic::exchange GTest::gtest_main)
+        gtest_discover_tests(hermeneutic_feed_wire_test)
+
         # book_subscription.hpp's JSON parsing needs simdjson, so - like the
         # feed tests above - it's gated on HERMENEUTIC_BUILD_INGESTION rather
         # than living in the always-built hermeneutic_tests binary.
