@@ -200,20 +200,27 @@ class SymbolBook {
     // exchange message carried) as a single book revision: one seq bump,
     // one broadcast - unlike calling apply_delta() once per level, which
     // would seq-bump and broadcast once per level even though the exchange
-    // meant it as one atomic update. Same per-level negative-size rejection
-    // as apply_delta, checked for every level before any of them is
-    // applied, so a bad level anywhere in the batch leaves the book
-    // untouched rather than partially updated for that reason specifically
-    // (an allocation failure partway through is not rolled back - same
-    // documented limitation as apply_snapshot()).
+    // meant it as one atomic update. Same per-level price/size rejection
+    // as apply_delta (a non-positive price or a negative size), checked
+    // for every level before any of them is applied, so a bad level
+    // anywhere in the batch leaves the book untouched rather than
+    // partially updated for that reason specifically (an allocation
+    // failure partway through is not rolled back - same documented
+    // limitation as apply_snapshot()).
     std::expected<void, std::errc> apply_batch(const VenueId& venue,
                                                 std::span<const std::pair<Price, Size>> bids,
                                                 std::span<const std::pair<Price, Size>> asks) {
+        // Cheap enough to reject before taking mutex_/doing any lookups -
+        // book_.apply_batch() below re-validates and is what actually
+        // guarantees this (a caller skipping this class entirely and
+        // calling book_.apply_batch() directly still gets the same
+        // rejection), but there is no reason to pay for before_bids/
+        // before_asks construction on a batch already known to be bad.
         for (const auto& [price, size] : bids) {
-            if (size.raw() < 0) return std::unexpected(std::errc::invalid_argument);
+            if (price.raw() <= 0 || size.raw() < 0) return std::unexpected(std::errc::invalid_argument);
         }
         for (const auto& [price, size] : asks) {
-            if (size.raw() < 0) return std::unexpected(std::errc::invalid_argument);
+            if (price.raw() <= 0 || size.raw() < 0) return std::unexpected(std::errc::invalid_argument);
         }
 
         std::lock_guard lock(mutex_);
@@ -236,12 +243,18 @@ class SymbolBook {
             before_asks.try_emplace(price, lookup_aggregate(Side::Ask, price));
         }
 
-        // Re-validates (already checked above, but book_.apply_batch()
-        // has to hold that guarantee on its own for callers that don't
-        // pre-validate) then applies - both branches already validated
-        // this exact bids/asks above, so this can only fail on
-        // allocation, matching book_.apply_delta()'s own documented
-        // not-rolled-back-partway limitation.
+        // Re-validates (already checked above, but book_.apply_batch() -
+        // and, one layer further in, apply_delta()'s own require_valid_level()
+        // - has to hold that guarantee on its own for callers that don't
+        // pre-validate) then applies. Three validation layers deep by the
+        // time a level reaches require_valid_level() is intentional
+        // defense in depth, not a sign any one of them is redundant to
+        // remove - each guards a different caller (this class's own
+        // pre-check above is the only one skipped by calling book_ directly).
+        // Given this exact bids/asks already passed the check above,
+        // this can only fail on allocation here, matching
+        // book_.apply_delta()'s own documented not-rolled-back-partway
+        // limitation.
         if (auto result = book_.apply_batch(venue, bids, asks); !result) return result;
 
         std::vector<Change> changed;

@@ -28,12 +28,12 @@ enum class Side { Bid, Ask };
 class AggregateOrderBook {
   public:
     // A `size` of zero removes that venue's level (Binance L2 diff semantics).
-    // Returns std::errc::invalid_argument if `size` is negative, or
-    // std::errc::not_enough_memory if a new venue's book could not be
-    // allocated.
+    // Returns std::errc::invalid_argument if `price` is not positive or
+    // `size` is negative, or std::errc::not_enough_memory if a new venue's
+    // book could not be allocated.
     std::expected<void, std::errc> apply_delta(const VenueId& venue, Side side, Price price,
                                                 Size size) noexcept {
-        if (auto check = require_non_negative_size(size); !check) return check;
+        if (auto check = require_valid_level(price, size); !check) return check;
 
         try {
             auto& venue_book = venues_[venue];
@@ -69,12 +69,13 @@ class AggregateOrderBook {
     // Any price the venue previously held that is absent from `levels` is
     // treated as removed. Use this to resynchronize after invalidate_venue().
     // Returns std::errc::invalid_argument, without modifying any state, if
-    // any level's size is negative, or std::errc::not_enough_memory if
-    // allocation fails partway through applying the snapshot.
+    // any level's price is not positive or its size is negative, or
+    // std::errc::not_enough_memory if allocation fails partway through
+    // applying the snapshot.
     std::expected<void, std::errc> apply_snapshot(
         const VenueId& venue, Side side, std::span<const std::pair<Price, Size>> levels) noexcept {
         for (const auto& level : levels) {
-            if (auto check = require_non_negative_size(level.second); !check) return check;
+            if (auto check = require_valid_level(level.first, level.second); !check) return check;
         }
 
         try {
@@ -96,7 +97,7 @@ class AggregateOrderBook {
     // whole batch as one atomic revision (one sequence bump, one
     // broadcast - see aggregator::SymbolBook::apply_batch) hook that
     // behavior onto exactly one call instead of reimplementing this same
-    // validate-then-apply shape itself. Same per-level negative-size
+    // validate-then-apply shape itself. Same per-level price/size
     // rejection as apply_delta, checked for every level before any of
     // them is applied, so a bad level anywhere in the batch leaves the
     // book untouched rather than partially updated for that reason
@@ -106,10 +107,10 @@ class AggregateOrderBook {
                                                 std::span<const std::pair<Price, Size>> bids,
                                                 std::span<const std::pair<Price, Size>> asks) noexcept {
         for (const auto& [price, size] : bids) {
-            if (auto check = require_non_negative_size(size); !check) return check;
+            if (auto check = require_valid_level(price, size); !check) return check;
         }
         for (const auto& [price, size] : asks) {
-            if (auto check = require_non_negative_size(size); !check) return check;
+            if (auto check = require_valid_level(price, size); !check) return check;
         }
 
         for (const auto& [price, size] : bids) {
@@ -125,7 +126,20 @@ class AggregateOrderBook {
     const std::unordered_map<VenueId, L2OrderBook>& venues() const noexcept { return venues_; }
 
   private:
-    static std::expected<void, std::errc> require_non_negative_size(Size size) noexcept {
+    // Rejects a level with a non-positive price or a negative size before
+    // it ever reaches venue_/aggregate_'s maps. A non-positive price used
+    // to pass through unchecked (only size was validated) - it would sort
+    // into the book like any other price, and price_bands.hpp's
+    // offset_by_bps()/within_bps() only assert() their own price>0
+    // precondition, which is compiled out under NDEBUG - so a malformed
+    // upstream message (a parse bug, or price_raw==0/negative on the wire)
+    // could silently corrupt band computations in a release build instead
+    // of being rejected here, at the one place that actually sees every
+    // level before it becomes part of the book's persistent state.
+    static std::expected<void, std::errc> require_valid_level(Price price, Size size) noexcept {
+        if (price.raw() <= 0) {
+            return std::unexpected(std::errc::invalid_argument);
+        }
         if (size.raw() < 0) {
             return std::unexpected(std::errc::invalid_argument);
         }

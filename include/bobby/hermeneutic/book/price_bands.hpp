@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <expected>
 #include <limits>
 #include <span>
+#include <system_error>
 #include <vector>
 
 #include "bobby/hermeneutic/book/l2_order_book.hpp"
@@ -82,9 +84,21 @@ constexpr bool within_bps(Price price, Price best_price, int signed_bps, bool ge
 // `levels` itself rather than passed separately, so it can't mismatch the
 // map it's derived from. `bps_sign` is +1 for asks, -1 for bids; a level
 // exactly at a boundary counts as within it. O(levels + bps_thresholds).
+//
+// Fails with std::errc::argument_out_of_domain if any level has a
+// non-positive price (or a negative size), checked as each level is
+// walked - same rationale as volume_band_prices()'s own per-level check:
+// `levels` is the caller's own already-mutated book, not something this
+// function controls, so a level that shouldn't exist (a malformed
+// upstream message that slipped past whatever inserted it) is a runtime
+// condition this must reject, not an assert()-only precondition that
+// silently no-ops in a release build. offset_by_bps()/within_bps() below
+// only assert() their own price>0 precondition precisely because this
+// function is what's responsible for upholding it before ever calling
+// them - never validated twice.
 template <typename Map>
-std::vector<PriceBand> price_band_depth(const Map& levels, int bps_sign,
-                                         std::span<const int> bps_thresholds) {
+std::expected<std::vector<PriceBand>, std::errc> price_band_depth(
+    const Map& levels, int bps_sign, std::span<const int> bps_thresholds) {
     assert(bps_sign == 1 || bps_sign == -1);
     assert(std::ranges::is_sorted(bps_thresholds));
     assert(std::ranges::all_of(bps_thresholds, [](int bps) { return bps >= 0; }));
@@ -94,6 +108,8 @@ std::vector<PriceBand> price_band_depth(const Map& levels, int bps_sign,
     std::vector<PriceBand> result;
     result.reserve(bps_thresholds.size());
     if (levels.empty()) return result;  // no BBO to offset from -> no bands
+    // best_price is levels.begin()->first, which the loop below validates
+    // on its own first iteration (no separate check needed here).
     Price best_price = levels.begin()->first;
 
     Size cum_size{};
@@ -102,6 +118,10 @@ std::vector<PriceBand> price_band_depth(const Map& levels, int bps_sign,
     bool round_down = bps_sign >= 0;  // ask boundary rounds down, bid rounds up: both inward.
 
     for (const auto& [price, size] : levels) {
+        if (price.raw() <= 0 || size.raw() < 0) {
+            return std::unexpected(std::errc::argument_out_of_domain);
+        }
+
         while (next < bps_thresholds.size()) {
             int signed_bps = bps_sign * bps_thresholds[next];
             bool within = detail::within_bps(price, best_price, signed_bps, /*ge=*/bps_sign < 0);
@@ -126,13 +146,13 @@ std::vector<PriceBand> price_band_depth(const Map& levels, int bps_sign,
     return result;
 }
 
-inline std::vector<PriceBand> bid_price_band_depths(const L2OrderBook& book,
-                                                      std::span<const int> bps_thresholds) {
+inline std::expected<std::vector<PriceBand>, std::errc> bid_price_band_depths(
+    const L2OrderBook& book, std::span<const int> bps_thresholds) {
     return price_band_depth(book.bids, -1, bps_thresholds);
 }
 
-inline std::vector<PriceBand> ask_price_band_depths(const L2OrderBook& book,
-                                                      std::span<const int> bps_thresholds) {
+inline std::expected<std::vector<PriceBand>, std::errc> ask_price_band_depths(
+    const L2OrderBook& book, std::span<const int> bps_thresholds) {
     return price_band_depth(book.asks, +1, bps_thresholds);
 }
 

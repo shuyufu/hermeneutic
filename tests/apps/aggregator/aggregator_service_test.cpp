@@ -519,6 +519,33 @@ TEST_F(AggregatorServiceTest, ApplyBatchRejectsNegativeSizeWithoutMutatingOrBroa
     EXPECT_EQ(msg.diff().bids(0).price_raw(), Price(100.0).raw());
 }
 
+// Same as the negative-size case above, but for a non-positive price -
+// this class's own pre-validation loop (the cheap rejection before
+// mutex_/before_bids/before_asks) has to check price too, not just size,
+// or a bad price would sail through it and only get caught later by
+// book_.apply_batch()'s own validation - still correct, but after paying
+// for lookups this batch was always going to fail anyway.
+TEST_F(AggregatorServiceTest, ApplyBatchRejectsNonPositivePriceWithoutMutatingOrBroadcasting) {
+    updates_.wait_for(0);  // initial snapshot
+
+    std::array<std::pair<Price, Size>, 2> bad_bids{{
+        {Price(100.0), Size(1.0)},
+        {Price::from_raw(0), Size(1.0)},
+    }};
+    auto bad = book().apply_batch(kBinance, bad_bids, {});
+    ASSERT_FALSE(bad.has_value());
+    EXPECT_EQ(bad.error(), std::errc::invalid_argument);
+
+    // Neither level from the rejected batch was applied: a good call right
+    // after must be seq 1 / the second message, not seq 2 / the third.
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0)).has_value());
+    L2Update msg = updates_.wait_for(1);
+    ASSERT_TRUE(msg.has_diff());
+    EXPECT_EQ(msg.diff().book_seq(), 1u);
+    ASSERT_EQ(msg.diff().bids_size(), 1);
+    EXPECT_EQ(msg.diff().bids(0).price_raw(), Price(100.0).raw());
+}
+
 TEST_F(AggregatorServiceTest, StuckSubscriberDoesNotBlockIngestionOrOtherSubscribers) {
     updates_.wait_for(0);  // initial snapshot for the fixture's own (fast) subscriber
 

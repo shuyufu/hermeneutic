@@ -2,6 +2,7 @@
 
 #include <array>
 #include <span>
+#include <system_error>
 
 #include <gtest/gtest.h>
 
@@ -35,7 +36,9 @@ TEST(PriceBands, AskExcludesLevelJustBeyondTheExactBpsBoundary) {
     book.asks[Price::from_raw(5)] = Size(1.0);
     book.asks[Price::from_raw(6)] = Size(1.0);
 
-    auto bands = ask_price_band_depths(book, std::array{1000});
+    auto result = ask_price_band_depths(book, std::array{1000});
+    ASSERT_TRUE(result.has_value());
+    const auto& bands = *result;
 
     ASSERT_EQ(bands.size(), 1u);
     EXPECT_EQ(bands[0].boundary_price.raw(), 5);
@@ -50,7 +53,9 @@ TEST(PriceBands, BidExcludesLevelJustBeyondTheExactBpsBoundary) {
     book.bids[Price::from_raw(6)] = Size(1.0);
     book.bids[Price::from_raw(5)] = Size(1.0);
 
-    auto bands = bid_price_band_depths(book, std::array{1000});
+    auto result = bid_price_band_depths(book, std::array{1000});
+    ASSERT_TRUE(result.has_value());
+    const auto& bands = *result;
 
     ASSERT_EQ(bands.size(), 1u);
     EXPECT_EQ(bands[0].boundary_price.raw(), 6);
@@ -81,7 +86,9 @@ TEST(PriceBands, AskBandsWalkBestAskFirstAndIncludeBoundaryInclusive) {
     book.asks[Price(103.0)] = Size(10.0);  // beyond every threshold
 
     std::vector<int> bps_thresholds = {50, 100, 200};
-    auto bands = ask_price_band_depths(book, bps_thresholds);
+    auto result = ask_price_band_depths(book, bps_thresholds);
+    ASSERT_TRUE(result.has_value());
+    const auto& bands = *result;
 
     ASSERT_EQ(bands.size(), 3u);
 
@@ -109,7 +116,9 @@ TEST(PriceBands, BidBandsWalkBestBidFirstAndOffsetDownward) {
     book.bids[Price(98.5)] = Size(1.0);   // beyond 100bps
 
     std::vector<int> bps_thresholds = {50, 100};
-    auto bands = bid_price_band_depths(book, bps_thresholds);
+    auto result = bid_price_band_depths(book, bps_thresholds);
+    ASSERT_TRUE(result.has_value());
+    const auto& bands = *result;
 
     ASSERT_EQ(bands.size(), 2u);
 
@@ -127,7 +136,9 @@ TEST(PriceBands, ThresholdsBeyondBookDepthReportTheWholeBookNotAFailure) {
     book.asks[Price(100.0)] = Size(5.0);
 
     std::vector<int> bps_thresholds = {50, 10'000};
-    auto bands = ask_price_band_depths(book, bps_thresholds);
+    auto result = ask_price_band_depths(book, bps_thresholds);
+    ASSERT_TRUE(result.has_value());
+    const auto& bands = *result;
 
     ASSERT_EQ(bands.size(), 2u);
     EXPECT_EQ(bands[0].cumulative_size, Size(5.0));
@@ -147,7 +158,9 @@ TEST(PriceBands, BidBoundaryIsDerivedFromTheHighestBidNotAnyOtherLevel) {
     book.bids[Price(99.0)] = Size(1.0);
     book.bids[Price(98.0)] = Size(1.0);
 
-    auto bands = bid_price_band_depths(book, std::array{50});
+    auto result = bid_price_band_depths(book, std::array{50});
+    ASSERT_TRUE(result.has_value());
+    const auto& bands = *result;
 
     ASSERT_EQ(bands.size(), 1u);
     EXPECT_EQ(bands[0].boundary_price, Price(99.5));
@@ -163,23 +176,29 @@ TEST(PriceBands, AcceptsThresholdsFromNonVectorContiguousStorage) {
     book.asks[Price(101.0)] = Size(4.0);
 
     std::array<int, 2> bps_thresholds = {50, 100};
-    auto bands = ask_price_band_depths(book, bps_thresholds);
-    EXPECT_EQ(bands.size(), 2u);
+    auto result = ask_price_band_depths(book, bps_thresholds);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->size(), 2u);
 
     std::array<int, 4> wider_buffer = {0, 0, 50, 100};
     std::span<const int> sub(wider_buffer.begin() + 2, 2);
     auto from_subspan = ask_price_band_depths(book, sub);
-    ASSERT_EQ(from_subspan.size(), 2u);
-    EXPECT_EQ(from_subspan[0].bps, 50);
-    EXPECT_EQ(from_subspan[1].bps, 100);
+    ASSERT_TRUE(from_subspan.has_value());
+    ASSERT_EQ(from_subspan->size(), 2u);
+    EXPECT_EQ((*from_subspan)[0].bps, 50);
+    EXPECT_EQ((*from_subspan)[1].bps, 100);
 }
 
 TEST(PriceBands, EmptyBookReturnsNoBands) {
     L2OrderBook book;
     std::vector<int> bps_thresholds = {50, 100};
 
-    EXPECT_TRUE(ask_price_band_depths(book, bps_thresholds).empty());
-    EXPECT_TRUE(bid_price_band_depths(book, bps_thresholds).empty());
+    auto ask_result = ask_price_band_depths(book, bps_thresholds);
+    auto bid_result = bid_price_band_depths(book, bps_thresholds);
+    ASSERT_TRUE(ask_result.has_value());
+    ASSERT_TRUE(bid_result.has_value());
+    EXPECT_TRUE(ask_result->empty());
+    EXPECT_TRUE(bid_result->empty());
 }
 
 TEST(PriceBands, ZeroBpsIncludesOnlyTheAggregatedBboLevel) {
@@ -190,7 +209,9 @@ TEST(PriceBands, ZeroBpsIncludesOnlyTheAggregatedBboLevel) {
     book.asks[Price(100.0)] = Size(3.0);
     book.asks[Price(100.1)] = Size(3.0);
 
-    auto bands = ask_price_band_depths(book, std::array{0});
+    auto result = ask_price_band_depths(book, std::array{0});
+    ASSERT_TRUE(result.has_value());
+    const auto& bands = *result;
 
     ASSERT_EQ(bands.size(), 1u);
     EXPECT_EQ(bands[0].boundary_price, Price(100.0));
@@ -202,7 +223,9 @@ TEST(PriceBands, DuplicateThresholdsProduceOneBandEachNotDeduplicated) {
     book.asks[Price(100.0)] = Size(5.0);
     book.asks[Price(101.0)] = Size(4.0);  // beyond 50bps (100.5), within 100bps
 
-    auto bands = ask_price_band_depths(book, std::array{50, 50, 100});
+    auto result = ask_price_band_depths(book, std::array{50, 50, 100});
+    ASSERT_TRUE(result.has_value());
+    const auto& bands = *result;
 
     ASSERT_EQ(bands.size(), 3u);
     EXPECT_EQ(bands[0].bps, 50);
@@ -222,10 +245,52 @@ TEST(PriceBands, BidBps9999IsAcceptedAtTheEdgeOfTheValidRange) {
     L2OrderBook book;
     book.bids[Price(100.0)] = Size(1.0);
 
-    auto bands = bid_price_band_depths(book, std::array{9999});
+    auto result = bid_price_band_depths(book, std::array{9999});
+    ASSERT_TRUE(result.has_value());
+    const auto& bands = *result;
 
     ASSERT_EQ(bands.size(), 1u);
     EXPECT_EQ(bands[0].cumulative_size, Size(1.0));
+}
+
+// Mirrors volume_bands_test.cpp's own RejectsNegativePriceLevel/
+// ZeroPriceLevelReportsArgumentOutOfDomainInsteadOfCrashing: a level with a
+// non-positive price must be rejected with std::errc::argument_out_of_domain
+// (a real runtime check), not silently walked over into offset_by_bps()/
+// within_bps(), whose own price>0 precondition is only assert()-checked
+// (compiled out under NDEBUG).
+TEST(PriceBands, RejectsNegativePriceLevel) {
+    L2OrderBook book;
+    book.asks[Price::from_raw(-1)] = Size(1.0);
+
+    auto result = ask_price_band_depths(book, std::array{50});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), std::errc::argument_out_of_domain);
+}
+
+TEST(PriceBands, RejectsZeroPriceLevel) {
+    L2OrderBook book;
+    book.bids[Price::from_raw(0)] = Size(1.0);
+
+    auto result = bid_price_band_depths(book, std::array{50});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), std::errc::argument_out_of_domain);
+}
+
+// The bad level doesn't have to be the best price - price_band_depth()
+// checks every level it walks, not just levels.begin()->first. bids sort
+// descending (best = highest first, see l2_order_book.hpp), so a
+// non-positive price - always numerically the smallest possible - sorts
+// last here, unlike on the ask side where it would sort first (ascending)
+// and always coincide with the best-price case instead.
+TEST(PriceBands, RejectsNonPositivePriceLevelEvenWhenNotTheBest) {
+    L2OrderBook book;
+    book.bids[Price(100.0)] = Size(1.0);        // valid best bid
+    book.bids[Price::from_raw(0)] = Size(1.0);  // malformed, sorts last
+
+    auto result = bid_price_band_depths(book, std::array{50});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), std::errc::argument_out_of_domain);
 }
 
 }  // namespace

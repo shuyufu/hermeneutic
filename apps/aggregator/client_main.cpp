@@ -181,6 +181,21 @@ std::string format_price_bands(const std::vector<PriceBand>& bands) {
 // either way, see aggregator.proto's PriceLevel/L2Diff comment. `Levels` is
 // left as a template parameter (rather than naming the protobuf
 // RepeatedPtrField type) purely to avoid an extra include here.
+//
+// Deliberately does not validate price_raw/size_raw itself (unlike
+// AggregateOrderBook::apply_delta()'s require_valid_level() on the
+// server side, which rejects a non-positive price or negative size
+// before it ever reaches a book): a wire-level malformed value here would
+// still get caught downstream, by price_band_depth()/volume_band_prices()
+// erroring out on the next print_bands() call - printing "ERROR" for that
+// side going forward rather than silently computing a wrong band. That's
+// an accepted, known-limited response (the bad level stays in the local
+// book forever; nothing here removes it or breaks the stream the way a
+// book_seq gap does), not an oversight - this is a diagnostic client, and
+// "ERROR" already surfaces the problem to whoever's watching it, which
+// was this fix's actual goal. A gap-triggered break()-out-of-read-loop
+// treatment for this case, if ever wanted, is future scope, not implied
+// by fixing the validation gap itself.
 template <typename Map, typename Levels>
 void apply_levels(Map& side, const Levels& levels) {
     for (const auto& level : levels) {
@@ -315,8 +330,10 @@ void publish_l2_bands(Mode mode, const std::string& address, const BookId& book_
             line << " bid[" << (bids.has_value() ? format_volume_bands(*bids) : std::string("ERROR")) << "]";
             line << " ask[" << (asks.has_value() ? format_volume_bands(*asks) : std::string("ERROR")) << "]";
         } else {
-            line << " bid[" << format_price_bands(bid_price_band_depths(book, kPriceBandBps)) << "]";
-            line << " ask[" << format_price_bands(ask_price_band_depths(book, kPriceBandBps)) << "]";
+            auto bids = bid_price_band_depths(book, kPriceBandBps);
+            auto asks = ask_price_band_depths(book, kPriceBandBps);
+            line << " bid[" << (bids.has_value() ? format_price_bands(*bids) : std::string("ERROR")) << "]";
+            line << " ask[" << (asks.has_value() ? format_price_bands(*asks) : std::string("ERROR")) << "]";
         }
         std::string result = line.str();
         print_line("[" + label + " " + mode_tag + "] " + result);

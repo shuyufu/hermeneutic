@@ -205,5 +205,43 @@ TEST(AggregateOrderBook, ApplySnapshotRejectsNegativeSizeAtomically) {
     EXPECT_EQ(book.venues().at(kBinance).asks.count(Price(101.0)), 0u);
 }
 
+// A non-positive price used to pass through unchecked (only size was
+// validated) - see require_valid_level()'s own comment. Both zero and
+// negative are rejected the same way size's own <0 check is: with
+// std::errc::invalid_argument and no state mutated.
+TEST(AggregateOrderBook, ApplyDeltaRejectsNonPositivePrice) {
+    AggregateOrderBook book;
+    book.apply_delta(kBinance, Side::Bid, Price(99.0), Size(1.0));
+
+    auto zero_result = book.apply_delta(kBinance, Side::Bid, Price::from_raw(0), Size(1.0));
+    ASSERT_FALSE(zero_result.has_value());
+    EXPECT_EQ(zero_result.error(), std::errc::invalid_argument);
+
+    auto negative_result = book.apply_delta(kBinance, Side::Bid, Price::from_raw(-1), Size(1.0));
+    ASSERT_FALSE(negative_result.has_value());
+    EXPECT_EQ(negative_result.error(), std::errc::invalid_argument);
+
+    // Neither rejected call mutated any state.
+    EXPECT_EQ(book.aggregate().bids.count(Price::from_raw(0)), 0u);
+    EXPECT_EQ(book.aggregate().bids.count(Price::from_raw(-1)), 0u);
+    EXPECT_EQ(book.aggregate().bids.at(Price(99.0)), Size(1.0));
+}
+
+TEST(AggregateOrderBook, ApplySnapshotRejectsNonPositivePriceAtomically) {
+    AggregateOrderBook book;
+    book.apply_delta(kBinance, Side::Ask, Price(100.0), Size(1.0));
+
+    const std::array snapshot = {std::pair{Price(100.0), Size(2.0)},
+                                  std::pair{Price::from_raw(0), Size(1.0)}};
+    auto result = book.apply_snapshot(kBinance, Side::Ask, snapshot);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), std::errc::invalid_argument);
+
+    // Validation must run before any level is touched.
+    EXPECT_EQ(book.venues().at(kBinance).asks.at(Price(100.0)), Size(1.0));
+    EXPECT_EQ(book.aggregate().asks.at(Price(100.0)), Size(1.0));
+    EXPECT_EQ(book.venues().at(kBinance).asks.count(Price::from_raw(0)), 0u);
+}
+
 }  // namespace
 }  // namespace bobby::hermeneutic
