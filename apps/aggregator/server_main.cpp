@@ -107,16 +107,15 @@ int main(int argc, char** argv) {
     }
     const std::vector<VenueSubscription>& subscriptions = *parsed;
 
-    // AggregatorService's book set is keyed by canonical, venue-neutral
-    // book keys ("BTCUSDT.SPOT"/"BTCUSDT.PERP") - deduplicated here, in
-    // first-seen order, since several subscriptions (one per venue) share
-    // the same book_key and AggregatorService requires unique entries.
-    std::vector<std::string> book_symbols;
+    // AggregatorService's book set is keyed by symbol::BookId - deduplicated
+    // here, in first-seen order, since several subscriptions (one per venue)
+    // share the same book_id and AggregatorService requires unique entries.
+    std::vector<bobby::hermeneutic::symbol::BookId> book_symbols;
     {
-        std::unordered_set<std::string> seen;
+        std::unordered_set<bobby::hermeneutic::symbol::BookId> seen;
         book_symbols.reserve(subscriptions.size());
         for (const auto& sub : subscriptions) {
-            if (seen.insert(sub.book_key).second) book_symbols.push_back(sub.book_key);
+            if (seen.insert(sub.book_id).second) book_symbols.push_back(sub.book_id);
         }
     }
 
@@ -184,8 +183,7 @@ int main(int argc, char** argv) {
     // symbol. Each subscription's own registry entry is keyed by its
     // native_symbol (what the venue's Feed actually subscribes with and what
     // dispatch_snapshot/dispatch_depth_update look it up by - see
-    // venue_session.hpp), pointing at the book its canonical book_key
-    // resolves to.
+    // venue_session.hpp), pointing at the book its BookId resolves to.
     ::VenueGroups groups;
     for (const auto& sub : subscriptions) {
         auto& group = groups[{sub.venue, sub.type}];
@@ -194,7 +192,7 @@ int main(int argc, char** argv) {
         // so this can never miss - asserted, not runtime-checked, the same
         // startup-invariant treatment AggregatorService's own constructor
         // gives its unique-symbols precondition.
-        auto* book = service.book(sub.book_key);
+        auto* book = service.book(sub.book_id);
         assert(book);
         group.registry.add(sub.native_symbol, book);
     }
@@ -226,7 +224,7 @@ int main(int argc, char** argv) {
 
     std::cout << "hermeneutic_aggregator_service listening on " << address << " for " << book_symbols.size()
               << " book(s):";
-    for (const auto& symbol : book_symbols) std::cout << ' ' << symbol;
+    for (const auto& id : book_symbols) std::cout << ' ' << bobby::hermeneutic::symbol::to_string(id);
     std::cout << ", ingesting from";
     for (const auto& venue : wired_venues) std::cout << ' ' << venue;
     std::cout << std::endl;

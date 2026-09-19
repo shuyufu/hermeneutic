@@ -10,23 +10,29 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
 
+#include "apps/aggregator/book_id.hpp"
+#include "bobby/hermeneutic/symbol/symbol.hpp"
+
 namespace bobby::hermeneutic::aggregator {
 namespace {
 
-SubscribeL2DiffRequest subscribe_l2_diff_request(std::string_view symbol) {
+using bobby::hermeneutic::symbol::BaseQuote;
+using bobby::hermeneutic::symbol::BookId;
+using bobby::hermeneutic::symbol::BookType;
+
+SubscribeL2DiffRequest subscribe_l2_diff_request(const BookId& book_id) {
     SubscribeL2DiffRequest request;
-    request.set_symbol(std::string(symbol));
+    fill_wire_book_id(request.mutable_book(), book_id);
     return request;
 }
 
-SubscribeBboRequest subscribe_bbo_request(std::string_view symbol) {
+SubscribeBboRequest subscribe_bbo_request(const BookId& book_id) {
     SubscribeBboRequest request;
-    request.set_symbol(std::string(symbol));
+    fill_wire_book_id(request.mutable_book(), book_id);
     return request;
 }
 
@@ -78,9 +84,9 @@ struct BboSubscription {
     }
 };
 
-std::unique_ptr<BboSubscription> subscribe_bbo(Aggregator::Stub& stub, std::string_view symbol) {
+std::unique_ptr<BboSubscription> subscribe_bbo(Aggregator::Stub& stub, const BookId& book_id) {
     auto sub = std::make_unique<BboSubscription>();
-    sub->reader = stub.SubscribeBbo(&sub->context, subscribe_bbo_request(symbol));
+    sub->reader = stub.SubscribeBbo(&sub->context, subscribe_bbo_request(book_id));
     sub->thread = std::thread([raw = sub.get()] {
         BboUpdate update;
         while (raw->reader->Read(&update)) raw->updates.push(update);
@@ -154,9 +160,9 @@ TEST(SubscriberQueueTest, DropOldestOverflowKeepsNewestWithoutClosing) {
 
 class AggregatorServiceTest : public ::testing::Test {
   protected:
-    static constexpr std::string_view kSymbol = "BTCUSDT";
+    static BookId TestBook() { return BookId{BaseQuote{"BTC", "USDT"}, BookType::Spot}; }
 
-    AggregatorServiceTest() : service_(std::vector<std::string>{std::string(kSymbol)}) {}
+    AggregatorServiceTest() : service_(std::vector<BookId>{TestBook()}) {}
 
     // Starts a real server on an ephemeral port and a real client stub
     // against it, so this exercises the actual gRPC wire path rather than
@@ -173,7 +179,7 @@ class AggregatorServiceTest : public ::testing::Test {
                                             grpc::InsecureChannelCredentials());
         stub_ = Aggregator::NewStub(channel);
 
-        reader_ = stub_->SubscribeL2Diff(&context_, subscribe_l2_diff_request(kSymbol));
+        reader_ = stub_->SubscribeL2Diff(&context_, subscribe_l2_diff_request(TestBook()));
         reader_thread_ = std::thread([this] {
             L2Update update;
             while (reader_->Read(&update)) {
@@ -193,9 +199,11 @@ class AggregatorServiceTest : public ::testing::Test {
     // would - the fixture used to expose apply_delta/apply_snapshot/
     // invalidate_venue/send_heartbeat straight on AggregatorService, back
     // when it wrapped exactly one symbol.
-    SymbolBook& book() { return *service_.book(kSymbol); }
+    SymbolBook& book() { return *service_.book(TestBook()); }
 
-    std::unique_ptr<BboSubscription> subscribe_bbo() { return ::bobby::hermeneutic::aggregator::subscribe_bbo(*stub_, kSymbol); }
+    std::unique_ptr<BboSubscription> subscribe_bbo() {
+        return ::bobby::hermeneutic::aggregator::subscribe_bbo(*stub_, TestBook());
+    }
 
     AggregatorService service_;
     std::unique_ptr<grpc::Server> server_;
@@ -354,7 +362,7 @@ TEST_F(AggregatorServiceTest, SnapshotOrderingMatchesBookConvention) {
     // ordering directly in its initial snapshot: bids descending, asks
     // ascending.
     grpc::ClientContext second_context;
-    auto second_reader = stub_->SubscribeL2Diff(&second_context, subscribe_l2_diff_request(kSymbol));
+    auto second_reader = stub_->SubscribeL2Diff(&second_context, subscribe_l2_diff_request(TestBook()));
     L2Update snapshot_msg;
     ASSERT_TRUE(second_reader->Read(&snapshot_msg));
     second_context.TryCancel();
@@ -513,7 +521,7 @@ TEST_F(AggregatorServiceTest, StuckSubscriberDoesNotBlockIngestionOrOtherSubscri
     // queue has overflowed yet, which depends on OS-level socket buffering
     // this test doesn't control and so doesn't assert on.
     grpc::ClientContext stuck_context;
-    auto stuck_reader = stub_->SubscribeL2Diff(&stuck_context, subscribe_l2_diff_request(kSymbol));
+    auto stuck_reader = stub_->SubscribeL2Diff(&stuck_context, subscribe_l2_diff_request(TestBook()));
 
     // Stays comfortably under kSubscriberQueueCapacity (256): this test is
     // about a non-draining subscriber not blocking anyone else, not about
@@ -672,7 +680,7 @@ TEST_F(AggregatorServiceTest, StuckBboSubscriberDoesNotBlockIngestionOrOtherSubs
     // that's stopped draining - mirrors StuckSubscriberDoesNotBlock
     // IngestionOrOtherSubscribers above, but for the BBO stream/queue.
     grpc::ClientContext stuck_context;
-    auto stuck_reader = stub_->SubscribeBbo(&stuck_context, subscribe_bbo_request(kSymbol));
+    auto stuck_reader = stub_->SubscribeBbo(&stuck_context, subscribe_bbo_request(TestBook()));
 
     auto bbo_sub = subscribe_bbo();
     bbo_sub->updates.wait_for(0);  // initial (empty) Bbo for the fast BBO subscriber
@@ -700,9 +708,12 @@ TEST_F(AggregatorServiceTest, StuckBboSubscriberDoesNotBlockIngestionOrOtherSubs
 // AggregatorService instance rather than the fixture's single-symbol one.
 class MultiSymbolAggregatorServiceTest : public ::testing::Test {
   protected:
+    static BookId BtcBook() { return BookId{BaseQuote{"BTC", "USDT"}, BookType::Spot}; }
+    static BookId EthBook() { return BookId{BaseQuote{"ETH", "USDT"}, BookType::Spot}; }
+
     void SetUp() override {
-        std::vector<std::string> symbols{"BTCUSDT", "ETHUSDT"};
-        service_ = std::make_unique<AggregatorService>(symbols);
+        std::vector<BookId> books{BtcBook(), EthBook()};
+        service_ = std::make_unique<AggregatorService>(books);
 
         grpc::ServerBuilder builder;
         int port = 0;
@@ -725,7 +736,7 @@ class MultiSymbolAggregatorServiceTest : public ::testing::Test {
 
 TEST_F(MultiSymbolAggregatorServiceTest, SymbolsAreFullyIsolated) {
     grpc::ClientContext btc_context;
-    auto btc_reader = stub_->SubscribeL2Diff(&btc_context, subscribe_l2_diff_request("BTCUSDT"));
+    auto btc_reader = stub_->SubscribeL2Diff(&btc_context, subscribe_l2_diff_request(BtcBook()));
     UpdateQueue<L2Update> btc_updates;
     std::thread btc_thread([&] {
         L2Update update;
@@ -733,7 +744,7 @@ TEST_F(MultiSymbolAggregatorServiceTest, SymbolsAreFullyIsolated) {
     });
 
     grpc::ClientContext eth_context;
-    auto eth_reader = stub_->SubscribeL2Diff(&eth_context, subscribe_l2_diff_request("ETHUSDT"));
+    auto eth_reader = stub_->SubscribeL2Diff(&eth_context, subscribe_l2_diff_request(EthBook()));
     UpdateQueue<L2Update> eth_updates;
     std::thread eth_thread([&] {
         L2Update update;
@@ -743,24 +754,24 @@ TEST_F(MultiSymbolAggregatorServiceTest, SymbolsAreFullyIsolated) {
     btc_updates.wait_for(0);  // initial snapshot
     eth_updates.wait_for(0);
 
-    // Ingestion routes through AggregatorService::book(symbol), the same
+    // Ingestion routes through AggregatorService::book(id), the same
     // interface a real ingestion dispatch layer would use to reach the
     // right SymbolBook directly.
-    ASSERT_TRUE(service_->book("BTCUSDT")
+    ASSERT_TRUE(service_->book(BtcBook())
                     ->apply_delta("binance", Side::Bid, Price(100.0), Size(1.0))
                     .has_value());
     L2Update btc_diff = btc_updates.wait_for(1);
     ASSERT_TRUE(btc_diff.has_diff());
     EXPECT_EQ(btc_diff.diff().book_seq(), 1u);
 
-    ASSERT_TRUE(service_->book("ETHUSDT")
+    ASSERT_TRUE(service_->book(EthBook())
                     ->apply_delta("binance", Side::Ask, Price(2000.0), Size(3.0))
                     .has_value());
     L2Update eth_diff = eth_updates.wait_for(1);
     ASSERT_TRUE(eth_diff.has_diff());
-    // ETHUSDT's own seq starts independently at 1, not "2" - proof the two
-    // symbols don't share a seq counter (or anything else): BTCUSDT's
-    // update above must never have reached ETHUSDT's subscriber, and
+    // ETH's own seq starts independently at 1, not "2" - proof the two
+    // symbols don't share a seq counter (or anything else): BTC's
+    // update above must never have reached ETH's subscriber, and
     // vice versa below.
     EXPECT_EQ(eth_diff.diff().book_seq(), 1u);
     ASSERT_EQ(eth_diff.diff().asks_size(), 1);
@@ -774,14 +785,36 @@ TEST_F(MultiSymbolAggregatorServiceTest, SymbolsAreFullyIsolated) {
 }
 
 TEST_F(MultiSymbolAggregatorServiceTest, UnknownSymbolFailsWithNotFound) {
+    // A well-formed BookId (valid base/quote/market) that just isn't one of
+    // this server's two books - distinct from a malformed request, see
+    // MalformedBookFailsWithInvalidArgument below.
     grpc::ClientContext context;
-    auto reader = stub_->SubscribeL2Diff(&context, subscribe_l2_diff_request("DOGEUSDT"));
+    auto reader = stub_->SubscribeL2Diff(
+        &context, subscribe_l2_diff_request(BookId{BaseQuote{"DOGE", "USDT"}, BookType::Spot}));
 
     L2Update update;
     EXPECT_FALSE(reader->Read(&update));  // no snapshot ever sent - the RPC fails immediately
 
     grpc::Status status = reader->Finish();
     EXPECT_EQ(status.error_code(), grpc::StatusCode::NOT_FOUND);
+}
+
+TEST_F(MultiSymbolAggregatorServiceTest, MalformedBookFailsWithInvalidArgument) {
+    // Left unset: proto3 defaults base/quote to "" and market to
+    // MARKET_TYPE_UNSPECIFIED - a malformed request no well-formed client
+    // could produce via fill_wire_book_id(), but still a possible message
+    // on the wire (a stale/buggy client, or nothing set at all). Must fail
+    // differently from UnknownSymbolFailsWithNotFound above - INVALID_ARGUMENT
+    // for "not a book at all", not NOT_FOUND for "not one of ours".
+    grpc::ClientContext context;
+    SubscribeL2DiffRequest request;
+    auto reader = stub_->SubscribeL2Diff(&context, request);
+
+    L2Update update;
+    EXPECT_FALSE(reader->Read(&update));
+
+    grpc::Status status = reader->Finish();
+    EXPECT_EQ(status.error_code(), grpc::StatusCode::INVALID_ARGUMENT);
 }
 
 }  // namespace

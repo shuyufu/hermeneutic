@@ -21,7 +21,9 @@
 // never checking it.
 #include <grpcpp/grpcpp.h>
 
+#include "apps/aggregator/book_id.hpp"
 #include "bobby/hermeneutic/aggregator/aggregator.grpc.pb.h"
+#include "bobby/hermeneutic/symbol/symbol.hpp"
 
 #include <array>
 #include <atomic>
@@ -54,10 +56,13 @@ using bobby::hermeneutic::bid_volume_band_prices;
 
 using bobby::hermeneutic::aggregator::Aggregator;
 using bobby::hermeneutic::aggregator::BboUpdate;
+using bobby::hermeneutic::aggregator::fill_wire_book_id;
 using bobby::hermeneutic::aggregator::L2Update;
 using bobby::hermeneutic::aggregator::PriceLevel;
 using bobby::hermeneutic::aggregator::SubscribeBboRequest;
 using bobby::hermeneutic::aggregator::SubscribeL2DiffRequest;
+using bobby::hermeneutic::symbol::BookId;
+using bobby::hermeneutic::symbol::to_string;
 
 namespace {
 
@@ -106,7 +111,7 @@ std::string format_fixed(FixedPoint value) {
 }
 
 // Guards stdout: each publish_bbo()/publish_l2_bands() call runs on its
-// own thread (one per symbol - see main()), and a bare `std::cout << a <<
+// own thread (one per book - see main()), and a bare `std::cout << a <<
 // b << c` is a sequence of independent stream operations, not one atomic
 // write - two threads' chains can interleave mid-line into a single
 // garbled, unparseable line. Callers build the complete line first (this
@@ -182,13 +187,14 @@ std::thread make_canceller(grpc::ClientContext& context, std::atomic<bool>* stop
     });
 }
 
-void publish_bbo(const std::string& address, const std::string& symbol, std::atomic<bool>* stop) {
+void publish_bbo(const std::string& address, const BookId& book_id, std::atomic<bool>* stop) {
+    std::string label = to_string(book_id);
     auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
     auto stub = Aggregator::NewStub(channel);
 
     grpc::ClientContext context;
     SubscribeBboRequest request;
-    request.set_symbol(symbol);
+    fill_wire_book_id(request.mutable_book(), book_id);
     auto reader = stub->SubscribeBbo(&context, request);
     std::atomic<bool> done{false};
     std::thread canceller = make_canceller(context, stop, &done);
@@ -204,7 +210,7 @@ void publish_bbo(const std::string& address, const std::string& symbol, std::ato
             line << "book_seq=" << bbo.book_seq() << " bid=" << (bbo.has_bid() ? format_level(bbo.bid()) : "(none)")
                  << " ask=" << (bbo.has_ask() ? format_level(bbo.ask()) : "(none)");
             last_line = line.str();
-            print_line("[" + symbol + " BBO] " + last_line);
+            print_line("[" + label + " BBO] " + last_line);
         } else if (update.has_heartbeat()) {
             ++heartbeat_count;
         }
@@ -213,7 +219,7 @@ void publish_bbo(const std::string& address, const std::string& symbol, std::ato
     canceller.join();
     auto status = reader->Finish();
     std::ostringstream done_line;
-    done_line << "[" << symbol << " BBO] DONE bbo_count=" << bbo_count << " heartbeat_count=" << heartbeat_count
+    done_line << "[" << label << " BBO] DONE bbo_count=" << bbo_count << " heartbeat_count=" << heartbeat_count
               << " last=(" << last_line << ") grpc_status=" << status.error_code() << " ("
               << status.error_message() << ")";
     print_line(done_line.str());
@@ -222,13 +228,14 @@ void publish_bbo(const std::string& address, const std::string& symbol, std::ato
 // Shared by volume-bands and price-bands: both subscribe to SubscribeL2Diff
 // and maintain the same local L2OrderBook, differing only in which bands
 // get computed/printed from it on every update.
-void publish_l2_bands(Mode mode, const std::string& address, const std::string& symbol, std::atomic<bool>* stop) {
+void publish_l2_bands(Mode mode, const std::string& address, const BookId& book_id, std::atomic<bool>* stop) {
+    std::string label = to_string(book_id);
     auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
     auto stub = Aggregator::NewStub(channel);
 
     grpc::ClientContext context;
     SubscribeL2DiffRequest request;
-    request.set_symbol(symbol);
+    fill_wire_book_id(request.mutable_book(), book_id);
     auto reader = stub->SubscribeL2Diff(&context, request);
     std::atomic<bool> done{false};
     std::thread canceller = make_canceller(context, stop, &done);
@@ -249,7 +256,7 @@ void publish_l2_bands(Mode mode, const std::string& address, const std::string& 
             line << " ask[" << format_price_bands(ask_price_band_depths(book, kPriceBandBps)) << "]";
         }
         std::string result = line.str();
-        print_line("[" + symbol + " " + mode_tag + "] " + result);
+        print_line("[" + label + " " + mode_tag + "] " + result);
         return result;
     };
 
@@ -282,7 +289,7 @@ void publish_l2_bands(Mode mode, const std::string& address, const std::string& 
             if (last_seq && diff.book_seq() != *last_seq + 1) {
                 ++gap_count;
                 std::ostringstream gap_line;
-                gap_line << "[" << symbol << " " << mode_tag << "] GAP: expected book_seq="
+                gap_line << "[" << label << " " << mode_tag << "] GAP: expected book_seq="
                           << (*last_seq + 1) << " got " << diff.book_seq()
                           << " - local book invalid, stopping this stream";
                 print_line(gap_line.str());
@@ -300,7 +307,7 @@ void publish_l2_bands(Mode mode, const std::string& address, const std::string& 
     canceller.join();
     auto status = reader->Finish();
     std::ostringstream done_line;
-    done_line << "[" << symbol << " " << mode_tag << "] DONE snapshot_count=" << snapshot_count
+    done_line << "[" << label << " " << mode_tag << "] DONE snapshot_count=" << snapshot_count
               << " diff_count=" << diff_count << " heartbeat_count=" << heartbeat_count
               << " gap_count=" << gap_count << " last=(" << last_line << ") grpc_status=" << status.error_code()
               << " (" << status.error_message() << ")";
@@ -309,9 +316,9 @@ void publish_l2_bands(Mode mode, const std::string& address, const std::string& 
 
 void print_usage() {
     std::cerr << "usage: hermeneutic_aggregator_client <address> <bbo|volume-bands|price-bands> "
-                 "<duration_seconds> <symbol1> [symbol2 ...]\n"
+                 "<duration_seconds> <book1> [book2 ...]\n"
                  "  duration_seconds <= 0 means run until interrupted or the server ends the stream\n"
-                 "  symbols are book keys, e.g. BTCUSDT.SPOT or BTCUSDT.PERP\n"
+                 "  books look like BTC_USDT.SPOT or BTC_USDT.PERP\n"
                  "  bbo:          subscribes to SubscribeBbo, prints best bid/ask on every update\n"
                  "  volume-bands: subscribes to SubscribeL2Diff, prints the VWAP needed to fill\n"
                  "                1M/5M/10M/25M/50M+ notional on each side on every update\n"
@@ -336,7 +343,20 @@ int main(int argc, char** argv) {
         print_usage();
         return 1;
     }
-    std::vector<std::string> symbols(argv + 4, argv + argc);
+
+    // Parsed once here, at this program's own input boundary - every
+    // downstream use (the log label, the wire BookId) works with the
+    // structured value, never the original string again. See
+    // bobby::hermeneutic::symbol::parse_book_id's own comment.
+    std::vector<BookId> books;
+    for (int i = 4; i < argc; ++i) {
+        auto book_id = bobby::hermeneutic::symbol::parse_book_id(argv[i]);
+        if (!book_id) {
+            std::cerr << "invalid book \"" << argv[i] << "\" (expected e.g. BTC_USDT.SPOT or BTC_USDT.PERP)\n";
+            return 1;
+        }
+        books.push_back(*book_id);
+    }
 
     auto mode = parse_mode(mode_str);
     if (!mode) {
@@ -346,9 +366,9 @@ int main(int argc, char** argv) {
 
     std::atomic<bool> stop{false};
     std::vector<std::thread> threads;
-    for (const auto& symbol : symbols) {
-        if (*mode == Mode::Bbo) threads.emplace_back(publish_bbo, address, symbol, &stop);
-        else threads.emplace_back(publish_l2_bands, *mode, address, symbol, &stop);
+    for (const auto& book_id : books) {
+        if (*mode == Mode::Bbo) threads.emplace_back(publish_bbo, address, book_id, &stop);
+        else threads.emplace_back(publish_l2_bands, *mode, address, book_id, &stop);
     }
 
     if (duration_s > 0) {

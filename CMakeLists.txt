@@ -230,13 +230,15 @@ if(HERMENEUTIC_BUILD_SERVICE)
     # apps/aggregator/client_main.cpp's own comment for why this one isn't
     # a throwaway like this project's other live-verification programs.
     add_executable(hermeneutic_aggregator_client apps/aggregator/client_main.cpp)
-    target_link_libraries(hermeneutic_aggregator_client PRIVATE hermeneutic::book hermeneutic::proto)
+    target_include_directories(hermeneutic_aggregator_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(hermeneutic_aggregator_client PRIVATE
+        hermeneutic::book hermeneutic::proto hermeneutic::symbol)
 
     if(HERMENEUTIC_BUILD_TESTS)
         add_executable(hermeneutic_aggregator_service_test tests/apps/aggregator/aggregator_service_test.cpp)
         target_include_directories(hermeneutic_aggregator_service_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(hermeneutic_aggregator_service_test PRIVATE
-            hermeneutic::book hermeneutic::proto GTest::gtest_main)
+            hermeneutic::book hermeneutic::proto hermeneutic::symbol GTest::gtest_main)
         gtest_discover_tests(hermeneutic_aggregator_service_test)
 
         add_executable(hermeneutic_websocket_connection_test tests/net/websocket_connection_test.cpp)
@@ -258,7 +260,8 @@ if(HERMENEUTIC_BUILD_SERVICE)
         add_executable(hermeneutic_venue_session_test tests/ingestion/venue_session_test.cpp)
         target_include_directories(hermeneutic_venue_session_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(hermeneutic_venue_session_test PRIVATE
-            hermeneutic::ingestion hermeneutic::exchange_policy hermeneutic::proto GTest::gtest_main)
+            hermeneutic::ingestion hermeneutic::exchange_policy hermeneutic::proto hermeneutic::symbol
+            GTest::gtest_main)
         gtest_discover_tests(hermeneutic_venue_session_test)
 
         # By contrast, this test never registers a book at all (see

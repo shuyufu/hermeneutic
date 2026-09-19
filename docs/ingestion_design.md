@@ -476,7 +476,7 @@ loop:
 
    **第 8 項提到的 live-gap 恢復限制，同樣適用於 OKX**：`kTrustsConnectionOrder` 的捷徑只在「進入 `on_snapshot()` 當下 buffer 完全沒被寫過」時生效，mid-stream 的 gap 會讓這個 symbol 卡在 `Buffering` 直到整條連線斷線重連——跟 Bybit 面對的是同一個尚未解決的限制，不是 OKX 特有的新問題。
 
-10. **`symbol.hpp::book_key()` 的字串格式是這個專案目前唯一還在製造「無法還原」歧義的地方，尚未決定要不要改，牽涉 breaking change**：`native_symbol()`/`venue_id()` 都吃 `(Venue, BaseQuote, BookType)`、對整個 domain model保持 total；只有 `book_key()` 把 `{BTC, USDT}` 攤平成無底線的 `BTCUSDT.SPOT`/`BTCUSDT.PERP`，base/quote 的邊界從此永久消失——跟 `split_base_quote()` 自己註解講的「串接字串在沒有維護 quote-asset 字典時無法反推邊界」是同一個問題，也是這個專案先前刪掉 `okx_canonical()`（第 9 節、`5d5dd69`）的同一個理由：猜邊界是死路，`book_key()` 是最後一個還在做這件事的地方。判斷式：能不能寫出 `parse_book_key(s) -> optional<pair<BaseQuote, BookType>>` 當精確反函式？現在不行。連帶地，`book_subscription.hpp` 的 `seen_book_keys` 用串接後的字串去重，「不同的 (base, quote, type) 不會撞成同一個 key」這件事目前是靠實際幣別代碼的巧合成立，不是靠結構保證。
+10. ~~`symbol.hpp::book_key()` 的字串格式是這個專案目前唯一還在製造「無法還原」歧義的地方，尚未決定要不要改，牽涉 breaking change~~ **已完成**：`native_symbol()`/`venue_id()` 都吃 `(Venue, BaseQuote, BookType)`、對整個 domain model保持 total；只有 `book_key()` 把 `{BTC, USDT}` 攤平成無底線的 `BTCUSDT.SPOT`/`BTCUSDT.PERP`，base/quote 的邊界從此永久消失——跟 `split_base_quote()` 自己註解講的「串接字串在沒有維護 quote-asset 字典時無法反推邊界」是同一個問題，也是這個專案先前刪掉 `okx_canonical()`（第 9 節、`5d5dd69`）的同一個理由：猜邊界是死路，`book_key()` 是最後一個還在做這件事的地方。判斷式：能不能寫出 `parse_book_key(s) -> optional<pair<BaseQuote, BookType>>` 當精確反函式？現在不行。連帶地，`book_subscription.hpp` 的 `seen_book_keys` 用串接後的字串去重，「不同的 (base, quote, type) 不會撞成同一個 key」這件事目前是靠實際幣別代碼的巧合成立，不是靠結構保證。
 
     **現況是刻意的，先講清楚不是 bug**：`book_key()` 的註解本來就講明「client 訂閱 `"BTCUSDT.PERP"` 不受設定檔輸入拼寫（`BASE_QUOTE`，例如 `BTC_USDT`）影響」——`BASE_QUOTE` 底線只是設定檔/CLI 的*輸入*拼寫慣例，用來消除 base/quote 邊界的歧義；`book_key()` 產生的才是 gRPC client 實際訂閱用的*穩定* key，兩者故意脫鉤，這樣設定檔輸入格式以後要改，既有 client 的訂閱字串不用跟著動。這個「輸入拼寫跟 key 脫鉤」的原則本身沒有問題，該保留。
 
@@ -494,7 +494,15 @@ loop:
 
     會動到的地方：`symbol.hpp`（`book_key`、新的 `BookId`/parse）、`book_subscription.hpp`（`seen_book_keys` 改用 `BookId` 當 set key）、`proto/bobby/hermeneutic/aggregator/aggregator.proto`、`aggregator_service.hpp`（`book()`、`SymbolBook` map、`NOT_FOUND` 路徑）、`server_main.cpp` 的 registry 迴圈、`client_main.cpp`（argv 解析 + usage）、`README.md`、以及 `symbol_test.cpp`/`book_subscription_test.cpp`/`aggregator_service_test.cpp`（`UnknownSymbolFailsWithNotFound`、`MultiSymbolAggregatorServiceTest` 都要跟著改）。
 
-    **尚未決定，也還沒排進任何分支**：這是 2026-09-19 討論 `hermeneutic_aggregator_client` cherry-pick 時，另外問顧問「如果可以 breaking change，這個 key 怎麼設計比較好」得到的建議，記在這裡避免遺忘在對話 scrollback 裡；真的要做的話應該另開一個獨立分支，不要跟既有的、乾淨的 cherry-pick 分支混在一起。
+    **實作完成，2026-09-19，`worktree-aggregator-client-bookkey-doc` 分支**：上面的提案大方向照做，`book_key()`/`parse_book_key()` 換成 `symbol::BookId`（`BaseQuote symbol; BookType type;`）+ `to_string(BookId)`/`parse_book_id(string_view)`，proto 加了 `MarketType` enum + `BookId` message，`SubscribeBboRequest`/`SubscribeL2DiffRequest` 的 `symbol` 欄位換成 `BookId book`。實作時跟提案有三處出入，都是往更簡單的方向收斂，不是推翻原設計：
+
+    - **鍵值容器選 `std::unordered_map`/`std::unordered_set`，只實作 `std::hash<BookId>`，沒有加 `operator<=>`**。`AggregatorService::books_`、`book_subscription.hpp` 的 `seen_book_ids` 都只需要「當 hash 容器的 key」，用不到排序；`Asset`/`BaseQuote` 自己的註解本來就講「排序對貨幣代碼沒有意義,能省則省」，`BookId` 沒理由破例。`std::unordered_map` 是 node-based，`AggregatorService::book()` 回傳的 `SymbolBook*` 在 rehash 之後位址依然穩定，這點跟原本的 `std::map` 一樣，`server_main.cpp` 的 registry 建構順序不用重新檢查。
+    - **`to_string(BookId)` 輸出帶底線的 `"BTC_USDT.SPOT"`,不是沿用舊 `book_key()` 的無底線 `"BTCUSDT.SPOT"`**。這是這次改動存在的理由本身——沿用無底線格式只會讓 `to_string`/`parse_book_id` 這組新函式看起來能反解析、實際上還是靠巧合，`parse_book_id` 因此是 `to_string` 真正精確的反函式（新增了對應的 round-trip 屬性測試,`symbol_test.cpp`），不是又一個「大部分情況能用」的猜測。
+    - **`hermeneutic_aggregator_client` 的 CLI 維持原本的 variadic「一個 token 一本 book」形狀（`<book1> [book2 ...]`）,不是提案文字裡寫的 `<base> <quote> <spot|perp>` 三元組**——三元組沒辦法表達「同一次執行訂閱多本 book」這個既有能力。改成在 argv 邊界呼叫 `parse_book_id()` 解析每個 token（例如 `BTC_USDT.SPOT`）,再用 `fill_wire_book_id()`（新增的 `apps/aggregator/book_id.hpp`,proto BookId ↔ `symbol::BookId` 的薄轉接層,故意不讓 `symbol.hpp` 沾到 gRPC 依賴）填進 wire message——這正是設計裡「parse 只在輸入邊界做一次」原則的直接體現,只是邊界token 的形狀選了 `to_string()` 自己的輸出格式,而不是拆成三個獨立 argv。
+
+    **實作時發現、提案沒設計到的一個新失敗模式**：proto3 對沒設定的欄位有隱式的零值（`market` 預設是 `MARKET_TYPE_UNSPECIFIED`,`base`/`quote` 預設是空字串）,所以「請求本身就是畸形的」（欄位沒填,或填了不合法的組合）跟「請求是合法的 BookId,只是不是這個 server 的book」是兩種不同的失敗,不該共用同一個 gRPC status code。`to_symbol_book_id()`（`book_id.hpp`）對前者回傳 `nullopt`,`SubscribeL2Diff`/`SubscribeBbo` 據此回 `INVALID_ARGUMENT`；後者（`AggregatorService::book()` 查無此 key）維持原本的 `NOT_FOUND`。`aggregator_service_test.cpp` 新增 `MalformedBookFailsWithInvalidArgument` 驗證前者,`UnknownSymbolFailsWithNotFound` 改成送一個合法但不存在的 `BookId{"DOGE","USDT",Spot}` 驗證後者維持原行為。
+
+    會動到的地方跟提案時列的一致,額外多了 `apps/aggregator/book_id.hpp`（新檔案,proto↔C++ 轉接層）跟 `CMakeLists.txt`（`hermeneutic_aggregator_client`/`hermeneutic_aggregator_service_test` 都要多連 `hermeneutic::symbol`,`hermeneutic_aggregator_client` 也要多加 repo-root include dir 讓 `apps/aggregator/book_id.hpp` 這個路徑能解析）。
 
 ## 11. 下一步
 

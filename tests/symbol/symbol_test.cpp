@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <unordered_set>
+
 namespace bobby::hermeneutic::symbol {
 namespace {
 
@@ -48,10 +50,62 @@ TEST(VenueName, RoundTripsThroughParseVenue) {
     EXPECT_EQ(venue_name(Venue::Okx), "OKX");
 }
 
-TEST(BookKey, IsConcatenatedWithTypeSuffix) {
-    BaseQuote btc_usdt{"BTC", "USDT"};
-    EXPECT_EQ(book_key(btc_usdt, BookType::Spot), "BTCUSDT.SPOT");
-    EXPECT_EQ(book_key(btc_usdt, BookType::Perp), "BTCUSDT.PERP");
+TEST(BookIdToString, IsUnderscoreSeparatedWithTypeSuffix) {
+    BookId btc_usdt_spot{BaseQuote{"BTC", "USDT"}, BookType::Spot};
+    BookId btc_usdt_perp{BaseQuote{"BTC", "USDT"}, BookType::Perp};
+    EXPECT_EQ(to_string(btc_usdt_spot), "BTC_USDT.SPOT");
+    EXPECT_EQ(to_string(btc_usdt_perp), "BTC_USDT.PERP");
+}
+
+TEST(ParseBookId, ParsesSpotAndPerp) {
+    auto spot = parse_book_id("BTC_USDT.SPOT");
+    ASSERT_TRUE(spot.has_value());
+    EXPECT_EQ(spot->symbol.base.code, "BTC");
+    EXPECT_EQ(spot->symbol.quote.code, "USDT");
+    EXPECT_EQ(spot->type, BookType::Spot);
+
+    auto perp = parse_book_id("BTC_USDT.PERP");
+    ASSERT_TRUE(perp.has_value());
+    EXPECT_EQ(perp->type, BookType::Perp);
+}
+
+TEST(ParseBookId, RejectsMissingOrUnknownSuffix) {
+    EXPECT_FALSE(parse_book_id("BTC_USDT").has_value());
+    EXPECT_FALSE(parse_book_id("BTC_USDT.FUTURES").has_value());
+}
+
+TEST(ParseBookId, RejectsMalformedBaseQuote) {
+    EXPECT_FALSE(parse_book_id("BTCUSDT.SPOT").has_value());  // no underscore
+    EXPECT_FALSE(parse_book_id("_USDT.SPOT").has_value());    // empty base
+}
+
+TEST(ParseBookId, IsTheExactInverseOfToString) {
+    for (BookId id : {BookId{BaseQuote{"BTC", "USDT"}, BookType::Spot},
+                       BookId{BaseQuote{"BTC", "USDT"}, BookType::Perp},
+                       BookId{BaseQuote{"ETH", "USDC"}, BookType::Perp}}) {
+        EXPECT_EQ(parse_book_id(to_string(id)), id);
+    }
+}
+
+TEST(BookIdEquality, ComparesBothBaseQuoteAndType) {
+    BookId btc_usdt_spot{BaseQuote{"BTC", "USDT"}, BookType::Spot};
+    EXPECT_EQ(btc_usdt_spot, (BookId{BaseQuote{"BTC", "USDT"}, BookType::Spot}));
+    EXPECT_NE(btc_usdt_spot, (BookId{BaseQuote{"BTC", "USDT"}, BookType::Perp}));
+    EXPECT_NE(btc_usdt_spot, (BookId{BaseQuote{"ETH", "USDT"}, BookType::Spot}));
+}
+
+// Exercises usability as an unordered_set key (compiles/links only if
+// std::hash<BookId> exists) and correct membership. unordered_set falls
+// back to operator== on a hash collision, so this does not by itself prove
+// anything about std::hash<BookId>'s collision rate - it proves the type is
+// usable as a key at all, which is the actual requirement here.
+TEST(BookIdHash, UsableAsUnorderedSetKey) {
+    std::unordered_set<BookId> seen;
+    EXPECT_TRUE(seen.insert(BookId{BaseQuote{"BTC", "USDT"}, BookType::Spot}).second);
+    EXPECT_TRUE(seen.insert(BookId{BaseQuote{"BTC", "USDT"}, BookType::Perp}).second);
+    EXPECT_TRUE(seen.insert(BookId{BaseQuote{"BT", "CUSDT"}, BookType::Spot}).second);
+    EXPECT_FALSE(seen.insert(BookId{BaseQuote{"BTC", "USDT"}, BookType::Spot}).second);
+    EXPECT_EQ(seen.size(), 3u);
 }
 
 TEST(VenueIdString, UsesEachExchangesOwnDerivativesTerm) {

@@ -19,17 +19,44 @@ service Aggregator {
   rpc SubscribeBbo(SubscribeBboRequest) returns (stream BboUpdate);
 }
 
+// Which market a book covers. MARKET_TYPE_UNSPECIFIED is proto3's implicit
+// zero value on an unset field, never a valid book - a request that leaves
+// this unset (or a base/quote left empty) is malformed, distinct from a
+// well-formed BookId that just doesn't match any book this server was
+// started with (see BookId's own comment and the two RPCs below).
+enum MarketType {
+  MARKET_TYPE_UNSPECIFIED = 0;
+  SPOT = 1;
+  PERP = 2;
+}
+
+// A book's identity as a structured value, not a string a client has to
+// spell correctly: base and quote are carried as their own fields, so
+// "which currency is which" is never something a server or client has to
+// parse back out of a concatenated symbol - see
+// bobby::hermeneutic::symbol::BookId (symbol.hpp) for the equivalent C++
+// type and docs/ingestion_design.md's 第10節第10項 for why this replaced a
+// single string field. base/quote are this project's own asset codes
+// (e.g. "BTC"/"USDT"), not a venue-native spelling.
+message BookId {
+  string base = 1;
+  string quote = 2;
+  MarketType market = 3;
+}
+
 message SubscribeL2DiffRequest {
-  // Must match one of the symbols this server instance was started with
-  // (a fixed, immutable set - see AggregatorService's constructor). Unknown
-  // symbol fails the RPC with NOT_FOUND rather than returning an empty
-  // stream, so a typo'd symbol is loud, not silently useless.
-  string symbol = 1;
+  // Must match one of the books this server instance was started with (a
+  // fixed, immutable set - see AggregatorService's constructor). A
+  // malformed BookId (MARKET_TYPE_UNSPECIFIED, or an empty base/quote)
+  // fails with INVALID_ARGUMENT; a well-formed one that just isn't one of
+  // this server's books fails with NOT_FOUND - so a typo'd book is loud
+  // either way, never a silently empty stream.
+  BookId book = 1;
 }
 
 message SubscribeBboRequest {
-  // Same contract as SubscribeL2DiffRequest.symbol.
-  string symbol = 1;
+  // Same contract as SubscribeL2DiffRequest.book.
+  BookId book = 1;
 }
 
 // Fixed-point encoding, fixed by this protocol (not configurable per

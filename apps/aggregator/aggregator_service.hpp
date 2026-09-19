@@ -17,11 +17,14 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "bobby/hermeneutic/book/aggregate_order_book.hpp"
 #include "bobby/hermeneutic/aggregator/aggregator.grpc.pb.h"
+#include "bobby/hermeneutic/symbol/symbol.hpp"
+#include "apps/aggregator/book_id.hpp"
 
 namespace bobby::hermeneutic::aggregator {
 
@@ -511,45 +514,49 @@ class SymbolBook {
     std::optional<std::pair<Price, Size>> last_bbo_ask_;
 };
 
-// The sole gRPC service type in this file: one instance serves every symbol
+// The sole gRPC service type in this file: one instance serves every book
 // it was constructed with, on one port, by routing each RPC (and each
-// ingestion call) to that symbol's own SymbolBook - see SymbolBook's class
-// comment for why that beats one grpc::Service instance per symbol.
+// ingestion call) to that book's own SymbolBook - see SymbolBook's class
+// comment for why that beats one grpc::Service instance per book.
 class AggregatorService final : public Aggregator::Service {
   public:
-    // `symbols` must be non-empty with unique entries - both are startup
+    // `books` must be non-empty with unique entries - both are startup
     // configuration preconditions (asserted, not runtime-checked: this
     // isn't external input), not something a client's request can violate.
-    // The resulting symbol set is fixed for this instance's lifetime - no
+    // The resulting book set is fixed for this instance's lifetime - no
     // dynamic add/remove.
-    explicit AggregatorService(std::span<const std::string> symbols) {
-        assert(!symbols.empty());
-        for (const auto& symbol : symbols) {
-            [[maybe_unused]] auto [it, inserted] = books_.try_emplace(symbol);
+    explicit AggregatorService(std::span<const symbol::BookId> books) {
+        assert(!books.empty());
+        for (const auto& id : books) {
+            [[maybe_unused]] auto [it, inserted] = books_.try_emplace(id);
             assert(inserted);
         }
     }
 
-    // Returns nullptr if `symbol` isn't one this instance was constructed
-    // with. Used by SubscribeL2Diff()/SubscribeBbo() below, and by an
-    // ingestion layer routing a parsed delta/snapshot/invalidation to the
-    // right book.
-    SymbolBook* book(std::string_view symbol) {
-        auto it = books_.find(symbol);
+    // Returns nullptr if `id` isn't one this instance was constructed with.
+    // Used by SubscribeL2Diff()/SubscribeBbo() below, and by an ingestion
+    // layer routing a parsed delta/snapshot/invalidation to the right book.
+    SymbolBook* book(const symbol::BookId& id) {
+        auto it = books_.find(id);
         return it != books_.end() ? &it->second : nullptr;
     }
 
-    // Broadcasts a liveness heartbeat to every subscriber of every symbol.
+    // Broadcasts a liveness heartbeat to every subscriber of every book.
     void send_heartbeat() {
-        for (auto& [symbol, symbol_book] : books_) symbol_book.send_heartbeat();
+        for (auto& [id, symbol_book] : books_) symbol_book.send_heartbeat();
     }
 
     grpc::Status SubscribeL2Diff(grpc::ServerContext* context, const SubscribeL2DiffRequest* request,
                                   grpc::ServerWriter<L2Update>* writer) override {
-        SymbolBook* target = book(request->symbol());
+        auto id = to_symbol_book_id(request->book());
+        if (!id) {
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                                 "malformed book: base/quote must be non-empty and market must be "
+                                 "SPOT or PERP");
+        }
+        SymbolBook* target = book(*id);
         if (!target) {
-            return grpc::Status(grpc::StatusCode::NOT_FOUND,
-                                 "unknown symbol: " + request->symbol());
+            return grpc::Status(grpc::StatusCode::NOT_FOUND, "unknown book: " + symbol::to_string(*id));
         }
 
         auto queue = target->subscribe(writer);
@@ -586,10 +593,15 @@ class AggregatorService final : public Aggregator::Service {
 
     grpc::Status SubscribeBbo(grpc::ServerContext* context, const SubscribeBboRequest* request,
                                grpc::ServerWriter<BboUpdate>* writer) override {
-        SymbolBook* target = book(request->symbol());
+        auto id = to_symbol_book_id(request->book());
+        if (!id) {
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                                 "malformed book: base/quote must be non-empty and market must be "
+                                 "SPOT or PERP");
+        }
+        SymbolBook* target = book(*id);
         if (!target) {
-            return grpc::Status(grpc::StatusCode::NOT_FOUND,
-                                 "unknown symbol: " + request->symbol());
+            return grpc::Status(grpc::StatusCode::NOT_FOUND, "unknown book: " + symbol::to_string(*id));
         }
 
         auto queue = target->subscribe_bbo(writer);
@@ -624,7 +636,7 @@ class AggregatorService final : public Aggregator::Service {
     }
 
   private:
-    std::map<std::string, SymbolBook, std::less<>> books_;
+    std::unordered_map<symbol::BookId, SymbolBook> books_;
 };
 
 }  // namespace bobby::hermeneutic::aggregator

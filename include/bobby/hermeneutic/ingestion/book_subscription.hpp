@@ -12,6 +12,7 @@
 
 namespace bobby::hermeneutic::ingestion {
 
+using bobby::hermeneutic::symbol::BookId;
 using bobby::hermeneutic::symbol::BookType;
 using bobby::hermeneutic::symbol::Venue;
 
@@ -24,8 +25,8 @@ using bobby::hermeneutic::symbol::Venue;
 struct VenueSubscription {
     Venue venue;
     BookType type;
-    std::string book_key;      // e.g. "BTCUSDT.PERP" - AggregatorService::book()'s key
-    std::string native_symbol; // e.g. "BTC-USDT-SWAP" - what this venue's Feed subscribes with
+    BookId book_id;              // AggregatorService::book()'s key
+    std::string native_symbol;   // e.g. "BTC-USDT-SWAP" - what this venue's Feed subscribes with
 };
 
 // Parses a subscription config document, e.g.:
@@ -56,7 +57,7 @@ struct VenueSubscription {
 inline std::expected<std::vector<VenueSubscription>, std::string> parse_book_subscriptions(
     std::string_view json_text) {
     std::vector<VenueSubscription> result;
-    std::unordered_set<std::string> seen_book_keys;
+    std::unordered_set<BookId> seen_book_ids;
 
     try {
         simdjson::padded_string padded(json_text);
@@ -97,9 +98,10 @@ inline std::expected<std::vector<VenueSubscription>, std::string> parse_book_sub
                                         std::string(symbol_field) + "\"");
             }
 
-            std::string key = bobby::hermeneutic::symbol::book_key(*symbol, type);
-            if (!seen_book_keys.insert(key).second) {
-                return std::unexpected("book \"" + key + "\" is configured more than once");
+            BookId id{*symbol, type};
+            std::string key_str = bobby::hermeneutic::symbol::to_string(id);
+            if (!seen_book_ids.insert(id).second) {
+                return std::unexpected("book \"" + key_str + "\" is configured more than once");
             }
 
             std::unordered_set<Venue> seen_venues;
@@ -109,26 +111,26 @@ inline std::expected<std::vector<VenueSubscription>, std::string> parse_book_sub
                 try {
                     venue_token = venue_value.get_string();
                 } catch (const simdjson::simdjson_error&) {
-                    return std::unexpected("\"venues\" for \"" + key + "\" must be an array of strings");
+                    return std::unexpected("\"venues\" for \"" + key_str + "\" must be an array of strings");
                 }
 
                 auto venue = bobby::hermeneutic::symbol::parse_venue(venue_token);
                 if (!venue) {
-                    return std::unexpected("unknown venue \"" + std::string(venue_token) + "\" for \"" + key +
+                    return std::unexpected("unknown venue \"" + std::string(venue_token) + "\" for \"" + key_str +
                                             "\"");
                 }
                 if (!seen_venues.insert(*venue).second) {
                     return std::unexpected("venue " + std::string(bobby::hermeneutic::symbol::venue_name(*venue)) +
-                                            " listed twice for \"" + key + "\"");
+                                            " listed twice for \"" + key_str + "\"");
                 }
 
                 any_venue = true;
                 result.push_back(VenueSubscription{
-                    *venue, type, key, bobby::hermeneutic::symbol::native_symbol(*venue, *symbol, type)});
+                    *venue, type, id, bobby::hermeneutic::symbol::native_symbol(*venue, *symbol, type)});
             }
 
             if (!any_venue) {
-                return std::unexpected("empty venue list for \"" + key + "\"");
+                return std::unexpected("empty venue list for \"" + key_str + "\"");
             }
         }
     } catch (const simdjson::simdjson_error& e) {

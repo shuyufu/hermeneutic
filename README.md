@@ -44,23 +44,24 @@ example, alongside its hand-written service in `apps/aggregator/aggregator_servi
 
 `hermeneutic_aggregator_service` (`apps/aggregator/server_main.cpp`) streams the
 aggregated L2 order book to subscribers: a client calls `SubscribeL2Diff` or
-`SubscribeBbo` with the symbol it wants, gets an initial snapshot, then every
-subsequent change as it happens. One instance serves any number of symbols on
-a single port — each gets two independent `SymbolBook`s (an
-`AggregateOrderBook` plus its own subscriber fan-out), one for perpetual/
-futures liquidity and one for spot, routed by `SubscribeL2DiffRequest.symbol`/
-`SubscribeBboRequest.symbol`. Which venues feed which book is driven by a JSON
-subscription config (see `apps/aggregator/subscriptions.example.json` and
+`SubscribeBbo` with the `BookId` it wants (a structured `{base, quote, market}`
+message, not a string - see `proto/bobby/hermeneutic/aggregator/aggregator.proto`
+and `bobby::hermeneutic::symbol::BookId` in `symbol/symbol.hpp` for the
+equivalent C++ type), gets an initial snapshot, then every subsequent change
+as it happens. One instance serves any number of books on a single port —
+each gets two independent `SymbolBook`s (an `AggregateOrderBook` plus its own
+subscriber fan-out), one for perpetual/futures liquidity and one for spot.
+Which venues feed which book is driven by a JSON subscription config (see
+`apps/aggregator/subscriptions.example.json` and
 `bobby/hermeneutic/ingestion/book_subscription.hpp` for the document shape);
-its `"symbol"` field is the bare base pair with an explicit base/quote
-separator (`"BTC_USDT"`), but the symbol a client actually subscribes with is
-`.PERP`/`.SPOT`-suffixed and unseparated (`"BTCUSDT.PERP"`, `"BTCUSDT.SPOT"`)
-- see `docs/ingestion_design.md`'s OKX section for why perp and spot aren't
-merged into one book. It only wraps the book(s) and broadcasts to
-subscribers — feeding real market data (`SymbolBook::apply_delta`/
-`apply_snapshot`/`invalidate_venue`, reached via
-`AggregatorService::book(".PERP"/".SPOT"-suffixed symbol)`) is up to the
-caller.
+its `"symbol"` field is the same `"BASE_QUOTE"` spelling (`"BTC_USDT"`) as the
+`BookId` a client subscribes with - see `docs/ingestion_design.md`'s 第10節
+第10項 for why the wire format moved from a concatenated string key to a
+structured message, and its OKX section for why perp and spot aren't merged
+into one book. It only wraps the book(s) and broadcasts to subscribers —
+feeding real market data (`SymbolBook::apply_delta`/`apply_snapshot`/
+`invalidate_venue`, reached via `AggregatorService::book(BookId)`) is up to
+the caller.
 
 ```sh
 cmake --build build-vcpkg --target hermeneutic_aggregator_service
@@ -72,24 +73,28 @@ cmake --build build-vcpkg --target hermeneutic_aggregator_service
 minimal example client for the service above - not a throwaway (unlike this
 project's earlier live-verification programs, see `docs/ingestion_design.md`),
 kept around as a starting point for consuming `AggregatorService`'s output
-and for manually poking at a running instance. It subscribes one or more book
-keys (one thread per symbol) and publishes a chosen view of
-the order book to stdout on every update; `volume-bands`/`price-bands` check
-`SubscribeL2Diff`'s own `book_seq` contiguity guarantee themselves, printing
-a `GAP` line if that contract is ever violated:
+and for manually poking at a running instance. It subscribes one or more
+books (one thread per book) and publishes a chosen view of the order book to
+stdout on every update; `volume-bands`/`price-bands` check `SubscribeL2Diff`'s
+own `book_seq` contiguity guarantee themselves, printing a `GAP` line if that
+contract is ever violated. Each book argument is the same human-readable
+`"BASE_QUOTE.SPOT"`/`"BASE_QUOTE.PERP"` spelling `bobby::hermeneutic::symbol::
+to_string(BookId)` produces - parsed back into a `BookId` once, at this
+program's own argv boundary (`parse_book_id`), never as a concatenated string
+past that point:
 
 ```sh
 cmake --build build-vcpkg --target hermeneutic_aggregator_client
-# <address> <bbo|volume-bands|price-bands> <duration_seconds> <symbol1> [symbol2 ...]
+# <address> <bbo|volume-bands|price-bands> <duration_seconds> <book1> [book2 ...]
 # duration_seconds <= 0 runs until interrupted or the server ends the stream.
 #   bbo:          subscribes to SubscribeBbo, prints best bid/ask
 #   volume-bands: subscribes to SubscribeL2Diff, prints the VWAP needed to
 #                 fill 1M/5M/10M/25M/50M+ notional on each side
 #   price-bands:  subscribes to SubscribeL2Diff, prints depth within
 #                 50/100/200/500/1000+ bps of BBO on each side
-./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 bbo 60 BTCUSDT.SPOT BTCUSDT.PERP
-./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 volume-bands 60 BTCUSDT.SPOT
-./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 price-bands 60 BTCUSDT.SPOT
+./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 bbo 60 BTC_USDT.SPOT BTC_USDT.PERP
+./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 volume-bands 60 BTC_USDT.SPOT
+./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 price-bands 60 BTC_USDT.SPOT
 ```
 
 `hermeneutic_aggregator_service_test` exercises it over a real (in-process)

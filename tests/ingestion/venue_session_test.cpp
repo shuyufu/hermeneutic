@@ -24,15 +24,26 @@
 #include <vector>
 
 #include "apps/aggregator/aggregator_service.hpp"
+#include "apps/aggregator/book_id.hpp"
 #include "bobby/hermeneutic/aggregator/aggregator.grpc.pb.h"
 #include "bobby/hermeneutic/exchange/binance/binance_futures_sequence_policy.hpp"
+#include "bobby/hermeneutic/symbol/symbol.hpp"
 
 namespace bobby::hermeneutic::ingestion {
 namespace {
 
 using bobby::hermeneutic::aggregator::AggregatorService;
+using bobby::hermeneutic::aggregator::fill_wire_book_id;
 using bobby::hermeneutic::aggregator::L2Update;
 using bobby::hermeneutic::aggregator::SymbolBook;
+using bobby::hermeneutic::symbol::BaseQuote;
+using bobby::hermeneutic::symbol::BookId;
+using bobby::hermeneutic::symbol::BookType;
+
+// The one book every AggregatorService in this file is constructed with -
+// these tests are about VenueSession's own mechanics (backoff/stop/snapshot
+// bridging), not about book identity, so a single fixed BookId is enough.
+BookId TestBookId() { return BookId{BaseQuote{"BTC", "USDT"}, BookType::Spot}; }
 
 std::vector<std::string_view> split(std::string_view text, char delimiter) {
     std::vector<std::string_view> fields;
@@ -212,7 +223,7 @@ TEST(VenueSessionTest, SnapshotFetchOverlapsReadingSoBufferedLiveEventBridgesIt)
     // it back the same way a real subscriber would - over a real gRPC
     // connection - not inspecting private state.
     std::vector<std::string> symbols{"BTCUSDT"};
-    AggregatorService service(symbols);
+    AggregatorService service(std::vector<BookId>{TestBookId()});
 
     grpc::ServerBuilder builder;
     int grpc_port = 0;
@@ -226,7 +237,7 @@ TEST(VenueSessionTest, SnapshotFetchOverlapsReadingSoBufferedLiveEventBridgesIt)
     auto stub = bobby::hermeneutic::aggregator::Aggregator::NewStub(channel);
     grpc::ClientContext context;
     bobby::hermeneutic::aggregator::SubscribeL2DiffRequest request;
-    request.set_symbol("BTCUSDT");
+    fill_wire_book_id(request.mutable_book(), TestBookId());
     auto reader = stub->SubscribeL2Diff(&context, request);
 
     std::mutex mutex;
@@ -283,7 +294,7 @@ TEST(VenueSessionTest, SnapshotFetchOverlapsReadingSoBufferedLiveEventBridgesIt)
 
     FakeFeed feed(std::to_string(ws_port), std::to_string(http_port));
     SymbolRegistry<SymbolBook> registry;
-    registry.add("BTCUSDT", service.book("BTCUSDT"));
+    registry.add("BTCUSDT", service.book(TestBookId()));
     VenueSession<FakeFeed, BinanceFuturesSequencePolicy, beast::tcp_stream, SymbolBook> session(
         std::move(feed), "fake_venue", symbols, std::move(registry), io.get_executor());
     session.start(fail_test_on_exception("session"));
@@ -317,7 +328,7 @@ TEST(VenueSessionTest, SnapshotFetchOverlapsReadingSoBufferedLiveEventBridgesIt)
 // stop.
 TEST(VenueSessionTest, StopAbortsBackoffWaitAndDoesNotReconnect) {
     std::vector<std::string> symbols{"BTCUSDT"};
-    AggregatorService service(symbols);
+    AggregatorService service(std::vector<BookId>{TestBookId()});
 
     net::io_context io;
     net::ip::tcp::acceptor ws_acceptor(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
@@ -332,7 +343,7 @@ TEST(VenueSessionTest, StopAbortsBackoffWaitAndDoesNotReconnect) {
     // StopDrainsInFlightSnapshotFetch below for that one).
     FakeFeed feed(std::to_string(ws_port), "1");
     SymbolRegistry<SymbolBook> registry;
-    registry.add("BTCUSDT", service.book("BTCUSDT"));
+    registry.add("BTCUSDT", service.book(TestBookId()));
     VenueSession<FakeFeed, BinanceFuturesSequencePolicy, beast::tcp_stream, SymbolBook> session(
         std::move(feed), "fake_venue", symbols, std::move(registry), io.get_executor());
 
@@ -385,7 +396,7 @@ TEST(VenueSessionTest, StopAbortsBackoffWaitAndDoesNotReconnect) {
 // take the full artificial HTTP delay below.
 TEST(VenueSessionTest, StopDrainsInFlightSnapshotFetch) {
     std::vector<std::string> symbols{"BTCUSDT"};
-    AggregatorService service(symbols);
+    AggregatorService service(std::vector<BookId>{TestBookId()});
 
     net::io_context io;
     net::ip::tcp::acceptor ws_acceptor(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
@@ -402,7 +413,7 @@ TEST(VenueSessionTest, StopDrainsInFlightSnapshotFetch) {
 
     FakeFeed feed(std::to_string(ws_port), std::to_string(http_port));
     SymbolRegistry<SymbolBook> registry;
-    registry.add("BTCUSDT", service.book("BTCUSDT"));
+    registry.add("BTCUSDT", service.book(TestBookId()));
     VenueSession<FakeFeed, BinanceFuturesSequencePolicy, beast::tcp_stream, SymbolBook> session(
         std::move(feed), "fake_venue", symbols, std::move(registry), io.get_executor());
 
@@ -458,7 +469,7 @@ TEST(VenueSessionTest, StopDrainsInFlightSnapshotFetch) {
 // flight) so a regression points straight at this code path.
 TEST(VenueSessionTest, StopWhileConnectedAndReadingReturnsCleanly) {
     std::vector<std::string> symbols{"BTCUSDT"};
-    AggregatorService service(symbols);
+    AggregatorService service(std::vector<BookId>{TestBookId()});
 
     net::io_context io;
     net::ip::tcp::acceptor ws_acceptor(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
@@ -472,7 +483,7 @@ TEST(VenueSessionTest, StopWhileConnectedAndReadingReturnsCleanly) {
     // above - this test is about the read/invalidate path, not snapshots.
     FakeFeed feed(std::to_string(ws_port), "1");
     SymbolRegistry<SymbolBook> registry;
-    registry.add("BTCUSDT", service.book("BTCUSDT"));
+    registry.add("BTCUSDT", service.book(TestBookId()));
     VenueSession<FakeFeed, BinanceFuturesSequencePolicy, beast::tcp_stream, SymbolBook> session(
         std::move(feed), "fake_venue", symbols, std::move(registry), io.get_executor());
 
@@ -519,7 +530,7 @@ TEST(VenueSessionTest, StopWhileConnectedAndReadingReturnsCleanly) {
 // proves the opposite: run() must never even attempt to connect.
 TEST(VenueSessionTest, StopBeforeStartPreventsConnecting) {
     std::vector<std::string> symbols{"BTCUSDT"};
-    AggregatorService service(symbols);
+    AggregatorService service(std::vector<BookId>{TestBookId()});
 
     net::io_context io;
     net::ip::tcp::acceptor ws_acceptor(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
@@ -530,7 +541,7 @@ TEST(VenueSessionTest, StopBeforeStartPreventsConnecting) {
 
     FakeFeed feed(std::to_string(ws_port), "1");
     SymbolRegistry<SymbolBook> registry;
-    registry.add("BTCUSDT", service.book("BTCUSDT"));
+    registry.add("BTCUSDT", service.book(TestBookId()));
     VenueSession<FakeFeed, BinanceFuturesSequencePolicy, beast::tcp_stream, SymbolBook> session(
         std::move(feed), "fake_venue", symbols, std::move(registry), io.get_executor());
 

@@ -8,6 +8,7 @@ namespace bobby::hermeneutic::ingestion {
 namespace {
 
 using bobby::hermeneutic::symbol::BookType;
+using bobby::hermeneutic::symbol::to_string;
 using bobby::hermeneutic::symbol::Venue;
 
 TEST(ParseBookSubscriptions, ParsesTheMotivatingExample) {
@@ -22,26 +23,26 @@ TEST(ParseBookSubscriptions, ParsesTheMotivatingExample) {
 
     EXPECT_EQ((*result)[0].venue, Venue::Binance);
     EXPECT_EQ((*result)[0].type, BookType::Spot);
-    EXPECT_EQ((*result)[0].book_key, "BTCUSDT.SPOT");
+    EXPECT_EQ(to_string((*result)[0].book_id), "BTC_USDT.SPOT");
     EXPECT_EQ((*result)[0].native_symbol, "BTCUSDT");
 
     EXPECT_EQ((*result)[1].venue, Venue::Okx);
     EXPECT_EQ((*result)[1].type, BookType::Spot);
-    EXPECT_EQ((*result)[1].book_key, "BTCUSDT.SPOT");
+    EXPECT_EQ(to_string((*result)[1].book_id), "BTC_USDT.SPOT");
     EXPECT_EQ((*result)[1].native_symbol, "BTC-USDT");
 
     EXPECT_EQ((*result)[2].venue, Venue::Bybit);
-    EXPECT_EQ((*result)[2].book_key, "BTCUSDT.SPOT");
+    EXPECT_EQ(to_string((*result)[2].book_id), "BTC_USDT.SPOT");
     EXPECT_EQ((*result)[2].native_symbol, "BTCUSDT");
 
     EXPECT_EQ((*result)[3].venue, Venue::Binance);
     EXPECT_EQ((*result)[3].type, BookType::Perp);
-    EXPECT_EQ((*result)[3].book_key, "BTCUSDT.PERP");
+    EXPECT_EQ(to_string((*result)[3].book_id), "BTC_USDT.PERP");
     EXPECT_EQ((*result)[3].native_symbol, "BTCUSDT");
 
     EXPECT_EQ((*result)[4].venue, Venue::Okx);
     EXPECT_EQ((*result)[4].type, BookType::Perp);
-    EXPECT_EQ((*result)[4].book_key, "BTCUSDT.PERP");
+    EXPECT_EQ(to_string((*result)[4].book_id), "BTC_USDT.PERP");
     EXPECT_EQ((*result)[4].native_symbol, "BTC-USDT-SWAP");
 }
 
@@ -54,9 +55,9 @@ TEST(ParseBookSubscriptions, HandlesMultipleSymbols) {
     })");
     ASSERT_TRUE(result.has_value()) << result.error();
     ASSERT_EQ(result->size(), 3u);
-    EXPECT_EQ((*result)[0].book_key, "BTCUSDT.SPOT");
-    EXPECT_EQ((*result)[1].book_key, "ETHUSDT.PERP");
-    EXPECT_EQ((*result)[2].book_key, "ETHUSDT.PERP");
+    EXPECT_EQ(to_string((*result)[0].book_id), "BTC_USDT.SPOT");
+    EXPECT_EQ(to_string((*result)[1].book_id), "ETH_USDT.PERP");
+    EXPECT_EQ(to_string((*result)[2].book_id), "ETH_USDT.PERP");
 }
 
 TEST(ParseBookSubscriptions, RejectsMalformedJson) {
@@ -151,7 +152,7 @@ TEST(LoadBookSubscriptions, ReadsAndParsesARealFile) {
     auto result = load_book_subscriptions(path);
     ASSERT_TRUE(result.has_value()) << result.error();
     ASSERT_EQ(result->size(), 1u);
-    EXPECT_EQ((*result)[0].book_key, "BTCUSDT.SPOT");
+    EXPECT_EQ(to_string((*result)[0].book_id), "BTC_USDT.SPOT");
 }
 
 TEST(LoadBookSubscriptions, RejectsAMissingFile) {
