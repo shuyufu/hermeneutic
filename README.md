@@ -73,16 +73,23 @@ minimal example client for the service above - not a throwaway (unlike this
 project's earlier live-verification programs, see `docs/ingestion_design.md`),
 kept around as a starting point for consuming `AggregatorService`'s output
 and for manually poking at a running instance. It subscribes one or more book
-keys to `SubscribeBbo`, `SubscribeL2Diff`, or both (one thread per
-`(symbol, stream)` pair), logging every update, and checks `SubscribeL2Diff`'s
-own `book_seq` contiguity guarantee itself, printing a `GAP` line if that
-contract is ever violated:
+keys (one thread per symbol) and publishes a chosen view of
+the order book to stdout on every update; `volume-bands`/`price-bands` check
+`SubscribeL2Diff`'s own `book_seq` contiguity guarantee themselves, printing
+a `GAP` line if that contract is ever violated:
 
 ```sh
 cmake --build build-vcpkg --target hermeneutic_aggregator_client
-# <address> <bbo|l2|both> <duration_seconds> <symbol1> [symbol2 ...]
+# <address> <bbo|volume-bands|price-bands> <duration_seconds> <symbol1> [symbol2 ...]
 # duration_seconds <= 0 runs until interrupted or the server ends the stream.
-./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 both 60 BTCUSDT.SPOT BTCUSDT.PERP
+#   bbo:          subscribes to SubscribeBbo, prints best bid/ask
+#   volume-bands: subscribes to SubscribeL2Diff, prints the VWAP needed to
+#                 fill 1M/5M/10M/25M/50M+ notional on each side
+#   price-bands:  subscribes to SubscribeL2Diff, prints depth within
+#                 50/100/200/500/1000+ bps of BBO on each side
+./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 bbo 60 BTCUSDT.SPOT BTCUSDT.PERP
+./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 volume-bands 60 BTCUSDT.SPOT
+./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 price-bands 60 BTCUSDT.SPOT
 ```
 
 `hermeneutic_aggregator_service_test` exercises it over a real (in-process)

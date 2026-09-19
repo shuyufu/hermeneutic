@@ -230,7 +230,7 @@ if(HERMENEUTIC_BUILD_SERVICE)
     # apps/aggregator/client_main.cpp's own comment for why this one isn't
     # a throwaway like this project's other live-verification programs.
     add_executable(hermeneutic_aggregator_client apps/aggregator/client_main.cpp)
-    target_link_libraries(hermeneutic_aggregator_client PRIVATE hermeneutic::proto)
+    target_link_libraries(hermeneutic_aggregator_client PRIVATE hermeneutic::book hermeneutic::proto)
 
     if(HERMENEUTIC_BUILD_TESTS)
         add_executable(hermeneutic_aggregator_service_test tests/apps/aggregator/aggregator_service_test.cpp)
