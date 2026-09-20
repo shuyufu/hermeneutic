@@ -118,9 +118,7 @@ std::expected<std::vector<PriceBand>, std::errc> price_band_depth(
     bool round_down = bps_sign >= 0;  // ask boundary rounds down, bid rounds up: both inward.
 
     for (const auto& [price, size] : levels) {
-        if (price.raw() <= 0 || size.raw() < 0) {
-            return std::unexpected(std::errc::argument_out_of_domain);
-        }
+        if (!is_valid_level(price, size)) return std::unexpected(std::errc::argument_out_of_domain);
 
         while (next < bps_thresholds.size()) {
             int signed_bps = bps_sign * bps_thresholds[next];

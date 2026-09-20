@@ -35,11 +35,11 @@ static_assert(Price::decimals == 9);
 static_assert(Size::decimals == 6);
 
 // One bounded mailbox per subscriber. Publishers (SymbolBook::apply_delta/
-// apply_snapshot/invalidate_venue/send_heartbeat, via broadcast_to_
-// subscribers()) only ever push; the SubscribeL2Diff()/SubscribeBbo()
-// handler thread that owns this subscriber's ServerWriter is the only one
-// that drains it and calls Write(). Never shared across subscribers, so one
-// slow drainer never contends with another subscriber's push or drain.
+// apply_snapshot/invalidate_venue/send_heartbeat, via Fanout::broadcast())
+// only ever push; the SubscribeL2Diff()/SubscribeBbo() handler thread that
+// owns this subscriber's ServerWriter is the only one that drains it and
+// calls Write(). Never shared across subscribers, so one slow drainer
+// never contends with another subscriber's push or drain.
 //
 // What a full queue should do differs by stream, hence `OverflowPolicy`:
 //
@@ -58,6 +58,10 @@ static_assert(Size::decimals == 6);
 //   disconnecting the subscriber for a condition that doesn't actually
 //   corrupt anything it will eventually receive.
 //
+// Both policies apply at a higher (not absent) capacity during the
+// bootstrap window between a queue's registration and its owner's first
+// successful Write() - see push_or_close()/end_bootstrap() below for why.
+//
 // Whichever policy is chosen, `closed_` (and DrainResult::Closed) is only
 // ever set by the Close policy's overflow path; a DropOldest queue is never
 // closed by this class, so its DrainResult is always TimedOut or Drained.
@@ -72,11 +76,31 @@ class SubscriberQueue {
         : capacity_(capacity), overflow_policy_(overflow_policy) {}
 
     // Non-blocking. False means this push found the queue already closed,
-    // or (Close policy only) just closed it by overflowing `capacity_`.
+    // or (Close policy only) just closed it by overflowing its effective
+    // capacity. While bootstrapping (see end_bootstrap() below), that
+    // effective capacity is `capacity_ * kBootstrapCapacityMultiplier`,
+    // not `capacity_` itself: a newly subscribed queue is registered for
+    // broadcast before its caller's own initial Write() (a blocking
+    // network call) has even completed - see SymbolBook::subscribe()'s
+    // own comment for why that ordering is required - so an ordinary
+    // burst landing in that window, while nobody has started draining
+    // yet, must not trip the same tight threshold a genuinely slow,
+    // already-draining subscriber would. This still has to be a real
+    // ceiling, not "no limit until draining starts": Write() blocking on
+    // a client that gRPC flow control has stalled is exactly the slow-
+    // client scenario Close/DropOldest exist for, and it can last as
+    // long as the peer keeps its window closed - a client that connects
+    // and then stops reading must not be able to drive unbounded memory
+    // growth here. If genuinely kBootstrapCapacityMultiplier times the
+    // steady-state capacity piles up before one Write() call returns,
+    // that Write() has stalled badly enough that applying the configured
+    // policy (closing an L2 subscriber, dropping a stale Bbo) is the
+    // right call anyway, same as it would be once draining has started.
     bool push_or_close(T update) {
         std::lock_guard lock(mutex_);
         if (closed_) return false;
-        if (queue_.size() >= capacity_) {
+        std::size_t effective_capacity = bootstrapping_ ? capacity_ * kBootstrapCapacityMultiplier : capacity_;
+        if (queue_.size() >= effective_capacity) {
             if (overflow_policy_ == OverflowPolicy::Close) {
                 closed_ = true;
                 queue_.clear();
@@ -88,6 +112,18 @@ class SubscriberQueue {
         queue_.push_back(std::move(update));
         cv_.notify_one();
         return true;
+    }
+
+    // Ends the bootstrap window described above, switching push_or_close()
+    // back to its normal capacity/policy enforcement. Called exactly once,
+    // by the subscribe() that created this queue, right after its own
+    // initial Write() has succeeded - never by anything else, so there is
+    // no race over `bootstrapping_` itself (this method and push_or_close()
+    // both take mutex_, but the write to bootstrapping_ has only ever this
+    // one caller).
+    void end_bootstrap() {
+        std::lock_guard lock(mutex_);
+        bootstrapping_ = false;
     }
 
     // Blocks up to `timeout` for a queued update or a close. Closed takes
@@ -107,12 +143,17 @@ class SubscriberQueue {
     }
 
   private:
+    // See push_or_close()'s own comment for why bootstrapping gets a
+    // higher, not absent, ceiling.
+    static constexpr std::size_t kBootstrapCapacityMultiplier = 4;
+
     std::mutex mutex_;
     std::condition_variable cv_;
     std::deque<T> queue_;
     std::size_t capacity_;
     OverflowPolicy overflow_policy_;
     bool closed_ = false;
+    bool bootstrapping_ = true;
 };
 
 // One stream's worth of subscriber bookkeeping: create a queue, broadcast
@@ -274,10 +315,10 @@ class SymbolBook {
         // rejection), but there is no reason to pay for before_bids/
         // before_asks construction on a batch already known to be bad.
         for (const auto& [price, size] : bids) {
-            if (price.raw() <= 0 || size.raw() < 0) return std::unexpected(std::errc::invalid_argument);
+            if (!is_valid_level(price, size)) return std::unexpected(std::errc::invalid_argument);
         }
         for (const auto& [price, size] : asks) {
-            if (price.raw() <= 0 || size.raw() < 0) return std::unexpected(std::errc::invalid_argument);
+            if (!is_valid_level(price, size)) return std::unexpected(std::errc::invalid_argument);
         }
 
         std::lock_guard lock(mutex_);
@@ -301,13 +342,14 @@ class SymbolBook {
         }
 
         // Re-validates (already checked above, but book_.apply_batch() -
-        // and, one layer further in, apply_delta()'s own require_valid_level()
-        // - has to hold that guarantee on its own for callers that don't
-        // pre-validate) then applies. Three validation layers deep by the
-        // time a level reaches require_valid_level() is intentional
-        // defense in depth, not a sign any one of them is redundant to
-        // remove - each guards a different caller (this class's own
-        // pre-check above is the only one skipped by calling book_ directly).
+        // and, one layer further in, apply_delta()'s own call to the
+        // shared is_valid_level() - has to hold that guarantee on its
+        // own for callers that don't pre-validate) then applies. Three
+        // validation layers deep by the time a level reaches
+        // is_valid_level() is intentional defense in depth, not a sign
+        // any one of them is redundant to remove - each guards a
+        // different caller (this class's own pre-check above is the
+        // only one skipped by calling book_ directly).
         // Given this exact bids/asks already passed the check above,
         // this can only fail on allocation here, matching
         // book_.apply_delta()'s own documented not-rolled-back-partway
@@ -369,42 +411,13 @@ class SymbolBook {
     // registers it for subsequent updates and returns its queue. Returns
     // nullptr (without leaving it registered) if the initial Write() fails -
     // the caller (AggregatorService::SubscribeL2Diff()) should end the RPC
-    // without draining a queue that was never meant to be used.
-    //
-    // writer->Write() is a blocking network call (gRPC flow control/TCP
-    // backpressure) - it must never run while mutex_ is held, or one new
-    // subscriber's slow/high-latency connection stalls ingestion
-    // (apply_delta/apply_batch/apply_snapshot) and every *other*
-    // subscriber's broadcast for as long as this one Write() takes. So
-    // this registers into l2_fanout_ *before* calling Write() (both
-    // under one lock, atomically with the snapshot itself, matching the
-    // previous single-critical-section guarantee that no update between
-    // "snapshot taken" and "registered for future updates" is ever
-    // missed), releases the lock, then writes. This is safe against a
-    // concurrent broadcast landing in that gap: Fanout::broadcast()
-    // only ever pushes into `queue` (a non-blocking, thread-safe
-    // enqueue - see Fanout's own class comment) and never calls Write()
-    // itself, so there is no writer->Write() vs. writer->Write() race -
-    // only this thread ever calls Write() on this particular `writer`.
-    // A registered-but-not-yet-Write()-succeeded subscriber just
-    // accumulates in its own queue like any other, ready for this
-    // function's caller to drain once it gets `queue` back. On failure,
-    // the provisional registration is undone under a second, separate
-    // critical section - Fanout::unsubscribe() erasing a key that isn't
-    // present is a no-op, not an error.
+    // without draining a queue that was never meant to be used. See
+    // subscribe_impl() below for the shared implementation both this and
+    // subscribe_bbo() call - including why Write() must not run under
+    // mutex_, why registering before it is safe, and why the resulting
+    // queue starts in SubscriberQueue's "bootstrapping" mode.
     std::shared_ptr<SubscriberQueue<L2Update>> subscribe(grpc::ServerWriter<L2Update>* writer) {
-        L2Update snapshot;
-        std::shared_ptr<SubscriberQueue<L2Update>> queue;
-        {
-            std::lock_guard lock(mutex_);
-            snapshot = build_snapshot();
-            queue = l2_fanout_.subscribe();
-        }
-        if (writer->Write(snapshot)) return queue;
-
-        std::lock_guard lock(mutex_);
-        l2_fanout_.unsubscribe(queue);
-        return nullptr;
+        return subscribe_impl(l2_fanout_, writer, [this] { return build_snapshot(); });
     }
 
     // Takes the queue subscribe() handed back, not the writer that was
@@ -419,26 +432,13 @@ class SymbolBook {
     // Writes the current complete BBO state to `writer` and, if that
     // succeeds, registers it for subsequent updates and returns its queue.
     // Returns nullptr (without leaving it registered) if the initial
-    // Write() fails - mirrors subscribe() above, including why Write()
-    // must not run under mutex_ and why registering before it (rather
-    // than after) is safe - see that function's own comment. Uses
-    // OverflowPolicy::DropOldest, not Close: see SubscriberQueue's class
-    // comment for why a slow BBO subscriber should never be disconnected
-    // for falling behind.
+    // Write() fails - mirrors subscribe() above via the same
+    // subscribe_impl() helper. Uses OverflowPolicy::DropOldest, not
+    // Close: see SubscriberQueue's class comment for why a slow BBO
+    // subscriber should never be disconnected for falling behind.
     std::shared_ptr<SubscriberQueue<BboUpdate>> subscribe_bbo(
         grpc::ServerWriter<BboUpdate>* writer) {
-        BboUpdate bbo;
-        std::shared_ptr<SubscriberQueue<BboUpdate>> queue;
-        {
-            std::lock_guard lock(mutex_);
-            bbo = build_bbo();
-            queue = bbo_fanout_.subscribe();
-        }
-        if (writer->Write(bbo)) return queue;
-
-        std::lock_guard lock(mutex_);
-        bbo_fanout_.unsubscribe(queue);
-        return nullptr;
+        return subscribe_impl(bbo_fanout_, writer, [this] { return build_bbo(); });
     }
 
     // See unsubscribe()'s own comment above for why this takes the queue,
@@ -450,6 +450,71 @@ class SymbolBook {
 
   private:
     static constexpr std::size_t kSubscriberQueueCapacity = 256;
+
+    // Shared by subscribe()/subscribe_bbo() (a code-review finding: they
+    // used to hand-duplicate this whole sequence, differing only in
+    // update type, snapshot-builder, and which fanout to use - exactly
+    // the kind of duplication Fanout<T> itself was extracted to remove
+    // one layer down).
+    //
+    // `writer->Write()` is a blocking network call (gRPC flow control/TCP
+    // backpressure) - it must never run while mutex_ is held, or one new
+    // subscriber's slow/high-latency connection stalls ingestion
+    // (apply_delta/apply_batch/apply_snapshot) and every *other*
+    // subscriber's broadcast for as long as this one Write() takes. So
+    // this registers into `fanout` *before* calling Write() (both under
+    // one lock, atomically with the snapshot/BBO capture via
+    // `build_initial`, matching the previous single-critical-section
+    // guarantee that no update between "initial state captured" and
+    // "registered for future updates" is ever missed), releases the
+    // lock, then writes. Safe against a concurrent broadcast landing in
+    // that gap: Fanout::broadcast() only ever pushes into `queue` (a
+    // non-blocking, thread-safe enqueue) and never calls Write() itself,
+    // so there is no writer->Write() vs. writer->Write() race - only
+    // this thread ever calls Write() on this particular `writer`.
+    //
+    // The queue Fanout::subscribe() returns starts in SubscriberQueue's
+    // "bootstrapping" mode (see that class's own comment): registered-
+    // but-not-yet-Write()-succeeded, it accumulates broadcasts against a
+    // higher capacity than usual, rather than risking a Close-policy
+    // queue closing itself on the tight steady-state threshold -
+    // disconnecting a client with RESOURCE_EXHAUSTED before it ever
+    // received anything - just because an ordinary burst landed while
+    // this one blocking Write() is still in flight (a real, code-review-
+    // flagged race in an earlier version of this function, before
+    // end_bootstrap() existed). end_bootstrap() is
+    // called the moment Write() succeeds, immediately before handing the
+    // queue back - from that point on, capacity/OverflowPolicy apply
+    // exactly as SubscriberQueue's own class comment documents.
+    //
+    // On failure, the provisional registration is undone under a
+    // second, separate critical section - Fanout::unsubscribe() erasing
+    // a key that isn't present is a no-op, not an error.
+    template <typename T, typename BuildInitial>
+    std::shared_ptr<SubscriberQueue<T>> subscribe_impl(Fanout<T>& fanout, grpc::ServerWriter<T>* writer,
+                                                         BuildInitial&& build_initial) {
+        T initial;
+        std::shared_ptr<SubscriberQueue<T>> queue;
+        {
+            std::lock_guard lock(mutex_);
+            initial = build_initial();
+            queue = fanout.subscribe();
+        }
+        // Unconditional, not just on the success path: nothing about
+        // leaving bootstrapping_ true depends on whether Write()
+        // succeeded, and running this before branching means the
+        // queue's mode never depends on which path is taken - a defensive
+        // habit, not a fix for a live bug (the failure path's `queue`
+        // goes out of scope right after unsubscribe() below, with no
+        // other owner today).
+        bool wrote = writer->Write(initial);
+        queue->end_bootstrap();
+        if (wrote) return queue;
+
+        std::lock_guard lock(mutex_);
+        fanout.unsubscribe(queue);
+        return nullptr;
+    }
 
     struct Change {
         Side side;

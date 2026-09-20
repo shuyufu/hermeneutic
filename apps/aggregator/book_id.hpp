@@ -56,7 +56,16 @@ inline void fill_wire_book_id(BookId* wire, const symbol::BookId& id) {
     // comment on why every switch over it, here included, is what turns a
     // missed future value into a compiler warning instead of silently
     // wiring the wrong market.
-    MarketType market;
+    //
+    // Initialized to the wire's own "something's wrong here" sentinel,
+    // not left uninitialized: -Wswitch (no -Werror in this build) warns
+    // but doesn't block a future symbol::MarketType value this switch
+    // hasn't been updated for, and id.type could in principle also hold
+    // an out-of-range value from memory corruption - either way, reading
+    // an uninitialized `market` afterward would be UB (a code-review
+    // finding); MARKET_TYPE_UNSPECIFIED degrades safely instead, and it's
+    // exactly the value to_symbol_book_id() already treats as an error.
+    MarketType market = MarketType::MARKET_TYPE_UNSPECIFIED;
     switch (id.type) {
         case symbol::MarketType::Spot: market = MarketType::SPOT; break;
         case symbol::MarketType::Perp: market = MarketType::PERP; break;

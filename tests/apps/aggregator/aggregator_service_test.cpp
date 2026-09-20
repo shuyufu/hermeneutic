@@ -124,8 +124,38 @@ TEST(SubscriberQueueTest, DrainsInFifoOrderAndReportsResultKind) {
     EXPECT_EQ(out[1].heartbeat().ts_ns(), 2u);
 }
 
+TEST(SubscriberQueueTest, BootstrappingAllowsAHigherCapacityThanSteadyState) {
+    SubscriberQueue<L2Update> queue(2, OverflowPolicy::Close);
+
+    // A freshly constructed queue starts in "bootstrapping" mode (see
+    // SubscriberQueue's own class comment): capacity is raised by
+    // kBootstrapCapacityMultiplier (4x) rather than removed, since
+    // nobody has started draining yet and the caller that will
+    // eventually own this queue (SymbolBook::subscribe()) hasn't even
+    // finished its own initial Write() - but it still has to be a real
+    // ceiling, not "no limit," or a client that connects and stops
+    // reading could grow this queue without bound. 8 pushes (2*4) into a
+    // capacity-2 queue must all still succeed here, even though the same
+    // burst would have closed a steady-state (post-end_bootstrap())
+    // queue after just 2.
+    L2Update update;
+    for (int i = 0; i < 8; ++i) {
+        EXPECT_TRUE(queue.push_or_close(update));
+    }
+
+    // The 9th push exceeds even the bootstrap ceiling - the queue must
+    // still close rather than grow further.
+    EXPECT_FALSE(queue.push_or_close(update));
+
+    std::vector<L2Update> out;
+    EXPECT_EQ(queue.wait_and_drain(std::chrono::milliseconds(10), out),
+              SubscriberQueue<L2Update>::DrainResult::Closed);
+    EXPECT_TRUE(out.empty());  // closed, so the 8 successfully queued updates were discarded
+}
+
 TEST(SubscriberQueueTest, CloseOverflowClosesAndDiscardsEverythingQueued) {
     SubscriberQueue<L2Update> queue(2, OverflowPolicy::Close);
+    queue.end_bootstrap();  // capacity/OverflowPolicy only apply after this
 
     L2Update update;
     ASSERT_TRUE(queue.push_or_close(update));
@@ -146,6 +176,7 @@ TEST(SubscriberQueueTest, CloseOverflowClosesAndDiscardsEverythingQueued) {
 
 TEST(SubscriberQueueTest, DropOldestOverflowKeepsNewestWithoutClosing) {
     SubscriberQueue<BboUpdate> queue(2, OverflowPolicy::DropOldest);
+    queue.end_bootstrap();  // capacity/OverflowPolicy only apply after this
 
     BboUpdate first, second, third;
     first.mutable_bbo()->set_book_seq(1);

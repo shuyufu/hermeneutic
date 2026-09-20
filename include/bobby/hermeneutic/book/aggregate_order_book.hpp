@@ -33,7 +33,7 @@ class AggregateOrderBook {
     // book could not be allocated.
     std::expected<void, std::errc> apply_delta(const VenueId& venue, Side side, Price price,
                                                 Size size) noexcept {
-        if (auto check = require_valid_level(price, size); !check) return check;
+        if (!is_valid_level(price, size)) return std::unexpected(std::errc::invalid_argument);
 
         try {
             auto& venue_book = venues_[venue];
@@ -75,7 +75,9 @@ class AggregateOrderBook {
     std::expected<void, std::errc> apply_snapshot(
         const VenueId& venue, Side side, std::span<const std::pair<Price, Size>> levels) noexcept {
         for (const auto& level : levels) {
-            if (auto check = require_valid_level(level.first, level.second); !check) return check;
+            if (!is_valid_level(level.first, level.second)) {
+                return std::unexpected(std::errc::invalid_argument);
+            }
         }
 
         try {
@@ -107,10 +109,10 @@ class AggregateOrderBook {
                                                 std::span<const std::pair<Price, Size>> bids,
                                                 std::span<const std::pair<Price, Size>> asks) noexcept {
         for (const auto& [price, size] : bids) {
-            if (auto check = require_valid_level(price, size); !check) return check;
+            if (!is_valid_level(price, size)) return std::unexpected(std::errc::invalid_argument);
         }
         for (const auto& [price, size] : asks) {
-            if (auto check = require_valid_level(price, size); !check) return check;
+            if (!is_valid_level(price, size)) return std::unexpected(std::errc::invalid_argument);
         }
 
         for (const auto& [price, size] : bids) {
@@ -126,26 +128,6 @@ class AggregateOrderBook {
     const std::unordered_map<VenueId, L2OrderBook>& venues() const noexcept { return venues_; }
 
   private:
-    // Rejects a level with a non-positive price or a negative size before
-    // it ever reaches venue_/aggregate_'s maps. A non-positive price used
-    // to pass through unchecked (only size was validated) - it would sort
-    // into the book like any other price, and price_bands.hpp's
-    // offset_by_bps()/within_bps() only assert() their own price>0
-    // precondition, which is compiled out under NDEBUG - so a malformed
-    // upstream message (a parse bug, or price_raw==0/negative on the wire)
-    // could silently corrupt band computations in a release build instead
-    // of being rejected here, at the one place that actually sees every
-    // level before it becomes part of the book's persistent state.
-    static std::expected<void, std::errc> require_valid_level(Price price, Size size) noexcept {
-        if (price.raw() <= 0) {
-            return std::unexpected(std::errc::invalid_argument);
-        }
-        if (size.raw() < 0) {
-            return std::unexpected(std::errc::invalid_argument);
-        }
-        return {};
-    }
-
     // Sets `price` to `new_size` in `side` (erasing it when <= 0) and
     // returns the size that was there before, so the caller can derive a delta.
     // `new_size` is validated non-negative by the public entry points; the

@@ -59,8 +59,9 @@ enum class MarketType { Spot, Perp };
 // venue list against it, e.g. bobby::hermeneutic::ingestion's subscription
 // config) stays usable - and unit-testable - without linking simdjson or
 // gRPC at all. Adding an exchange means adding a case to native_symbol()/
-// to_string(VenueId)/parse_exchange() below, and separately wiring its
-// Feed/Policy into apps/aggregator/server_main.cpp's own dispatch.
+// venue_naming() (to_string(VenueId)'s own helper, below)/parse_exchange(),
+// and separately wiring its Feed/Policy into apps/aggregator/server_main.cpp's
+// own dispatch.
 enum class Exchange { Binance, Bybit, Okx };
 
 inline std::optional<Exchange> parse_exchange(std::string_view token) {
@@ -226,32 +227,51 @@ struct VenueId {
 // exchange's term as "the" answer. For display only, same as
 // to_string(BookId) above - nothing parses this back into a VenueId, and
 // nothing needs to: nothing constructs a VenueId from a string any more.
-inline std::string to_string(const VenueId& id) {
-    // Nested exhaustive switch, not `id.type == MarketType::Spot ? X : Y`
-    // per exchange - see MarketType's own comment on why a missed future
-    // value needs to be a compiler warning at every switch over it, not a
-    // silently-wrong ternary fallthrough.
-    switch (id.exchange) {
-        case Exchange::Binance:
-            switch (id.type) {
-                case MarketType::Spot: return "binance_spot";
-                case MarketType::Perp: return "binance_futures";
-            }
-            break;
-        case Exchange::Bybit:
-            switch (id.type) {
-                case MarketType::Spot: return "bybit_spot";
-                case MarketType::Perp: return "bybit_linear";
-            }
-            break;
-        case Exchange::Okx:
-            switch (id.type) {
-                case MarketType::Spot: return "okx_spot";
-                case MarketType::Perp: return "okx_swap";
-            }
-            break;
+// to_string(VenueId)'s own naming table: `exchange_part` is the lowercase
+// log-facing exchange name ("binance"/"bybit"/"okx" - distinct from
+// exchange_name()'s uppercase config-facing "BINANCE"/"BYBIT"/"OKX", a
+// different vocabulary for a different audience), `spot_suffix`/
+// `perp_suffix` are that exchange's own term for each market segment
+// ("futures"/"linear"/"swap" all mean the same thing - a perpetual swap -
+// but each exchange's own docs use a different word for it, and this
+// stays venue-native rather than picking one).
+//
+// Factored out of to_string(VenueId) itself so that function needs only
+// one flat switch(MarketType) - not this switch(Exchange) nested inside
+// every one of its cases (a code-review finding: 6 leaf returns, 3 dead
+// `break`s, and an unreachable trailing return, to cover what's really
+// two independent, individually-exhaustive 2-and-3-way choices). Both
+// switches stay real exhaustive switches (no default:), same reasoning
+// as every other switch over Exchange/MarketType in this file - a future
+// third value of either enum should still be a compiler warning here.
+//
+// Declared at namespace scope, not as a function-local struct returned
+// via `auto`: a function-local type's name isn't visible to its own
+// caller, so `to_string(VenueId)` would be stuck spelling its result as
+// `auto` forever, and no other function could ever hold one by name.
+struct VenueNaming {
+    std::string_view exchange_part;
+    std::string_view spot_suffix;
+    std::string_view perp_suffix;
+};
+
+constexpr VenueNaming venue_naming(Exchange exchange) {
+    switch (exchange) {
+        case Exchange::Binance: return VenueNaming{"binance", "spot", "futures"};
+        case Exchange::Bybit: return VenueNaming{"bybit", "spot", "linear"};
+        case Exchange::Okx: return VenueNaming{"okx", "spot", "swap"};
     }
-    return "";  // unreachable - silences -Wreturn-type on an exhaustive switch
+    return VenueNaming{"", "", ""};  // unreachable - silences -Wreturn-type
+}
+
+inline std::string to_string(const VenueId& id) {
+    VenueNaming naming = venue_naming(id.exchange);
+    std::string_view market_part;
+    switch (id.type) {
+        case MarketType::Spot: market_part = naming.spot_suffix; break;
+        case MarketType::Perp: market_part = naming.perp_suffix; break;
+    }
+    return std::string(naming.exchange_part) + "_" + std::string(market_part);
 }
 
 // The wire-format symbol a venue's own Feed subscribes with. Binance/Bybit

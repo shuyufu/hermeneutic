@@ -206,19 +206,31 @@ void apply_levels(Map& side, const Levels& levels) {
     }
 }
 
-// Shared by every StreamCanceller and by main()'s `stop` watcher below:
-// one mutex/condition_variable pair the whole process waits on and
-// notifies through, rather than each canceller thread polling on a timer
-// (the old behavior cost every stream teardown up to 200ms of needless
-// wait). Contention is a non-issue - each thread touches this only once
-// to wait and once (from the other side) to notify.
-std::mutex& cancel_mutex() {
+class StreamCanceller;
+
+// Registry of every currently-live StreamCanceller, so main()'s global
+// `stop` flag can wake each one individually through its own private
+// condition_variable, instead of every canceller sharing one cv/mutex
+// pair the way an earlier version of this class did - a design where
+// any single stream's own *natural* completion (nothing to do with a
+// global stop) woke every other concurrently-subscribed stream's
+// canceller thread too, each re-acquiring the one shared mutex just to
+// find its own predicate still false: a thundering-herd wakeup on every
+// individual stream teardown, not just at actual shutdown, scaling with
+// subscription count (a code-review finding).
+//
+// This registry's own mutex is held only briefly, for registration/
+// deregistration/notify-everyone bookkeeping - never while any canceller
+// thread is actually blocked waiting - so it introduces no new
+// contention on the wait path itself, unlike the shared cv/mutex pair
+// it replaces.
+std::mutex& canceller_registry_mutex() {
     static std::mutex m;
     return m;
 }
-std::condition_variable& cancel_cv() {
-    static std::condition_variable cv;
-    return cv;
+std::vector<StreamCanceller*>& canceller_registry() {
+    static std::vector<StreamCanceller*> registry;
+    return registry;
 }
 
 // RAII owner of the background thread that cancels `context` if the
@@ -239,24 +251,57 @@ std::condition_variable& cancel_cv() {
 class StreamCanceller {
   public:
     StreamCanceller(grpc::ClientContext& context, std::atomic<bool>* stop)
-        : stop_(stop), thread_([this, &context] { run(context); }) {}
+        : stop_(stop), thread_([this, &context] { run(context); }) {
+        std::lock_guard<std::mutex> lock(canceller_registry_mutex());
+        canceller_registry().push_back(this);
+    }
 
     ~StreamCanceller() {
+        // Deregister first, before touching anything else this
+        // instance owns: notify_stop() (called by main()'s stop path,
+        // possibly from another thread, concurrently with this
+        // destructor running) only ever reaches instances still in the
+        // registry, so removing `this` here - before mutex_/cv_/
+        // thread_ are torn down below - guarantees notify_stop() can
+        // never be called on a partially-destroyed object. The two
+        // registry-mutex critical sections (this erase, and
+        // notify_all_of_stop()'s own iteration below) are mutually
+        // exclusive, so whichever runs first fully finishes before the
+        // other can start.
         {
-            std::lock_guard<std::mutex> lock(cancel_mutex());
+            std::lock_guard<std::mutex> lock(canceller_registry_mutex());
+            std::erase(canceller_registry(), this);
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
             read_loop_done_ = true;
         }
-        cancel_cv().notify_all();
+        cv_.notify_all();
         thread_.join();
     }
 
     StreamCanceller(const StreamCanceller&) = delete;
     StreamCanceller& operator=(const StreamCanceller&) = delete;
 
+    // Called by main()'s stop path (via notify_all_of_stop() below) to
+    // wake this one instance without touching any other canceller's own
+    // wait. Must take `mutex_` - the same lock run()'s wait() uses -
+    // even though `*stop_` itself is already a plain atomic write done
+    // by the caller before this runs: the atomicity of the *value* does
+    // not, on its own, close the lost-wakeup window between a waiter
+    // re-checking its predicate and actually starting to block (see
+    // main()'s own comment on the identical hazard this project already
+    // hit once with the previous shared-mutex design). Taking `mutex_`
+    // here serializes against exactly that transition.
+    void notify_stop() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cv_.notify_all();
+    }
+
   private:
     void run(grpc::ClientContext& context) {
-        std::unique_lock<std::mutex> lock(cancel_mutex());
-        cancel_cv().wait(lock, [this] { return stop_->load() || read_loop_done_; });
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] { return stop_->load() || read_loop_done_; });
         bool should_cancel = stop_->load();
         lock.unlock();
         if (should_cancel) context.TryCancel();
@@ -264,8 +309,18 @@ class StreamCanceller {
 
     std::atomic<bool>* stop_;
     bool read_loop_done_ = false;
+    std::mutex mutex_;
+    std::condition_variable cv_;
     std::thread thread_;
 };
+
+// Wakes every currently-registered StreamCanceller - see
+// canceller_registry()'s own comment for why each gets its own
+// individually-locked notify rather than one shared broadcast.
+void notify_all_of_stop() {
+    std::lock_guard<std::mutex> lock(canceller_registry_mutex());
+    for (StreamCanceller* canceller : canceller_registry()) canceller->notify_stop();
+}
 
 void publish_bbo(const std::string& address, const BookId& book_id, std::atomic<bool>* stop) {
     std::string label = to_string(book_id);
@@ -472,20 +527,17 @@ int main(int argc, char** argv) {
 
     if (duration_s > 0) {
         std::this_thread::sleep_for(std::chrono::seconds(duration_s));
-        // Setting `stop` while holding cancel_mutex() (not just relying on
-        // it being std::atomic) closes a lost-wakeup window: without the
-        // lock, a canceller thread could re-check its predicate (see
-        // `false`), then get preempted right before blocking on the CV -
-        // this write and the notify_all() below would then land in that
-        // gap and be missed entirely, leaving the thread asleep until its
-        // own read loop happens to end on its own. That would reintroduce
-        // the exact class of hang 2055487 fixed, just for the
-        // duration-elapsed path instead of the natural-completion one.
-        {
-            std::lock_guard<std::mutex> lock(cancel_mutex());
-            stop = true;
-        }
-        cancel_cv().notify_all();
+        // `stop` itself is a plain atomic write - the lost-wakeup window
+        // this project already hit once (see StreamCanceller::
+        // notify_stop()'s own comment) is closed on the *reader* side
+        // instead now: notify_all_of_stop() takes each canceller's own
+        // mutex_ before notifying it, which is what actually serializes
+        // against a canceller thread that's mid-transition into
+        // wait()'s blocked state - writing `stop` under a lock here
+        // wouldn't help, since no single lock covers every canceller's
+        // own wait() any more.
+        stop = true;
+        notify_all_of_stop();
     }
     for (auto& t : threads) t.join();
     return 0;

@@ -146,43 +146,43 @@ inline FixedPointType parse_decimal_string_to_fixed(std::string_view text) {
         dot == std::string_view::npos ? std::string_view{} : rest.substr(dot + 1);
     if (int_part.empty() && frac_part.empty()) fail();  // "", "-", ".", "-."
 
-    auto all_digits = [](std::string_view s) {
-        for (char c : s) {
-            if (c < '0' || c > '9') return false;
-        }
-        return true;
-    };
-    // Rejects non-digit garbage in either half, and a second '.' (which
-    // lands inside frac_part as a non-digit character) in one check - no
-    // separate "count the dots" logic needed.
-    if (!all_digits(int_part) || !all_digits(frac_part)) fail();
-
-    // Integer part, accumulated in a 128-bit intermediate. Bailing as
-    // soon as it exceeds Raw's own max (not Raw's max/scale - the final,
-    // tight bound is applied after scaling below) is a looser check, but
-    // it's what keeps this loop itself safe from ever overflowing
-    // __int128 on a maliciously long digit string: __int128 has roughly
-    // 20 more decimal digits of headroom than Raw::max, so this trips
-    // long before that could happen, however many digits `int_part` has.
+    // Integer part: digit validation and accumulation fused into one
+    // pass (each was previously a separate full pass over int_part - a
+    // code-review finding, since this parser runs on every price/size
+    // field of every venue's every message). Accumulated in a 128-bit
+    // intermediate. Bailing as soon as it exceeds Raw's own max (not
+    // Raw's max/scale - the final, tight bound is applied after scaling
+    // below) is a looser check, but it's what keeps this loop itself
+    // safe from ever overflowing __int128 on a maliciously long digit
+    // string: __int128 has roughly 20 more decimal digits of headroom
+    // than Raw::max, so this trips long before that could happen,
+    // however many digits `int_part` has.
     unsigned __int128 int_value = 0;
     for (char c : int_part) {
+        if (c < '0' || c > '9') fail();
         int_value = int_value * 10 + static_cast<unsigned>(c - '0');
         if (int_value > static_cast<unsigned __int128>(kRawMax)) fail();
     }
 
-    // Fractional part, rescaled to exactly kDecimals digits. Only the
-    // first kDecimals+1 characters of frac_part are ever read, however
-    // long it is: under "round half up, ties away from zero", the single
-    // digit immediately after the cut point already fully determines the
-    // outcome (>=5 always rounds up regardless of what follows, since
-    // further digits can only make the discarded remainder larger, never
-    // pull it back under half; <=4 always rounds down for the same
-    // reason in reverse) - so digits beyond that one can never change
-    // the result.
+    // Fractional part: every character still has to be validated (this
+    // is untrusted wire text - "1.23abc" must still be rejected, not
+    // silently truncated to "1.23"), but only the first kDecimals+1
+    // characters are ever *accumulated*: under "round half up, ties
+    // away from zero", the single digit immediately after the cut point
+    // already fully determines the outcome (>=5 always rounds up
+    // regardless of what follows, since further digits can only make
+    // the discarded remainder larger, never pull it back under half;
+    // <=4 always rounds down for the same reason in reverse) - so
+    // digits beyond that one can never change the result. One pass
+    // over the whole of frac_part does both at once, rather than a full
+    // validation pass followed by a separate (shorter) accumulation
+    // pass - same fusion as int_part above, for the same reason.
     std::size_t take = std::min(frac_part.size(), static_cast<std::size_t>(kDecimals) + 1);
     __int128 frac_numerator = 0;
-    for (std::size_t i = 0; i < take; ++i) {
-        frac_numerator = frac_numerator * 10 + (frac_part[i] - '0');
+    for (std::size_t i = 0; i < frac_part.size(); ++i) {
+        char c = frac_part[i];
+        if (c < '0' || c > '9') fail();  // also rejects a second '.', e.g. "1.2.3"
+        if (i < take) frac_numerator = frac_numerator * 10 + (c - '0');
     }
 
     __int128 frac_value;
@@ -235,10 +235,24 @@ inline FixedPointType parse_decimal_string_to_fixed(std::string_view text) {
     return FixedPointType::from_raw(static_cast<Raw>(negative ? -magnitude : magnitude));
 }
 
+// Reads only the first two elements ([price, size, ...]) - deliberately
+// not "exactly 2": OKX's own 4-element level arrays
+// (["price","size","0","numOrders"], see okx_feed.hpp) go through this
+// same function, and any trailing elements past index 1 are meant to be
+// left unconsumed. Checks `it != level.end()` before each of the two
+// dereferences it does take, though: a truncated array (0 or 1
+// elements) used to fall through to an unchecked second-element
+// dereference (a code-review finding) - a malformed/truncated level
+// array from an exchange usually surfaces as a caught simdjson_error via
+// an incorrect-type check elsewhere, but not reliably in the narrow case
+// where the byte right after the array's closing ']' happens to be a
+// '"' and get_string() succeeds on the wrong bytes instead of throwing.
 inline std::pair<Price, Size> parse_level(simdjson::ondemand::array level) {
     auto it = level.begin();
+    if (it == level.end()) throw simdjson::simdjson_error(simdjson::INDEX_OUT_OF_BOUNDS);
     std::string_view price_text = (*it).get_string();
     ++it;
+    if (it == level.end()) throw simdjson::simdjson_error(simdjson::INDEX_OUT_OF_BOUNDS);
     std::string_view size_text = (*it).get_string();
     return {parse_decimal_string_to_fixed<Price>(price_text),
             parse_decimal_string_to_fixed<Size>(size_text)};

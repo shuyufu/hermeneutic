@@ -149,9 +149,7 @@ std::expected<std::vector<VolumeBand>, std::errc> volume_band_prices(
     std::size_t next = 0;
 
     for (const auto& [price, size] : levels) {
-        if (price.raw() <= 0 || size.raw() < 0) {
-            return std::unexpected(std::errc::argument_out_of_domain);
-        }
+        if (!is_valid_level(price, size)) return std::unexpected(std::errc::argument_out_of_domain);
 
         Notional level_notional = price * size;
 

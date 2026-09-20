@@ -426,13 +426,26 @@ class VenueSession {
         // without ever actually producing one (this was the real cause of
         // a SIGTRAP: Clang traps on falling off the end of a non-void,
         // non-coroutine function instead of silently returning garbage).
+        //
+        // `apply_failed`, set inside the visitor and checked after it
+        // returns, is how a book-level rejection reaches the resync logic
+        // below without needing the visitor itself to co_await anything -
+        // a book rejecting a level (malformed venue data, not a sequence
+        // gap SymbolSync itself would have already caught) used to have
+        // its std::expected<void, std::errc> result silently discarded
+        // here (a code-review finding): for ApplySnapshot specifically,
+        // bids and asks are two independent calls into the book, so a
+        // rejection on only one side left the book genuinely half-applied
+        // - no log, no resync - with nothing downstream able to tell.
+        bool apply_failed = false;
         std::visit(
-            [this, &symbol](auto&& a) {
+            [this, &symbol, &apply_failed](auto&& a) {
                 using T = std::decay_t<decltype(a)>;
                 if constexpr (std::is_same_v<T, ApplySnapshot>) {
                     if (auto* book = registry_.book(symbol)) {
-                        book->apply_snapshot(venue_, Side::Bid, a.bids);
-                        book->apply_snapshot(venue_, Side::Ask, a.asks);
+                        auto bid_result = book->apply_snapshot(venue_, Side::Bid, a.bids);
+                        auto ask_result = book->apply_snapshot(venue_, Side::Ask, a.asks);
+                        apply_failed = !bid_result || !ask_result;
                     }
                 } else if constexpr (std::is_same_v<T, ApplyDelta>) {
                     // One call, not one apply_delta() per level: a.bids/
@@ -441,13 +454,38 @@ class VenueSession {
                     // one atomic update from becoming several separate seq
                     // bumps/broadcasts on our own wire protocol.
                     if (auto* book = registry_.book(symbol)) {
-                        book->apply_batch(venue_, a.bids, a.asks);
+                        apply_failed = !book->apply_batch(venue_, a.bids, a.asks);
                     }
                 } else if constexpr (std::is_same_v<T, InvalidateVenue>) {
                     if (auto* book = registry_.book(symbol)) book->invalidate_venue(venue_);
                 }
             },
             std::move(action));
+
+        if (!apply_failed) co_return;
+
+        // A rejected level means this venue's data for `symbol` can no
+        // longer be trusted - same reasoning as a lost connection (see
+        // AggregateOrderBook::invalidate_venue()'s own doc comment) - so
+        // this is handled exactly like on_disconnected() handles one:
+        // invalidate this venue's contribution and reset SymbolSync back
+        // to Buffering, via the same InvalidateVenue action path already
+        // above (SymbolSync::on_disconnected() is scoped to one symbol,
+        // unlike VenueSession::invalidate_all()). Logged here, not inside
+        // the visitor, since std::cerr is fine to call from a plain
+        // function but this project's convention (see log_exception) is
+        // to keep I/O out of the visitor itself.
+        std::cerr << "[venue_session] " << symbol
+                  << ": rejected level(s) from this venue (malformed data) - invalidating and "
+                     "resyncing\n";
+        // Recurses into execute_action() exactly one level deep, not
+        // further: on_disconnected() only ever returns {InvalidateVenue{}},
+        // and InvalidateVenue's own branch above never sets apply_failed,
+        // so this nested execute_actions() call can't loop back into this
+        // same resync path again.
+        if (auto it = symbol_syncs_.find(symbol); it != symbol_syncs_.end()) {
+            co_await execute_actions(symbol, it->second.on_disconnected());
+        }
     }
 
     // RequestSnapshot's fulfillment: for a Feed whose snapshot arrives over
