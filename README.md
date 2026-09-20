@@ -48,7 +48,9 @@ Docker" below.
 
 ## Building with vcpkg
 
-Some build targets fetch dependencies via
+`HERMENEUTIC_BUILD_SERVICE` defaults `ON`: this project always builds and
+runs the gRPC-based aggregator service in practice, so a plain configure
+fetches gRPC and its dependencies via
 [vcpkg](https://github.com/microsoft/vcpkg) in manifest mode (`vcpkg.json`,
 pinned via `builtin-baseline`). vcpkg itself is not vendored in this repo;
 clone it once and point `VCPKG_ROOT` at it:
@@ -59,13 +61,9 @@ git clone https://github.com/microsoft/vcpkg.git ~/vcpkg
 export VCPKG_ROOT=~/vcpkg
 ```
 
-The default build (no preset) needs no vcpkg and only builds
-`hermeneutic_tests` as before.
-
-## Building the gRPC-based service targets
-
-The service build (`HERMENEUTIC_BUILD_SERVICE=ON`, set by the `vcpkg` preset)
-fetches gRPC and its dependencies via vcpkg:
+Configure with the `vcpkg` preset, which points `CMAKE_TOOLCHAIN_FILE` at
+it - a bare `cmake -B build` with no toolchain file fails to find
+Protobuf/gRPC/Boost, since those only resolve through vcpkg:
 
 ```sh
 cmake --preset vcpkg
@@ -74,6 +72,17 @@ cmake --preset vcpkg
 The first configure builds gRPC/protobuf/abseil from source, which takes a
 while; vcpkg's binary cache (`~/.cache/vcpkg/archives` by default) speeds up
 subsequent configures and other checkouts on the same machine.
+
+To build only the vcpkg-free tiers (`hermeneutic_tests`, the market-data
+feed parsers under `HERMENEUTIC_BUILD_INGESTION`) without gRPC, pass
+`-DHERMENEUTIC_BUILD_SERVICE=OFF` explicitly:
+
+```sh
+cmake -B build -DHERMENEUTIC_BUILD_SERVICE=OFF
+cmake --build build --target hermeneutic_tests
+```
+
+## Building the gRPC-based service targets
 
 ### Adding a `.proto`
 

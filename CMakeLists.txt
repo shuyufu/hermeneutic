@@ -201,7 +201,16 @@ if(HERMENEUTIC_BUILD_INGESTION)
     endif()
 endif()
 
-option(HERMENEUTIC_BUILD_SERVICE "Build gRPC service targets (requires vcpkg toolchain, see README)" OFF)
+# Defaults ON: this project always builds and runs the gRPC service in
+# practice (Docker's build - see docker/Dockerfile's own explicit
+# -DHERMENEUTIC_BUILD_SERVICE=ON, unaffected by this default either way -
+# is the only build that actually ships), so OFF was a default nobody
+# was building without the flag anyway. A bare `cmake -B build` now
+# needs the vcpkg toolchain (see README) - pass
+# -DHERMENEUTIC_BUILD_SERVICE=OFF explicitly for the old vcpkg-free,
+# hermeneutic_tests-only configure (still useful: HERMENEUTIC_BUILD_INGESTION's
+# feed-parsing tiers stay buildable/testable without vcpkg either way).
+option(HERMENEUTIC_BUILD_SERVICE "Build gRPC service targets (requires vcpkg toolchain, see README)" ON)
 
 if(HERMENEUTIC_BUILD_SERVICE)
     # hermeneutic_aggregator_service/hermeneutic_aggregator_client below
