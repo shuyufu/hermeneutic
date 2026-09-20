@@ -261,37 +261,41 @@ class SymbolBook {
         return result;
     }
 
+    // Resyncs both sides of `venue`'s book from a REST snapshot as a
+    // single book revision: one seq bump, one broadcast - mirrors
+    // apply_batch() below in both shape and reasoning. book_.apply_snapshot()
+    // itself validates both sides before touching either, so a bad level
+    // on one side no longer leaves this venue's *other*, perfectly valid
+    // side resynced while the bad one is rejected (a past code-review
+    // finding, back when this took one side per call - see
+    // venue_session.hpp's own historical comment on it).
     std::expected<void, std::errc> apply_snapshot(
-        const VenueId& venue, Side side, std::span<const std::pair<Price, Size>> levels) {
+        const VenueId& venue, std::span<const std::pair<Price, Size>> bids,
+        std::span<const std::pair<Price, Size>> asks) {
         std::lock_guard lock(mutex_);
         auto venue_it = book_.venues().find(venue);
 
-        // bids/asks are different std::map instantiations (opposite
-        // comparators), so they can't share one branch via a ternary; each
-        // branch uses the matching comparator for `before_by_price` too, so
-        // the diff this produces comes out in the same order as the book
-        // itself (descending for bids, ascending for asks) for free - see
-        // capture_snapshot_before().
+        // Captured before any mutation, one comparator-matched map per
+        // side - same trick as apply_batch()'s before_bids/before_asks
+        // below, so the eventual diff comes out in the book's own order
+        // (descending for bids, ascending for asks) without a separate
+        // sort. See capture_snapshot_before() for what "every price this
+        // could possibly change" means per side.
+        static const std::map<Price, Size, std::greater<Price>> kEmptyBids;
+        static const std::map<Price, Size, std::less<Price>> kEmptyAsks;
+        auto before_bids = capture_snapshot_before(
+            Side::Bid, venue_it != book_.venues().end() ? venue_it->second.bids : kEmptyBids, bids);
+        auto before_asks = capture_snapshot_before(
+            Side::Ask, venue_it != book_.venues().end() ? venue_it->second.asks : kEmptyAsks, asks);
+
+        auto result = book_.apply_snapshot(venue, bids, asks);
+        if (!result) return result;
+
         std::vector<Change> changed;
-        if (side == Side::Bid) {
-            static const std::map<Price, Size, std::greater<Price>> kEmpty;
-            auto before = capture_snapshot_before(
-                side, venue_it != book_.venues().end() ? venue_it->second.bids : kEmpty, levels);
-            auto result = book_.apply_snapshot(venue, side, levels);
-            if (!result) return result;
-            for (const auto& kv : before) collect_change(changed, side, kv.first, kv.second);
-            publish(changed);
-            return result;
-        } else {
-            static const std::map<Price, Size, std::less<Price>> kEmpty;
-            auto before = capture_snapshot_before(
-                side, venue_it != book_.venues().end() ? venue_it->second.asks : kEmpty, levels);
-            auto result = book_.apply_snapshot(venue, side, levels);
-            if (!result) return result;
-            for (const auto& kv : before) collect_change(changed, side, kv.first, kv.second);
-            publish(changed);
-            return result;
-        }
+        for (const auto& [price, before] : before_bids) collect_change(changed, Side::Bid, price, before);
+        for (const auto& [price, before] : before_asks) collect_change(changed, Side::Ask, price, before);
+        publish(changed);
+        return result;
     }
 
     // Applies one batch of delta changes (e.g. everything one upstream

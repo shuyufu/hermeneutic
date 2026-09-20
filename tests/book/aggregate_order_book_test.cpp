@@ -143,9 +143,11 @@ TEST(AggregateOrderBook, ApplySnapshotReplacesVenueSideWholesale) {
     book.apply_delta(kBinance, Side::Ask, Price(101.0), Size(2.0));
     book.apply_delta(kOkx, Side::Ask, Price(100.0), Size(4.0));
 
-    // REST snapshot: 100.0 unchanged, 101.0 gone, 102.0 new.
+    // REST snapshot: 100.0 unchanged, 101.0 gone, 102.0 new. binance has no
+    // bids anywhere in this test, so an empty bids span here is a genuine
+    // no-op, not accidentally wiping real data.
     const std::array snapshot = {std::pair{Price(100.0), Size(1.0)}, std::pair{Price(102.0), Size(3.0)}};
-    book.apply_snapshot(kBinance, Side::Ask, snapshot);
+    book.apply_snapshot(kBinance, {}, snapshot);
 
     EXPECT_EQ(book.venues().at(kBinance).asks.count(Price(101.0)), 0u);
     EXPECT_EQ(book.venues().at(kBinance).asks.at(Price(100.0)), Size(1.0));
@@ -167,9 +169,10 @@ TEST(AggregateOrderBook, InvalidateThenApplySnapshotResyncsCleanly) {
     book.invalidate_venue(kBinance);
     ASSERT_TRUE(book.aggregate().bids.empty());
 
-    // Resync from a fresh REST snapshot.
+    // Resync from a fresh REST snapshot. binance has no asks anywhere in
+    // this test, so an empty asks span here is a genuine no-op.
     const std::array snapshot = {std::pair{Price(99.0), Size(1.5)}, std::pair{Price(97.0), Size(1.0)}};
-    book.apply_snapshot(kBinance, Side::Bid, snapshot);
+    book.apply_snapshot(kBinance, snapshot, {});
 
     EXPECT_EQ(book.aggregate().bids.at(Price(99.0)), Size(1.5));
     EXPECT_EQ(book.aggregate().bids.at(Price(97.0)), Size(1.0));
@@ -195,7 +198,7 @@ TEST(AggregateOrderBook, ApplySnapshotRejectsNegativeSizeAtomically) {
 
     const std::array snapshot = {std::pair{Price(100.0), Size(2.0)},
                                   std::pair{Price(101.0), Size(-1.0)}};
-    auto result = book.apply_snapshot(kBinance, Side::Ask, snapshot);
+    auto result = book.apply_snapshot(kBinance, {}, snapshot);
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), std::errc::invalid_argument);
 
@@ -233,7 +236,7 @@ TEST(AggregateOrderBook, ApplySnapshotRejectsNonPositivePriceAtomically) {
 
     const std::array snapshot = {std::pair{Price(100.0), Size(2.0)},
                                   std::pair{Price::from_raw(0), Size(1.0)}};
-    auto result = book.apply_snapshot(kBinance, Side::Ask, snapshot);
+    auto result = book.apply_snapshot(kBinance, {}, snapshot);
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), std::errc::invalid_argument);
 
@@ -241,6 +244,71 @@ TEST(AggregateOrderBook, ApplySnapshotRejectsNonPositivePriceAtomically) {
     EXPECT_EQ(book.venues().at(kBinance).asks.at(Price(100.0)), Size(1.0));
     EXPECT_EQ(book.aggregate().asks.at(Price(100.0)), Size(1.0));
     EXPECT_EQ(book.venues().at(kBinance).asks.count(Price::from_raw(0)), 0u);
+}
+
+TEST(AggregateOrderBook, ApplySnapshotAppliesBothSidesInOneCall) {
+    AggregateOrderBook book;
+
+    const std::array bids = {std::pair{Price(99.0), Size(1.0)}, std::pair{Price(98.0), Size(2.0)}};
+    const std::array asks = {std::pair{Price(101.0), Size(3.0)}};
+    ASSERT_TRUE(book.apply_snapshot(kBinance, bids, asks).has_value());
+
+    EXPECT_EQ(book.venues().at(kBinance).bids.at(Price(99.0)), Size(1.0));
+    EXPECT_EQ(book.venues().at(kBinance).bids.at(Price(98.0)), Size(2.0));
+    EXPECT_EQ(book.venues().at(kBinance).asks.at(Price(101.0)), Size(3.0));
+    EXPECT_EQ(book.aggregate().bids.at(Price(99.0)), Size(1.0));
+    EXPECT_EQ(book.aggregate().asks.at(Price(101.0)), Size(3.0));
+}
+
+// The bug this guards against: apply_snapshot() used to take one side at a
+// time, so a caller resyncing both sides of a venue made two independent
+// calls - a bad level on one side could be rejected while the other side's
+// (perfectly valid) resync had already gone through, leaving the venue's
+// book genuinely half-resynced with nothing downstream able to tell (see
+// venue_session.hpp's own historical comment on this). Taking both sides
+// in one call and validating both before touching either - the same shape
+// apply_batch() already used - closes that gap: a bad level anywhere
+// rejects the whole snapshot, valid side included.
+TEST(AggregateOrderBook, ApplySnapshotRejectsBadLevelOnEitherSideWithoutTouchingTheOther) {
+    AggregateOrderBook book;
+    book.apply_delta(kBinance, Side::Bid, Price(50.0), Size(1.0));
+    book.apply_delta(kBinance, Side::Ask, Price(100.0), Size(1.0));
+
+    // A perfectly good bids resync, paired with an asks resync containing
+    // one bad level.
+    const std::array good_bids = {std::pair{Price(99.0), Size(2.0)}};
+    const std::array bad_asks = {std::pair{Price(101.0), Size(1.0)}, std::pair{Price(102.0), Size(-1.0)}};
+    auto result = book.apply_snapshot(kBinance, good_bids, bad_asks);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), std::errc::invalid_argument);
+
+    // Neither side was touched - not even the bids side, whose own data
+    // was entirely valid.
+    EXPECT_EQ(book.venues().at(kBinance).bids.count(Price(99.0)), 0u);
+    EXPECT_EQ(book.venues().at(kBinance).bids.at(Price(50.0)), Size(1.0));
+    EXPECT_EQ(book.venues().at(kBinance).asks.count(Price(101.0)), 0u);
+    EXPECT_EQ(book.venues().at(kBinance).asks.at(Price(100.0)), Size(1.0));
+}
+
+// Unlike apply_batch(), where an empty span means "no changes on this
+// side" (an exchange delta message can legitimately touch only one side),
+// apply_snapshot()'s levels are the *complete* state for that side - an
+// empty span means this venue now holds nothing there, the same as if
+// every existing level had been explicitly dropped from the snapshot.
+// This matches a real REST snapshot response, which always reports both
+// sides' complete current state at once.
+TEST(AggregateOrderBook, ApplySnapshotWithEmptySpanClearsThatSide) {
+    AggregateOrderBook book;
+    book.apply_delta(kBinance, Side::Bid, Price(99.0), Size(1.0));
+    book.apply_delta(kBinance, Side::Ask, Price(101.0), Size(1.0));
+
+    const std::array new_bids = {std::pair{Price(98.0), Size(1.0)}};
+    ASSERT_TRUE(book.apply_snapshot(kBinance, new_bids, {}).has_value());
+
+    EXPECT_EQ(book.venues().at(kBinance).bids.count(Price(99.0)), 0u);
+    EXPECT_EQ(book.venues().at(kBinance).bids.at(Price(98.0)), Size(1.0));
+    EXPECT_TRUE(book.venues().at(kBinance).asks.empty());
+    EXPECT_TRUE(book.aggregate().asks.empty());
 }
 
 // apply_batch()'s own aggregation/atomicity behavior belongs here, not in

@@ -334,7 +334,7 @@ TEST_F(AggregatorServiceTest, ApplySnapshotDiffsAgainstAggregateNotJustThatVenue
         {Price(100.0), Size(3.0)},
         {Price(102.0), Size(4.0)},
     }};
-    auto result = book().apply_snapshot(kBinance, Side::Bid, levels);
+    auto result = book().apply_snapshot(kBinance, levels, {});
     ASSERT_TRUE(result.has_value());
 
     L2Update msg = updates_.wait_for(4);
@@ -367,7 +367,7 @@ TEST_F(AggregatorServiceTest, ApplySnapshotOnAskSideProducesAscendingDiff) {
         {Price(101.0), Size(4.0)},
         {Price(103.0), Size(3.0)},
     }};
-    ASSERT_TRUE(book().apply_snapshot(kBinance, Side::Ask, levels).has_value());
+    ASSERT_TRUE(book().apply_snapshot(kBinance, {}, levels).has_value());
 
     L2Update msg = updates_.wait_for(3);
     ASSERT_TRUE(msg.has_diff());
@@ -380,6 +380,62 @@ TEST_F(AggregatorServiceTest, ApplySnapshotOnAskSideProducesAscendingDiff) {
     EXPECT_EQ(msg.diff().asks(2).price_raw(), Price(105.0).raw());
     EXPECT_EQ(msg.diff().asks(2).size_raw(), 0);  // dropped, no one else held it
     EXPECT_EQ(msg.diff().bids_size(), 0);
+}
+
+TEST_F(AggregatorServiceTest, ApplySnapshotBothSidesProducesOneSeqBump) {
+    updates_.wait_for(0);  // initial snapshot
+
+    std::array<std::pair<Price, Size>, 1> bids{{
+        {Price(100.0), Size(1.0)},
+    }};
+    std::array<std::pair<Price, Size>, 1> asks{{
+        {Price(101.0), Size(2.0)},
+    }};
+    ASSERT_TRUE(book().apply_snapshot(kBinance, bids, asks).has_value());
+
+    // One message, seq 1 - not two separate diffs the way two independent
+    // per-side apply_snapshot() calls used to produce.
+    L2Update msg = updates_.wait_for(1);
+    ASSERT_TRUE(msg.has_diff());
+    EXPECT_EQ(msg.diff().book_seq(), 1u);
+    ASSERT_EQ(msg.diff().bids_size(), 1);
+    EXPECT_EQ(msg.diff().bids(0).price_raw(), Price(100.0).raw());
+    EXPECT_EQ(msg.diff().bids(0).size_raw(), Size(1.0).raw());
+    ASSERT_EQ(msg.diff().asks_size(), 1);
+    EXPECT_EQ(msg.diff().asks(0).price_raw(), Price(101.0).raw());
+    EXPECT_EQ(msg.diff().asks(0).size_raw(), Size(2.0).raw());
+}
+
+// The bug this guards against: apply_snapshot() used to take one side per
+// call, so a caller resyncing both sides made two independent book calls -
+// a bad level on one side could be rejected after the other side's
+// perfectly valid resync had already gone through and broadcast, with
+// nothing downstream able to tell (see venue_session.hpp's own historical
+// comment on this). One call validating both sides before touching either
+// closes that gap.
+TEST_F(AggregatorServiceTest, ApplySnapshotRejectsBadLevelOnEitherSideWithoutMutatingOrBroadcasting) {
+    updates_.wait_for(0);  // initial snapshot
+
+    std::array<std::pair<Price, Size>, 1> good_bids{{
+        {Price(100.0), Size(1.0)},
+    }};
+    std::array<std::pair<Price, Size>, 1> bad_asks{{
+        {Price(101.0), Size(-1.0)},
+    }};
+    auto bad = book().apply_snapshot(kBinance, good_bids, bad_asks);
+    ASSERT_FALSE(bad.has_value());
+    EXPECT_EQ(bad.error(), std::errc::invalid_argument);
+
+    // Neither side from the rejected snapshot was applied: a good call
+    // right after must be seq 1 / the second message, not seq 2 / the
+    // third (which a stray broadcast from the rejected bids side would
+    // have produced).
+    ASSERT_TRUE(book().apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0)).has_value());
+    L2Update msg = updates_.wait_for(1);
+    ASSERT_TRUE(msg.has_diff());
+    EXPECT_EQ(msg.diff().book_seq(), 1u);
+    ASSERT_EQ(msg.diff().bids_size(), 1);
+    EXPECT_EQ(msg.diff().bids(0).price_raw(), Price(100.0).raw());
 }
 
 TEST_F(AggregatorServiceTest, SnapshotOrderingMatchesBookConvention) {

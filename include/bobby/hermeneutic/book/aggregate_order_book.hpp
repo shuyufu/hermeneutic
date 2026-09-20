@@ -35,9 +35,17 @@ class AggregateOrderBook {
                                                 Size size) noexcept {
         if (!is_valid_level(price, size)) return std::unexpected(std::errc::invalid_argument);
 
-        return try_apply(venue, side, [&](auto& venue_side, auto& aggregate_side) {
-            apply_level(venue_side, aggregate_side, price, size);
-        });
+        try {
+            auto& venue_book = venues_[venue];
+            if (side == Side::Bid) {
+                apply_level(venue_book.bids, aggregate_.bids, price, size);
+            } else {
+                apply_level(venue_book.asks, aggregate_.asks, price, size);
+            }
+        } catch (const std::bad_alloc&) {
+            return std::unexpected(std::errc::not_enough_memory);
+        }
+        return {};
     }
 
     // Removes every level `venue` contributed and drops its book entirely.
@@ -57,37 +65,38 @@ class AggregateOrderBook {
         venues_.erase(it);
     }
 
-    // Replaces one side of `venue`'s book wholesale from a REST snapshot.
-    // Any price the venue previously held that is absent from `levels` is
-    // treated as removed. Use this to resynchronize after invalidate_venue().
-    // Returns std::errc::invalid_argument, without modifying any state, if
-    // any level's price is not positive or its size is negative, or
+    // Replaces `venue`'s entire book (both sides at once) wholesale from a
+    // REST snapshot. Any price the venue previously held on a side that is
+    // absent from that side's new `levels` is treated as removed. Use this
+    // to resynchronize after invalidate_venue(). Both sides are validated
+    // before either is touched - a bad level on one side leaves the other
+    // side's still-good data un-replaced too, rather than resyncing one
+    // side and leaving the other stale (see apply_batch()'s own doc
+    // comment for why the two sides can't be validated/applied
+    // independently: exactly the same reasoning applies here). Returns
+    // std::errc::invalid_argument, without modifying any state, if any
+    // level's price is not positive or its size is negative, or
     // std::errc::not_enough_memory if allocation fails partway through
-    // applying the snapshot.
+    // applying the snapshot (not rolled back - same documented limitation
+    // as apply_batch()).
     std::expected<void, std::errc> apply_snapshot(
-        const VenueId& venue, Side side, std::span<const std::pair<Price, Size>> levels) noexcept {
-        for (const auto& level : levels) {
-            if (!is_valid_level(level.first, level.second)) {
-                return std::unexpected(std::errc::invalid_argument);
-            }
+        const VenueId& venue, std::span<const std::pair<Price, Size>> bids,
+        std::span<const std::pair<Price, Size>> asks) noexcept {
+        for (const auto& [price, size] : bids) {
+            if (!is_valid_level(price, size)) return std::unexpected(std::errc::invalid_argument);
+        }
+        for (const auto& [price, size] : asks) {
+            if (!is_valid_level(price, size)) return std::unexpected(std::errc::invalid_argument);
         }
 
-        return try_apply(venue, side, [&](auto& venue_side, auto& aggregate_side) {
-            std::map<Price, Size> new_levels(levels.begin(), levels.end());
-
-            for (auto it = venue_side.begin(); it != venue_side.end();) {
-                if (new_levels.contains(it->first)) {
-                    ++it;
-                } else {
-                    adjust_aggregate(aggregate_side, it->first, Size{} - it->second);
-                    it = venue_side.erase(it);
-                }
-            }
-
-            for (const auto& [price, size] : new_levels) {
-                apply_level(venue_side, aggregate_side, price, size);
-            }
-        });
+        try {
+            auto& venue_book = venues_[venue];
+            resync_side(venue_book.bids, aggregate_.bids, bids);
+            resync_side(venue_book.asks, aggregate_.asks, asks);
+        } catch (const std::bad_alloc&) {
+            return std::unexpected(std::errc::not_enough_memory);
+        }
+        return {};
     }
 
     // Applies one batch of delta changes (e.g. everything one upstream
@@ -128,28 +137,6 @@ class AggregateOrderBook {
     const std::unordered_map<VenueId, L2OrderBook>& venues() const noexcept { return venues_; }
 
   private:
-    // Looks up (creating on first use) `venue`'s book, picks the map
-    // matching `side`, and runs `op(venue_side, aggregate_side)` against
-    // it and the matching aggregate map. bids and asks are different map
-    // types (see l2_order_book.hpp), so this dispatch can't be done with
-    // a single reference - `op` is a generic lambda instead, letting
-    // apply_delta() and apply_snapshot() share this lookup/dispatch/
-    // bad_alloc-handling shape instead of each duplicating it.
-    template <typename Op>
-    std::expected<void, std::errc> try_apply(const VenueId& venue, Side side, Op&& op) noexcept {
-        try {
-            auto& venue_book = venues_[venue];
-            if (side == Side::Bid) {
-                op(venue_book.bids, aggregate_.bids);
-            } else {
-                op(venue_book.asks, aggregate_.asks);
-            }
-        } catch (const std::bad_alloc&) {
-            return std::unexpected(std::errc::not_enough_memory);
-        }
-        return {};
-    }
-
     // Sets `price` to `new_size` in `side` (erasing it when <= 0) and
     // returns the size that was there before, so the caller can derive a delta.
     // `new_size` is validated non-negative by the public entry points; the
@@ -199,6 +186,34 @@ class AggregateOrderBook {
     static void apply_level(Map& venue_side, Map& aggregate_side, Price price, Size new_size) {
         Size old_size = set_level(venue_side, price, new_size);
         adjust_aggregate(aggregate_side, price, new_size - old_size);
+    }
+
+    // Resyncs one side of `venue_side` to `levels`: any price it currently
+    // holds that's absent from `levels` is removed (propagating that
+    // removal to `aggregate_side`), then every (price, size) in `levels`
+    // is applied via apply_level(). Called once per side from
+    // apply_snapshot(), after that function has already validated both
+    // sides' levels - this function itself performs no validation and
+    // offers no atomicity between the two calls; that guarantee comes
+    // entirely from apply_snapshot() checking both spans before either
+    // call happens.
+    template <typename Map>
+    static void resync_side(Map& venue_side, Map& aggregate_side,
+                             std::span<const std::pair<Price, Size>> levels) {
+        std::map<Price, Size> new_levels(levels.begin(), levels.end());
+
+        for (auto it = venue_side.begin(); it != venue_side.end();) {
+            if (new_levels.contains(it->first)) {
+                ++it;
+            } else {
+                adjust_aggregate(aggregate_side, it->first, Size{} - it->second);
+                it = venue_side.erase(it);
+            }
+        }
+
+        for (const auto& [price, size] : new_levels) {
+            apply_level(venue_side, aggregate_side, price, size);
+        }
     }
 
     std::unordered_map<VenueId, L2OrderBook> venues_;

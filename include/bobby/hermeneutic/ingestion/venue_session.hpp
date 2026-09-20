@@ -433,19 +433,22 @@ class VenueSession {
         // a book rejecting a level (malformed venue data, not a sequence
         // gap SymbolSync itself would have already caught) used to have
         // its std::expected<void, std::errc> result silently discarded
-        // here (a code-review finding): for ApplySnapshot specifically,
-        // bids and asks are two independent calls into the book, so a
-        // rejection on only one side left the book genuinely half-applied
-        // - no log, no resync - with nothing downstream able to tell.
+        // here (a code-review finding). ApplySnapshot and ApplyDelta both
+        // route through a single book call (apply_snapshot()/apply_batch())
+        // that validates every level across both bids and asks before
+        // applying any of them - a rejection here means nothing from this
+        // action was applied, not a harder-to-detect case of one side
+        // silently landing while the other didn't (ApplySnapshot used to
+        // be two independent per-side calls, which could do exactly that;
+        // see AggregateOrderBook::apply_snapshot()'s own doc comment for
+        // why it no longer can).
         bool apply_failed = false;
         std::visit(
             [this, &symbol, &apply_failed](auto&& a) {
                 using T = std::decay_t<decltype(a)>;
                 if constexpr (std::is_same_v<T, ApplySnapshot>) {
                     if (auto* book = registry_.book(symbol)) {
-                        auto bid_result = book->apply_snapshot(venue_, Side::Bid, a.bids);
-                        auto ask_result = book->apply_snapshot(venue_, Side::Ask, a.asks);
-                        apply_failed = !bid_result || !ask_result;
+                        apply_failed = !book->apply_snapshot(venue_, a.bids, a.asks);
                     }
                 } else if constexpr (std::is_same_v<T, ApplyDelta>) {
                     // One call, not one apply_delta() per level: a.bids/
