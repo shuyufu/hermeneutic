@@ -36,7 +36,7 @@ class AggregateOrderBook {
         if (!is_valid_level(price, size)) return std::unexpected(std::errc::invalid_argument);
 
         return try_apply(venue, side, [&](auto& venue_side, auto& aggregate_side) {
-            apply_side(venue_side, aggregate_side, price, size);
+            apply_level(venue_side, aggregate_side, price, size);
         });
     }
 
@@ -49,10 +49,10 @@ class AggregateOrderBook {
         if (it == venues_.end()) return;
 
         for (const auto& [price, size] : it->second.bids) {
-            apply_aggregate_delta(aggregate_.bids, price, Size{} - size);
+            adjust_aggregate(aggregate_.bids, price, Size{} - size);
         }
         for (const auto& [price, size] : it->second.asks) {
-            apply_aggregate_delta(aggregate_.asks, price, Size{} - size);
+            adjust_aggregate(aggregate_.asks, price, Size{} - size);
         }
         venues_.erase(it);
     }
@@ -73,7 +73,20 @@ class AggregateOrderBook {
         }
 
         return try_apply(venue, side, [&](auto& venue_side, auto& aggregate_side) {
-            apply_snapshot_side(venue_side, aggregate_side, levels);
+            std::map<Price, Size> new_levels(levels.begin(), levels.end());
+
+            for (auto it = venue_side.begin(); it != venue_side.end();) {
+                if (new_levels.contains(it->first)) {
+                    ++it;
+                } else {
+                    adjust_aggregate(aggregate_side, it->first, Size{} - it->second);
+                    it = venue_side.erase(it);
+                }
+            }
+
+            for (const auto& [price, size] : new_levels) {
+                apply_level(venue_side, aggregate_side, price, size);
+            }
         });
     }
 
@@ -100,10 +113,10 @@ class AggregateOrderBook {
         try {
             auto& venue_book = venues_[venue];
             for (const auto& [price, size] : bids) {
-                apply_side(venue_book.bids, aggregate_.bids, price, size);
+                apply_level(venue_book.bids, aggregate_.bids, price, size);
             }
             for (const auto& [price, size] : asks) {
-                apply_side(venue_book.asks, aggregate_.asks, price, size);
+                apply_level(venue_book.asks, aggregate_.asks, price, size);
             }
         } catch (const std::bad_alloc&) {
             return std::unexpected(std::errc::not_enough_memory);
@@ -157,8 +170,14 @@ class AggregateOrderBook {
         return old_size;
     }
 
+    // Adds `delta` (already computed by the caller - a difference between
+    // two absolute sizes, or a straight negation to remove a level) to
+    // `price` in `aggregate_side`, erasing it when the result is <= 0.
+    // Unlike set_level(), there is no "new absolute size" here: the
+    // aggregate never has one value to set to, since more than one venue
+    // can hold the same price - only ever a delta to fold in.
     template <typename Map>
-    static void apply_aggregate_delta(Map& aggregate_side, Price price, Size delta) {
+    static void adjust_aggregate(Map& aggregate_side, Price price, Size delta) {
         if (delta.raw() == 0) return;
 
         auto it = aggregate_side.find(price);
@@ -172,29 +191,14 @@ class AggregateOrderBook {
         }
     }
 
+    // Sets one (price, new_size) level on both `venue_side` and, by the
+    // delta that produces, `aggregate_side` - the one operation every
+    // public entry point above bottoms out at for a single level, whether
+    // it came from a delta, a batch, or diffing a snapshot.
     template <typename Map>
-    static void apply_side(Map& venue_side, Map& aggregate_side, Price price, Size new_size) {
+    static void apply_level(Map& venue_side, Map& aggregate_side, Price price, Size new_size) {
         Size old_size = set_level(venue_side, price, new_size);
-        apply_aggregate_delta(aggregate_side, price, new_size - old_size);
-    }
-
-    template <typename Map>
-    static void apply_snapshot_side(Map& venue_side, Map& aggregate_side,
-                                     std::span<const std::pair<Price, Size>> levels) {
-        std::map<Price, Size> new_levels(levels.begin(), levels.end());
-
-        for (auto it = venue_side.begin(); it != venue_side.end();) {
-            if (new_levels.contains(it->first)) {
-                ++it;
-            } else {
-                apply_aggregate_delta(aggregate_side, it->first, Size{} - it->second);
-                it = venue_side.erase(it);
-            }
-        }
-
-        for (const auto& [price, size] : new_levels) {
-            apply_side(venue_side, aggregate_side, price, size);
-        }
+        adjust_aggregate(aggregate_side, price, new_size - old_size);
     }
 
     std::unordered_map<VenueId, L2OrderBook> venues_;
