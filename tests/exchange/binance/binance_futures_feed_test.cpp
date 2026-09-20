@@ -93,14 +93,14 @@ TEST(BinanceFuturesFeedTest, MalformedSnapshotResponseFailsWithBadMessage) {
 
 TEST(BinanceFuturesFeedTest, SubscribeMessageListsEachSymbolLowercasedWithStreamSuffix) {
     BinanceFuturesFeed feed;
-    std::array<SymbolId, 2> symbols{"BTCUSDT", "ETHUSDT"};
+    std::array<NativeSymbol, 2> symbols{"BTCUSDT", "ETHUSDT"};
     EXPECT_EQ(feed.subscribe_message(symbols),
               R"({"method":"SUBSCRIBE","params":["btcusdt@depth@100ms","ethusdt@depth@100ms"],"id":1})");
 }
 
 TEST(BinanceFuturesFeedTest, SubscribeMessageHonorsCustomUpdateSpeed) {
     BinanceFuturesFeed feed;
-    std::array<SymbolId, 1> symbols{"BTCUSDT"};
+    std::array<NativeSymbol, 1> symbols{"BTCUSDT"};
     EXPECT_EQ(feed.subscribe_message(symbols, "500ms"),
               R"({"method":"SUBSCRIBE","params":["btcusdt@depth@500ms"],"id":1})");
 }

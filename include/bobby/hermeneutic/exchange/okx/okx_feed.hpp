@@ -62,7 +62,7 @@ class OkxFeed {
     // transformation - matching what OkxFeed::parse_message() reads back
     // out of `arg.instId` (dispatch below matches on this same native
     // spelling, via VenueSession's symbol_syncs_ - see venue_session.hpp).
-    std::string subscribe_message(std::span<const SymbolId> symbols) const {
+    std::string subscribe_message(std::span<const NativeSymbol> symbols) const {
         std::string args;
         for (std::size_t i = 0; i < symbols.size(); ++i) {
             if (i > 0) args += ',';

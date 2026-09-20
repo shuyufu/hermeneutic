@@ -104,7 +104,7 @@ class FakeFeed {
     std::string_view ws_port() const { return ws_port_; }
     std::string_view ws_target() const { return "/"; }
 
-    std::string subscribe_message(std::span<const SymbolId>) const { return "SUBSCRIBE"; }
+    std::string subscribe_message(std::span<const NativeSymbol>) const { return "SUBSCRIBE"; }
 
     // "DEPTH:<symbol>:<first_id>:<final_id>:<prev_final_id>:<bid_price>:<bid_size>"
     std::expected<std::optional<std::variant<SnapshotMessage, DepthUpdate>>, std::errc> parse_message(
@@ -126,12 +126,12 @@ class FakeFeed {
         return std::unexpected(std::errc::bad_message);
     }
 
-    FakeHttpRequestSpec snapshot_request(const SymbolId& symbol) const {
+    FakeHttpRequestSpec snapshot_request(const NativeSymbol& symbol) const {
         return FakeHttpRequestSpec{"127.0.0.1", http_port_, "/snapshot/" + symbol};
     }
 
     // "<last_update_id>:<bid_price>:<bid_size>"
-    std::expected<SnapshotMessage, std::errc> parse_snapshot_response(SymbolId symbol,
+    std::expected<SnapshotMessage, std::errc> parse_snapshot_response(NativeSymbol symbol,
                                                                        std::string_view body) const {
         auto fields = split(body, ':');
         if (fields.size() != 3) return std::unexpected(std::errc::bad_message);
@@ -168,7 +168,7 @@ class FakeFeedNoRest {
     std::string_view ws_port() const { return ws_port_; }
     std::string_view ws_target() const { return "/"; }
 
-    std::string subscribe_message(std::span<const SymbolId>) const { return "SUBSCRIBE"; }
+    std::string subscribe_message(std::span<const NativeSymbol>) const { return "SUBSCRIBE"; }
 
     // "SNAPSHOT:<symbol>:<last_update_id>:<bid_price>:<bid_size>" (pushed
     // by the exchange, unprompted - not a response to any request this

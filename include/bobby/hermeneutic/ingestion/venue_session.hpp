@@ -76,15 +76,15 @@ inline void log_exception(std::string_view component, std::string_view action, s
 template <typename Book>
 class SymbolRegistry {
   public:
-    void add(SymbolId symbol, Book* book) { books_.emplace(std::move(symbol), book); }
+    void add(NativeSymbol symbol, Book* book) { books_.emplace(std::move(symbol), book); }
 
-    Book* book(const SymbolId& symbol) const {
+    Book* book(const NativeSymbol& symbol) const {
         auto it = books_.find(symbol);
         return it != books_.end() ? it->second : nullptr;
     }
 
   private:
-    std::unordered_map<SymbolId, Book*> books_;
+    std::unordered_map<NativeSymbol, Book*> books_;
 };
 
 // The I/O driver for one venue connection: owns a SymbolSync<Policy> per
@@ -103,7 +103,7 @@ class SymbolRegistry {
 template <typename Feed, typename Policy, typename NextLayer, typename Book>
 class VenueSession {
   public:
-    VenueSession(Feed feed, VenueId venue, std::vector<SymbolId> symbols, SymbolRegistry<Book> registry,
+    VenueSession(Feed feed, VenueId venue, std::vector<NativeSymbol> symbols, SymbolRegistry<Book> registry,
                  net::any_io_executor executor, net::ssl::context* ssl_ctx = nullptr)
         : feed_(std::move(feed)),
           venue_(std::move(venue)),
@@ -349,7 +349,7 @@ class VenueSession {
         }
     }
 
-    net::awaitable<void> execute_actions(const SymbolId& symbol, std::vector<SyncAction> actions) {
+    net::awaitable<void> execute_actions(const NativeSymbol& symbol, std::vector<SyncAction> actions) {
         for (auto& action : actions) co_await execute_action(symbol, std::move(action));
     }
 
@@ -357,20 +357,20 @@ class VenueSession {
     // one generic lambda passed to std::visit - easier to read/step
     // through, and keeps std::get_if's dispatch (below) simple.
     net::awaitable<void> dispatch_snapshot(SnapshotMessage message) {
-        SymbolId symbol = message.symbol;
+        NativeSymbol symbol = message.symbol;
         auto it = symbol_syncs_.find(symbol);
         if (it == symbol_syncs_.end()) co_return;  // not ours
         co_await execute_actions(symbol, it->second.on_snapshot(std::move(message)));
     }
 
     net::awaitable<void> dispatch_depth_update(DepthUpdate message) {
-        SymbolId symbol = message.symbol;
+        NativeSymbol symbol = message.symbol;
         auto it = symbol_syncs_.find(symbol);
         if (it == symbol_syncs_.end()) co_return;  // not ours
         co_await execute_actions(symbol, it->second.on_depth_update(std::move(message)));
     }
 
-    net::awaitable<void> execute_action(const SymbolId& symbol, SyncAction action) {
+    net::awaitable<void> execute_action(const NativeSymbol& symbol, SyncAction action) {
         if (std::holds_alternative<RequestSnapshot>(action)) {
             // Spawned rather than co_await'ed: the snapshot fetch can take
             // a while, and the whole point of buffering is that live
@@ -502,7 +502,7 @@ class VenueSession {
     // `co_await fetch(...)` below (the fetch takes real time; the caller
     // returns almost immediately after spawning it). Caught the hard way:
     // this was a genuine use-after-free that surfaced as a SIGTRAP crash.
-    net::awaitable<void> handle_request_snapshot(SymbolId symbol) {
+    net::awaitable<void> handle_request_snapshot(NativeSymbol symbol) {
         if constexpr (!Feed::kSnapshotViaRest) {
             co_return;
         } else {
@@ -579,10 +579,10 @@ class VenueSession {
 
     Feed feed_;
     VenueId venue_;
-    std::vector<SymbolId> symbols_;
+    std::vector<NativeSymbol> symbols_;
     SymbolRegistry<Book> registry_;
     net::ssl::context* ssl_ctx_;
-    std::unordered_map<SymbolId, SymbolSync<Policy>> symbol_syncs_;
+    std::unordered_map<NativeSymbol, SymbolSync<Policy>> symbol_syncs_;
 
     // Everything below is only ever touched while running on strand_ (run()
     // itself, its dispatch/execute_action helpers, and every

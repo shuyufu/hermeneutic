@@ -156,7 +156,7 @@ TEST(OkxFeedTest, UpdateMissingRequiredFieldFailsWithBadMessage) {
 
 TEST(OkxFeedTest, SubscribeMessageListsEachInstIdOnBooksChannel) {
     OkxFeed feed;
-    std::array<SymbolId, 2> symbols{"BTC-USDT", "BTC-USDT-SWAP"};
+    std::array<NativeSymbol, 2> symbols{"BTC-USDT", "BTC-USDT-SWAP"};
     EXPECT_EQ(feed.subscribe_message(symbols),
               R"({"op":"subscribe","args":[{"channel":"books","instId":"BTC-USDT"},)"
               R"({"channel":"books","instId":"BTC-USDT-SWAP"}]})");

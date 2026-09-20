@@ -8,10 +8,11 @@
 #include <vector>
 
 #include "bobby/hermeneutic/core/fixed_point.hpp"
+#include "bobby/hermeneutic/symbol/symbol.hpp"
 
 namespace bobby::hermeneutic {
 
-using SymbolId = std::string;
+using NativeSymbol = bobby::hermeneutic::symbol::NativeSymbol;
 
 // One parsed depth-diff message from an exchange's WebSocket feed. This is
 // a *batch* of bid/ask level changes sharing one sequencing envelope -
@@ -19,7 +20,7 @@ using SymbolId = std::string;
 // carries multiple b/a level changes per message, not one level per
 // message) - not a single (side, price, size) triple.
 struct DepthUpdate {
-    SymbolId symbol;
+    NativeSymbol symbol;
     std::uint64_t first_id;       // Binance: U
     std::uint64_t final_id;       // Binance: u
     std::uint64_t prev_final_id;  // Binance USDS-M Futures: pu (no Spot equivalent)
@@ -30,7 +31,7 @@ struct DepthUpdate {
 // One parsed order-book snapshot, whether it came from a REST call or was
 // pushed by the exchange over the same WebSocket connection.
 struct SnapshotMessage {
-    SymbolId symbol;
+    NativeSymbol symbol;
     std::vector<std::pair<Price, Size>> bids;
     std::vector<std::pair<Price, Size>> asks;
     std::uint64_t last_update_id;

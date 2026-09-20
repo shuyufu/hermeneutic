@@ -48,7 +48,7 @@
 
 ```cpp
 struct DepthUpdate {
-    SymbolId symbol;
+    NativeSymbol symbol;
     std::uint64_t first_id;       // Binance: U
     std::uint64_t final_id;       // Binance: u
     std::uint64_t prev_final_id;  // Binance Futures: pu（Spot 沒有這欄位）
@@ -57,7 +57,7 @@ struct DepthUpdate {
 };
 
 struct SnapshotMessage {
-    SymbolId symbol;
+    NativeSymbol symbol;
     std::vector<std::pair<Price, Size>> bids;
     std::vector<std::pair<Price, Size>> asks;
     std::uint64_t last_update_id;
@@ -237,11 +237,11 @@ class BinanceFuturesFeed {
   public:
     static constexpr bool kSnapshotViaRest = true;  // false 的話 RequestSnapshot 對 VenueSession 是 no-op
 
-    std::string subscribe_message(std::span<const SymbolId> symbols,
+    std::string subscribe_message(std::span<const NativeSymbol> symbols,
                                    std::string_view update_speed = "100ms") const;  // 純函式
     std::expected<ParsedMessage, std::errc> parse_message(std::string_view text) const;
-    HttpRequestSpec snapshot_request(const SymbolId& symbol) const;  // GET /fapi/v1/depth?symbol=...&limit=1000
-    std::expected<SnapshotMessage, std::errc> parse_snapshot_response(SymbolId symbol,
+    HttpRequestSpec snapshot_request(const NativeSymbol& symbol) const;  // GET /fapi/v1/depth?symbol=...&limit=1000
+    std::expected<SnapshotMessage, std::errc> parse_snapshot_response(NativeSymbol symbol,
                                                                         std::string_view body) const;
 };
 ```
@@ -262,7 +262,7 @@ class BybitLinearFeed {
   public:
     static constexpr bool kSnapshotViaRest = false;  // snapshot 由 WS 自己推，RequestSnapshot 是 no-op
     std::string_view ws_target() const { return "/v5/public/linear"; }
-    std::string subscribe_message(std::span<const SymbolId> symbols, int depth = 50) const;  // orderbook.{depth}.{symbol}
+    std::string subscribe_message(std::span<const NativeSymbol> symbols, int depth = 50) const;  // orderbook.{depth}.{symbol}
     std::expected<ParsedMessage, std::errc> parse_message(std::string_view text) const;
     // 沒有 snapshot_request()/parse_snapshot_response()：kSnapshotViaRest==false 時
     // VenueSession 的 handle_request_snapshot() 走 if constexpr 的另一支，這兩個方法
@@ -299,7 +299,7 @@ class BybitSpotFeed {
   - **template 化在 `NextLayer` 上**，不是寫死 SSL：`PlainWebSocketConnection`（`beast::tcp_stream`）給測試用（本地 server，不用處理測試憑證），`TlsWebSocketConnection`（`net::ssl::stream<beast::tcp_stream>`）給正式環境接 `wss://` 用。兩者共用同一份 connect/send/read/close 邏輯，只有 `connect()` 內用 `if constexpr` 判斷 `NextLayer` 是不是 SSL stream 來決定要不要多做 SNI 設定 + TLS handshake。測試涵蓋 connect/send/read/close 的機制本身（用本地 plain TCP echo server），不涵蓋 TLS handshake 這條分支本身（那段是 Asio/OpenSSL 自己的、有廣泛測試覆蓋的邏輯，不是本專案自己的程式碼）。
   - `asio::strand` 的部分尚未加——目前 `WebSocketConnection` 本身不管理 strand，這是 `VenueSession` 建構它的時候要決定的事（見下）。
 - **HTTP snapshot（已實作：`service/http_client.hpp` / `tests/http_client_test.cpp`）**：不需要獨立的「HttpConnection」物件，寫成一次性函式 `http_get<NextLayer>(host, port, target, stream_args...) -> awaitable<expected<string, errc>>` 就夠，因為 REST snapshot 只是偶發的一次性 GET，不是常駐連線。跟 `WebSocketConnection` 同樣的 template 手法（`NextLayer` 決定要不要走 SSL），也跟它共用同一個 `detail::is_ssl_stream_v` trait（抽到 `service/net_traits.hpp`，避免兩邊各自重複定義）。測試涵蓋成功回應、非 200 狀態碼、連線被拒絕三種情況，一樣用本地 plain TCP HTTP server，不用測試憑證。
-- **`VenueSession<Feed, Policy, NextLayer>`（已實作：`service/venue_session.hpp` / `tests/venue_session_test.cpp`）**：真正的 orchestrator，生命週期橫跨很多次 `WebSocketConnection`。擁有這條 session 負責的所有 symbol 的 `SymbolSync<Policy>`（`unordered_map<SymbolId, SymbolSync<Policy>>`），驅動迴圈：
+- **`VenueSession<Feed, Policy, NextLayer>`（已實作：`service/venue_session.hpp` / `tests/venue_session_test.cpp`）**：真正的 orchestrator，生命週期橫跨很多次 `WebSocketConnection`。擁有這條 session 負責的所有 symbol 的 `SymbolSync<Policy>`（`unordered_map<NativeSymbol, SymbolSync<Policy>>`），驅動迴圈：
 
 ```
 loop:
@@ -327,13 +327,13 @@ loop:
 ### 實作時踩到的坑（都是真的踩過，不是紙上談兵）
 
 1. **`RequestSnapshot` 必須用 `co_spawn` 丟到背景、絕對不能 `co_await` 內聯處理。** 這不是效能優化，是正確性的必要條件：如果內聯 `co_await http_get(...)`，`execute_action` 會一路卡住，`run()` 的讀取迴圈整個被 HTTP fetch 卡住，永遠沒機會在等 snapshot 回來的同時繼續讀 WS、把 live event 塞進 buffer——`on_snapshot()` 每次都會發現 buffer 是空的、永遠銜接不上、無限重試。這正是顧問一開始強調「要在發 snapshot 請求之前就先開始緩衝」的具體體現：不是文件寫寫而已，是 coroutine 排程層面真的會卡死。
-2. **傳給 `co_spawn` 的 coroutine，所有參數必須是值傳遞，不能是參考。** `handle_request_snapshot`（處理 `RequestSnapshot` 的那個 coroutine）一開始寫成 `const SymbolId& symbol`，結果是真實的 use-after-free：`co_spawn` 出去之後，呼叫端（`execute_action`）幾乎立刻執行完畢、它所在的 coroutine frame 被銷毀，連帶讓參考指向的 `symbol` 區域變數一起死掉；但 `handle_request_snapshot` 還在等 HTTP fetch（真的要花時間），等它恢復執行、要用 `symbol` 時，參考的東西早就沒了。實際症狀是 SIGTRAP crash（沒有任何例外訊息，直接跳過），花了不少時間才用 lldb + 大量 debug print 定位到。**教訓：任何要交給 `co_spawn`（而非直接 `co_await`）的 coroutine，其所有參數都必須用值傳遞**——因為它的生命週期不再受呼叫端的 frame 保護。`execute_actions`/`execute_action` 目前仍用 `const SymbolId&`，這是安全的，因為它們永遠是被直接 `co_await`（不是 spawn）呼叫，呼叫端的 frame 保證活到它們執行完——但這條規則是脆弱的，之後如果誰把其中一個也改成 spawn，要記得同步把參數改成值傳遞。
+2. **傳給 `co_spawn` 的 coroutine，所有參數必須是值傳遞，不能是參考。** `handle_request_snapshot`（處理 `RequestSnapshot` 的那個 coroutine）一開始寫成 `const NativeSymbol& symbol`，結果是真實的 use-after-free：`co_spawn` 出去之後，呼叫端（`execute_action`）幾乎立刻執行完畢、它所在的 coroutine frame 被銷毀，連帶讓參考指向的 `symbol` 區域變數一起死掉；但 `handle_request_snapshot` 還在等 HTTP fetch（真的要花時間），等它恢復執行、要用 `symbol` 時，參考的東西早就沒了。實際症狀是 SIGTRAP crash（沒有任何例外訊息，直接跳過），花了不少時間才用 lldb + 大量 debug print 定位到。**教訓：任何要交給 `co_spawn`（而非直接 `co_await`）的 coroutine，其所有參數都必須用值傳遞**——因為它的生命週期不再受呼叫端的 frame 保護。`execute_actions`/`execute_action` 目前仍用 `const NativeSymbol&`，這是安全的，因為它們永遠是被直接 `co_await`（不是 spawn）呼叫，呼叫端的 frame 保證活到它們執行完——但這條規則是脆弱的，之後如果誰把其中一個也改成 spawn，要記得同步把參數改成值傳遞。
 3. **std::visit 的 visitor 如果宣告回傳 `net::awaitable<void>`，函式本體卻完全沒有 `co_await`/`co_return`，會在函式結尾「掉出」而沒有真正產生回傳值。** 這不是空手而回——Clang 會在非 void、非 coroutine 函式掉出結尾的地方插入 trap 指令，一執行到就是 SIGTRAP，是第二個造成同一個 crash 症狀的真實 bug（先修好 bug 2 之後才浮現，之前被 bug 2 的 crash 蓋住了）。修法：如果 visitor 內部完全是同步邏輯（`SymbolBook` 的呼叫都不會 suspend），就老實宣告成回傳 `void` 的一般函式，不要為了「看起來要放進 `co_await std::visit(...)` 這種寫法」硬掛一個 `-> net::awaitable<void>`。
 4. **測試時，假的 WS server 送完一則訊息就讓 coroutine 結束、底層 socket 跟著被解構關閉連線，會被 `VenueSession` 正確判定為斷線，觸發 `on_disconnected()` 把剛緩衝好的事件整個清空。** 這不是 bug，是系統正確的行為，但一開始把它誤判成又一個記憶體損壞 bug、花了好一陣子用 constructor/destructor 追蹤 + 逐點印位址才排除。**教訓：測試裡模擬「連線還活著、資料還沒送完」的假 server，送完 scripted 訊息之後，要故意再掛一個不會結束的 read（或其他方式）撐住連線的生命週期，不能讓 coroutine 提早 return。**
 
 ## 8. `SymbolRegistry`（已實作：`service/venue_session.hpp`）
 
-`std::unordered_map<SymbolId, SymbolBook*>`，啟動時用 `add(symbol, service.book(symbol))` 建好，不動態增減。沒有特別的設計難度，純查表。
+`std::unordered_map<NativeSymbol, SymbolBook*>`，啟動時用 `add(symbol, service.book(symbol))` 建好，不動態增減。沒有特別的設計難度，純查表。
 
 ## 9. 其他修正記錄摘要
 

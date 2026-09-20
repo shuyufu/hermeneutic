@@ -37,7 +37,7 @@ class BybitLinearFeed {
     std::string_view ws_port() const { return "443"; }
     std::string_view ws_target() const { return "/v5/public/linear"; }
 
-    std::string subscribe_message(std::span<const SymbolId> symbols, int depth = 50) const {
+    std::string subscribe_message(std::span<const NativeSymbol> symbols, int depth = 50) const {
         return detail::bybit_orderbook_subscribe_message(symbols, depth);
     }
 
@@ -67,7 +67,7 @@ class BybitSpotFeed {
     std::string_view ws_port() const { return "443"; }
     std::string_view ws_target() const { return "/v5/public/spot"; }
 
-    std::string subscribe_message(std::span<const SymbolId> symbols, int depth = 50) const {
+    std::string subscribe_message(std::span<const NativeSymbol> symbols, int depth = 50) const {
         return detail::bybit_orderbook_subscribe_message(symbols, depth);
     }
 

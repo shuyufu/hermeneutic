@@ -15,6 +15,7 @@ namespace bobby::hermeneutic::ingestion {
 using bobby::hermeneutic::symbol::BookId;
 using bobby::hermeneutic::symbol::Exchange;
 using bobby::hermeneutic::symbol::MarketType;
+using bobby::hermeneutic::symbol::NativeSymbol;
 using bobby::hermeneutic::symbol::VenueId;
 
 // One venue's contribution to one book: everything apps/aggregator/server_main.cpp
@@ -32,7 +33,7 @@ using bobby::hermeneutic::symbol::VenueId;
 struct VenueSubscription {
     VenueId venue_id;
     BookId book_id;              // AggregatorService::book()'s key
-    std::string native_symbol;   // e.g. "BTC-USDT-SWAP" - what this venue's Feed subscribes with
+    NativeSymbol native_symbol;  // e.g. "BTC-USDT-SWAP" - what this venue's Feed subscribes with
 };
 
 // Parses a subscription config document, e.g.:

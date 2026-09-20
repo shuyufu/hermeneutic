@@ -274,17 +274,26 @@ inline std::string to_string(const VenueId& id) {
     return std::string(naming.exchange_part) + "_" + std::string(market_part);
 }
 
-// The wire-format symbol a venue's own Feed subscribes with. Binance/Bybit
-// use the same concatenated spelling for both spot and their derivatives
-// market ("BTCUSDT" either way - see apps/aggregator/server_main.cpp's registry-
-// building loop, which relies on this); OKX separates base/quote with its
-// own dash and tags a swap with "-SWAP" (matching the instId shape
-// OkxFeed::parse_message() reads back verbatim - see okx_feed.hpp).
-// Unambiguous by construction - `symbol` already carries the base/quote
-// boundary the caller supplied, rather than this having to recover it
-// from a concatenated string the way split_base_quote()'s own comment
-// explains this project avoids.
-inline std::string native_symbol(Exchange exchange, const BaseQuote& symbol, MarketType type) {
+// The wire-format symbol a venue's own Feed subscribes with - an opaque,
+// venue-scoped string ("BTCUSDT", "BTC-USDT-SWAP"), not a cross-venue
+// identity the way BookId/BaseQuote are. Every consumer of this type
+// (exchange/*_feed.hpp's DepthUpdate/SnapshotMessage, VenueSession's
+// SymbolRegistry/symbol_syncs_ maps) is already scoped to one VenueId, so
+// there's no need for a strong type here to keep two venues' symbols from
+// colliding in the same container - a plain alias is the right altitude.
+using NativeSymbol = std::string;
+
+// Computes that wire-format spelling for one (exchange, symbol, type)
+// triple. Binance/Bybit use the same concatenated spelling for both spot and
+// their derivatives market ("BTCUSDT" either way - see
+// apps/aggregator/server_main.cpp's registry-building loop, which relies on
+// this); OKX separates base/quote with its own dash and tags a swap with
+// "-SWAP" (matching the instId shape OkxFeed::parse_message() reads back
+// verbatim - see okx_feed.hpp). Unambiguous by construction - `symbol`
+// already carries the base/quote boundary the caller supplied, rather than
+// this having to recover it from a concatenated string the way
+// split_base_quote()'s own comment explains this project avoids.
+inline NativeSymbol native_symbol(Exchange exchange, const BaseQuote& symbol, MarketType type) {
     switch (exchange) {
         case Exchange::Binance:
         case Exchange::Bybit:

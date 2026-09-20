@@ -59,7 +59,7 @@ class MinimalFakeFeed {
     std::string_view ws_port() const { return ws_port_; }
     std::string_view ws_target() const { return "/"; }
 
-    std::string subscribe_message(std::span<const SymbolId>) const { return "SUBSCRIBE"; }
+    std::string subscribe_message(std::span<const NativeSymbol>) const { return "SUBSCRIBE"; }
 
     std::expected<std::optional<std::variant<SnapshotMessage, DepthUpdate>>, std::errc> parse_message(
         std::string_view) const {

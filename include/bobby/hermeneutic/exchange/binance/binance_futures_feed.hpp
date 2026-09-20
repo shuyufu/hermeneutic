@@ -44,7 +44,7 @@ class BinanceFuturesFeed {
     // every symbol's depth diff stream. Stream name pattern is
     // `{symbol}@depth@{update_speed}` (symbol lowercased), matching one of
     // Binance's documented update_speed options ("100ms"/"500ms").
-    std::string subscribe_message(std::span<const SymbolId> symbols,
+    std::string subscribe_message(std::span<const NativeSymbol> symbols,
                                    std::string_view update_speed = "100ms") const {
         std::string params;
         for (std::size_t i = 0; i < symbols.size(); ++i) {
@@ -98,14 +98,14 @@ class BinanceFuturesFeed {
 
     // GET /fapi/v1/depth?symbol=<symbol>&limit=1000 -- see
     // developers.binance.com's Order Book REST endpoint doc.
-    HttpRequestSpec snapshot_request(const SymbolId& symbol) const {
+    HttpRequestSpec snapshot_request(const NativeSymbol& symbol) const {
         return HttpRequestSpec{"fapi.binance.com", "443", "/fapi/v1/depth?symbol=" + symbol + "&limit=1000"};
     }
 
     // `symbol` is supplied by the caller (the request it made), not read
     // from the response body -- the REST response itself carries no symbol
     // field (see the doc's Sources for the exact shape).
-    std::expected<SnapshotMessage, std::errc> parse_snapshot_response(SymbolId symbol,
+    std::expected<SnapshotMessage, std::errc> parse_snapshot_response(NativeSymbol symbol,
                                                                        std::string_view body) const {
         try {
             simdjson::ondemand::parser parser;

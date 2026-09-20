@@ -47,6 +47,7 @@ using bobby::hermeneutic::aggregator::SymbolBook;
 using bobby::hermeneutic::ingestion::VenueSubscription;
 using bobby::hermeneutic::symbol::Exchange;
 using bobby::hermeneutic::symbol::MarketType;
+using bobby::hermeneutic::symbol::NativeSymbol;
 using bobby::hermeneutic::symbol::VenueId;
 
 // Every venue's contribution, gathered from the flat VenueSubscription
@@ -54,7 +55,7 @@ using bobby::hermeneutic::symbol::VenueId;
 // list plus one SymbolRegistry per venue, not one per symbol. See the
 // grouping loop in main() below.
 struct VenueGroup {
-    std::vector<std::string> native_symbols;
+    std::vector<NativeSymbol> native_symbols;
     bobby::hermeneutic::ingestion::SymbolRegistry<SymbolBook> registry;
 };
 

@@ -101,14 +101,14 @@ TEST(BybitLinearFeedTest, DeltaMissingRequiredFieldFailsWithBadMessage) {
 
 TEST(BybitLinearFeedTest, SubscribeMessageListsEachTopicWithDefaultDepth50) {
     BybitLinearFeed feed;
-    std::array<SymbolId, 2> symbols{"BTCUSDT", "ETHUSDT"};
+    std::array<NativeSymbol, 2> symbols{"BTCUSDT", "ETHUSDT"};
     EXPECT_EQ(feed.subscribe_message(symbols),
               R"({"op":"subscribe","args":["orderbook.50.BTCUSDT","orderbook.50.ETHUSDT"]})");
 }
 
 TEST(BybitLinearFeedTest, SubscribeMessageHonorsCustomDepth) {
     BybitLinearFeed feed;
-    std::array<SymbolId, 1> symbols{"BTCUSDT"};
+    std::array<NativeSymbol, 1> symbols{"BTCUSDT"};
     EXPECT_EQ(feed.subscribe_message(symbols, 200),
               R"({"op":"subscribe","args":["orderbook.200.BTCUSDT"]})");
 }

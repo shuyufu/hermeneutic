@@ -82,7 +82,7 @@ TEST(BybitSpotFeedTest, MalformedJsonFailsWithBadMessage) {
 
 TEST(BybitSpotFeedTest, SubscribeMessageListsEachTopicWithDefaultDepth50) {
     BybitSpotFeed feed;
-    std::array<SymbolId, 2> symbols{"BTCUSDT", "ETHUSDT"};
+    std::array<NativeSymbol, 2> symbols{"BTCUSDT", "ETHUSDT"};
     EXPECT_EQ(feed.subscribe_message(symbols),
               R"({"op":"subscribe","args":["orderbook.50.BTCUSDT","orderbook.50.ETHUSDT"]})");
 }

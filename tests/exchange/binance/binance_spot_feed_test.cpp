@@ -112,7 +112,7 @@ TEST(BinanceSpotFeedTest, MalformedSnapshotResponseFailsWithBadMessage) {
 
 TEST(BinanceSpotFeedTest, SubscribeMessageListsEachSymbolLowercasedWithStreamSuffix) {
     BinanceSpotFeed feed;
-    std::array<SymbolId, 2> symbols{"BTCUSDT", "ETHUSDT"};
+    std::array<NativeSymbol, 2> symbols{"BTCUSDT", "ETHUSDT"};
     EXPECT_EQ(feed.subscribe_message(symbols),
               R"({"method":"SUBSCRIBE","params":["btcusdt@depth@100ms","ethusdt@depth@100ms"],"id":1})");
 }
@@ -121,7 +121,7 @@ TEST(BinanceSpotFeedTest, SubscribeMessageHonorsCustomUpdateSpeed) {
     // 1000ms is Spot's documented default speed (not Futures' "500ms"
     // option, which Spot doesn't have).
     BinanceSpotFeed feed;
-    std::array<SymbolId, 1> symbols{"BTCUSDT"};
+    std::array<NativeSymbol, 1> symbols{"BTCUSDT"};
     EXPECT_EQ(feed.subscribe_message(symbols, "1000ms"),
               R"({"method":"SUBSCRIBE","params":["btcusdt@depth@1000ms"],"id":1})");
 }

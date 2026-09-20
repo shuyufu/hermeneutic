@@ -37,7 +37,7 @@ namespace detail {
 // expects in the subscribe request and echoes back in `data.s`); `depth`
 // must be one of Bybit's documented values for the calling Feed's market
 // segment - not validated here, a caller-level concern.
-inline std::string bybit_orderbook_subscribe_message(std::span<const SymbolId> symbols, int depth) {
+inline std::string bybit_orderbook_subscribe_message(std::span<const NativeSymbol> symbols, int depth) {
     std::string args;
     for (std::size_t i = 0; i < symbols.size(); ++i) {
         if (i > 0) args += ',';

@@ -50,7 +50,7 @@ class BinanceSpotFeed {
     // (spelled out explicitly, not "500ms" like Futures) - default kept at
     // "100ms" here for parity with BinanceFuturesFeed's default, not
     // because Spot's own default differs.
-    std::string subscribe_message(std::span<const SymbolId> symbols,
+    std::string subscribe_message(std::span<const NativeSymbol> symbols,
                                    std::string_view update_speed = "100ms") const {
         std::string params;
         for (std::size_t i = 0; i < symbols.size(); ++i) {
@@ -113,7 +113,7 @@ class BinanceSpotFeed {
     // snapshot minimizes how often on_snapshot() has to retry when Spot's
     // <= drop rule (BinanceSpotSequencePolicy, unlike Futures' strict <)
     // empties the buffer on a quiet symbol - see docs/ingestion_design.md.
-    HttpRequestSpec snapshot_request(const SymbolId& symbol) const {
+    HttpRequestSpec snapshot_request(const NativeSymbol& symbol) const {
         return HttpRequestSpec{"api.binance.com", "443", "/api/v3/depth?symbol=" + symbol + "&limit=5000"};
     }
 
@@ -122,7 +122,7 @@ class BinanceSpotFeed {
     // field (see the doc's Sources for the exact shape). Same shape as
     // Futures' response minus the `E`/`T` fields Futures has and this code
     // doesn't parse from either.
-    std::expected<SnapshotMessage, std::errc> parse_snapshot_response(SymbolId symbol,
+    std::expected<SnapshotMessage, std::errc> parse_snapshot_response(NativeSymbol symbol,
                                                                        std::string_view body) const {
         try {
             simdjson::ondemand::parser parser;
