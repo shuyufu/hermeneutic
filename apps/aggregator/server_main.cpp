@@ -3,6 +3,7 @@
 
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/signal_set.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/beast/core/tcp_stream.hpp>
 
@@ -10,7 +11,10 @@
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
+#include <cstdlib>
 #include <exception>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -163,9 +167,8 @@ int main(int argc, char** argv) {
     // still alive (mid-sleep) when main() reaches the end of this
     // function calls service.send_heartbeat() on an object that's about
     // to be (or already is) destroyed - a real use-after-free, not
-    // hypothetical, once anything actually makes server->Wait() return
-    // (nothing does yet - see the shutdown comment below - but this
-    // thread shouldn't be a landmine waiting for whoever wires that up).
+    // hypothetical, now that the signal handler below actually makes
+    // server->Wait() return.
     constexpr auto kHeartbeatInterval = std::chrono::seconds(1);
     std::atomic<bool> heartbeat_stop{false};
     std::thread heartbeat_thread([&service, &heartbeat_stop, kHeartbeatInterval] {
@@ -229,6 +232,80 @@ int main(int argc, char** argv) {
     wire_venue<bobby::hermeneutic::ingestion::OkxFeed, bobby::hermeneutic::OkxSequencePolicy>(
         runner, groups, VenueId{Exchange::Okx, MarketType::Perp}, wired_venues, io.get_executor(), &ssl_ctx);
 
+    // Lets a real SIGINT/SIGTERM (Ctrl-C, `docker stop`/`docker compose
+    // down`) make server->Wait() below return, instead of the OS just
+    // killing the process outright - its default disposition, since
+    // nothing else here installs a handler, which used to mean every one
+    // of those skipped runner.stop_all()'s clean drain entirely. Delivered
+    // through `io`'s own event loop (runs on io_thread) rather than a raw
+    // signal()/sigaction() handler, so the callback isn't restricted to
+    // async-signal-safe calls the way a real signal handler would be.
+    //
+    // grpc_shutdown_thread, not an inline server->Shutdown() call: the
+    // handler itself runs on io_thread, and Shutdown() blocks for up to
+    // kGrpcShutdownDeadline draining in-flight RPCs - doing that inline
+    // would stall every VenueSession's read/write/reconnect-timer
+    // dispatch on `io` for that whole window, for no benefit (nothing
+    // here needs Shutdown() to finish before those keep running). Joined
+    // right after server->Wait() returns below - never detached, for the
+    // same use-after-free reason heartbeat_thread and shutdown_watchdog
+    // aren't either. Guarded with joinable(), not asserted: Server::Wait()
+    // is `while (started_ && !shutdown_notified_)`, so if `started_` were
+    // ever false it returns immediately without this thread ever having
+    // been started - joining a default-constructed std::thread is
+    // std::terminate, a crash, not merely a wrong value, so this is worth
+    // the runtime check even though today's code always starts it first.
+    //
+    // A deadline, not a bare Shutdown(): AggregatorService's subscriber
+    // streams (SubscribeL2Diff/SubscribeBbo) are intentionally long-lived,
+    // so a subscriber that never disconnects would otherwise make
+    // Shutdown() wait for it forever. kGrpcShutdownDeadline only bounds
+    // grpc's own *first* internal phase, though, not the whole call: past
+    // this deadline, grpc force-cancels every in-flight RPC and then waits
+    // *again*, untimed, for that cancellation to actually be observed
+    // (Server::ShutdownInternal(), server_cc.cc) - so a genuinely wedged
+    // subscriber Write() (a black-holed socket cancellation can't unstick
+    // promptly, the same class of pathological network condition the
+    // DNS-resolution comment below already calls out for the ingestion
+    // side) can still leave server->Wait() blocked indefinitely. That's a
+    // known, accepted gap, not an oversight: the backstop for it is a
+    // second SIGINT/SIGTERM (forcing std::_Exit() below) or, failing
+    // that, the orchestrator's own SIGKILL - not one more layered
+    // in-process timeout on top of the two this file already has. This
+    // stacks with kShutdownTimeout below rather than overlapping it in
+    // the nominal case - Shutdown() must finish, and server->Wait()
+    // return, before runner.stop_all() even starts - so anything driving
+    // this process needs a shutdown budget of at least their sum; see
+    // docker-compose.yml's stop_grace_period for this project's own.
+    //
+    // Re-armed, not truly one-shot: boost::asio::signal_set keeps the OS
+    // disposition pointed at this handler for `signals`' whole lifetime -
+    // it does not revert to the OS default just because async_wait()
+    // isn't re-armed, so a genuinely one-shot registration would silently
+    // swallow every signal after the first rather than let an operator
+    // force an immediate exit (via a second Ctrl-C/SIGTERM) if the drain
+    // below ever stalls. Re-arming lets a second signal reach this same
+    // handler, which calls std::_Exit() instead of asking nicely again.
+    constexpr auto kGrpcShutdownDeadline = std::chrono::seconds(5);
+    std::thread grpc_shutdown_thread;
+    bool shutdown_requested = false;
+    net::signal_set signals(io, SIGINT, SIGTERM);
+    std::function<void(const boost::system::error_code&, int)> on_signal;
+    on_signal = [&server, &signals, &on_signal, &shutdown_requested, &grpc_shutdown_thread,
+                 kGrpcShutdownDeadline](const boost::system::error_code& ec, int signal_number) {
+        if (ec) return;  // e.g. the signal_set was cancelled/destroyed first
+        std::cerr << "received signal " << signal_number << ", shutting down\n";
+        if (shutdown_requested) {
+            std::_Exit(1);
+        }
+        shutdown_requested = true;
+        grpc_shutdown_thread = std::thread([&server, kGrpcShutdownDeadline] {
+            server->Shutdown(std::chrono::system_clock::now() + kGrpcShutdownDeadline);
+        });
+        signals.async_wait(on_signal);
+    };
+    signals.async_wait(on_signal);
+
     runner.start_all();
     std::thread io_thread([&io] { io.run(); });
 
@@ -239,6 +316,7 @@ int main(int argc, char** argv) {
     for (const auto& venue : wired_venues) std::cout << ' ' << venue;
     std::cout << std::endl;
     server->Wait();
+    if (grpc_shutdown_thread.joinable()) grpc_shutdown_thread.join();
 
     // No io.stop() as the primary shutdown mechanism: stop_all() aborts
     // every session's in-flight read/backoff wait and drains any in-flight

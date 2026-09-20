@@ -51,6 +51,18 @@ services:
       # bobby/hermeneutic/ingestion/book_subscription.hpp for the shape).
       - ./apps/aggregator/subscriptions.example.json:/etc/hermeneutic/subscriptions.json:ro
     restart: unless-stopped
+    # A policy choice, not a computed bound - no finite number can be,
+    # since server_main.cpp's own comment on kGrpcShutdownDeadline
+    # explains that a genuinely wedged gRPC shutdown can hang past its
+    # deadline. 45s = kGrpcShutdownDeadline (5s) + kShutdownTimeout (35s)
+    # + margin: long enough that the *existing* in-process
+    # shutdown_watchdog backstop gets a real chance to fire before Docker
+    # would otherwise SIGKILL out from under it (at Compose's 10s
+    # default, that 35s watchdog can never fire at all - dead code in
+    # this exact deployment). A shutdown that's still stuck past 45s
+    # terminates by SIGKILL, by design, same as an operator's second
+    # Ctrl-C/SIGTERM would force via std::_Exit() on the host.
+    stop_grace_period: 45s
     # A plain TCP-connect check, not a real gRPC health check: good enough
     # to know the listener is up (grpc::ServerBuilder::BuildAndStart()
     # returns, and binds the port, well before server_main.cpp's ingestion

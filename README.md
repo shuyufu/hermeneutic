@@ -279,12 +279,30 @@ Technical decisions worth calling out:
 - **Both containers run as a non-root user** (`hermeneutic`, created in
   `runtime-base`) rather than the default root, since neither binary needs
   elevated privileges at runtime.
-- **Graceful shutdown is a known gap, not something this Docker setup
-  adds or hides.** `server_main.cpp` has no `SIGTERM`/`SIGINT` handler and
-  nothing calls `grpc::Server::Shutdown()` yet (see that file's own
-  comment on `server->Wait()` for why the shutdown-watchdog thread already
-  anticipates this); `docker compose down`/`docker stop` therefore hard-kill
-  the process exactly as an unhandled `SIGTERM` would on the host, skipping
-  `runner.stop_all()`'s clean drain of in-flight venue sessions and
-  subscriber streams. Wiring that up is an application-level change
-  outside this Docker work's scope, not a container-runtime one.
+- **`aggregator-service` has a `stop_grace_period: 45s`, and it's a
+  policy choice, not a computed bound.** `server_main.cpp` installs a
+  `SIGINT`/`SIGTERM` handler (a `boost::asio::signal_set` on its own
+  `io_context`) that calls `grpc::Server::Shutdown()` with a 5s deadline,
+  so `docker compose down`/`docker stop` now drain cleanly -
+  `runner.stop_all()`'s clean shutdown of in-flight venue sessions, and
+  every `SubscribeL2Diff`/`SubscribeBbo` handler unsubscribing itself as
+  it unwinds - instead of hard-killing the process. Measured directly
+  (`docker stop`, then `docker inspect` for `ExitCode`/timestamps):
+  `ExitCode=0` in every case, under 1s once venue sessions have
+  stabilized and nothing is subscribed, ~5.1s with three real
+  `aggregator-client-*` subscribers attached (they hit the 5s gRPC
+  deadline since none disconnects on its own, then exit cleanly with
+  `grpc_status=14`), and up to ~10.8s if the signal lands while venue
+  sessions are still mid-connect at startup. No finite `stop_grace_period`
+  can bound the true worst case, though: `server_main.cpp`'s own comment
+  on `kGrpcShutdownDeadline` explains that it only bounds gRPC's first
+  internal shutdown phase, not the whole call, so a genuinely wedged
+  subscriber connection can still hang past it. 45s
+  (`kGrpcShutdownDeadline` + `kShutdownTimeout` + margin) is sized so the
+  existing in-process `shutdown_watchdog` backstop gets a real chance to
+  fire before Docker would otherwise `SIGKILL` out from under it - at
+  Compose's 10s default, that 35s watchdog can never fire at all in this
+  deployment. A shutdown still stuck past 45s terminates by `SIGKILL`, by
+  design, the same as a second Ctrl-C/SIGTERM forces via `std::_Exit()`
+  on the host - not one more layered in-process timeout on top of the two
+  `server_main.cpp` already has.
