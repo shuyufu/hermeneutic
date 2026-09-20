@@ -1,0 +1,19 @@
+# Keep the Docker build context small and avoid shipping host build
+# artifacts (a different compiler/vcpkg triplet than the image's own)
+# into the builder stage's COPY . . .
+build/
+build-*/
+.cache/
+Testing/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+
+.git/
+.claude/
+
+*.o
+*.a
+*.so
+*.so.*
+*.dylib

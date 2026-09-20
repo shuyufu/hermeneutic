@@ -1,0 +1,87 @@
+# Runs the aggregator service (and, optionally, its diagnostic client) on a
+# single host. See README.md's "Running with Docker" section for the
+# reasoning behind the two-target Dockerfile this builds from.
+
+# Fixed project name: like the per-service `image:` names below, this
+# keeps container names (e.g. "hermeneutic-aggregator-service-1") stable
+# regardless of which directory the repo happens to be checked out into -
+# Compose otherwise derives the project name from that directory.
+name: hermeneutic
+
+# Every service here builds from the same context/dockerfile, only
+# `target:` differs, so that pair lives in one anchor instead of being
+# repeated (and risking drift) in each service's own `build:` block.
+x-build-base: &build-base
+  context: .
+  dockerfile: docker/Dockerfile
+
+# Shared by every aggregator-client-* service below: one client_main.cpp
+# binary, three concurrent invocations distinguished only by `command:`
+# (bbo/volume-bands/price-bands can't share a single Compose service - each
+# needs its own container and its own long-running foreground process).
+x-client-base: &client-base
+  build:
+    <<: *build-base
+    target: client
+  depends_on:
+    aggregator-service:
+      condition: service_healthy
+  profiles: ["client"]
+
+services:
+  aggregator-service:
+    # Named explicitly rather than left to Compose's default
+    # <project>-<service> tag (which takes <project> from whatever
+    # directory the compose file happens to be run from - a worktree
+    # checkout named e.g. "docker-deploy" would otherwise tag this
+    # "docker-deploy-aggregator-service"): a fixed name here is stable
+    # regardless of where the repo is checked out.
+    image: aggregator-service
+    build:
+      <<: *build-base
+      target: service
+    ports:
+      - "50051:50051"
+    volumes:
+      # The image bakes in no config of its own (see docker/Dockerfile) -
+      # this mount is what makes `docker compose up` actually work.
+      # Defaults to the repo's worked example; point this at your own
+      # config to change which books/venues get ingested (see
+      # apps/aggregator/subscriptions.example.json and
+      # bobby/hermeneutic/ingestion/book_subscription.hpp for the shape).
+      - ./apps/aggregator/subscriptions.example.json:/etc/hermeneutic/subscriptions.json:ro
+    restart: unless-stopped
+    # A plain TCP-connect check, not a real gRPC health check: good enough
+    # to know the listener is up (grpc::ServerBuilder::BuildAndStart()
+    # returns, and binds the port, well before server_main.cpp's ingestion
+    # setup or server->Wait()), which is all aggregator-client's
+    # depends_on below needs - the client's own SubscribeBbo call doesn't
+    # set wait_for_ready, so without this it can race the listener and
+    # fail fast with UNAVAILABLE instead of actually connecting.
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/50051' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # Diagnostic/example clients (apps/aggregator/client_main.cpp) - not part
+  # of "the service", so they're gated behind a profile: `docker compose up`
+  # alone starts none of them, `docker compose --profile client up` starts
+  # all three alongside aggregator-service. Each is
+  # `<address> <bbo|volume-bands|price-bands> <duration_seconds> <book...>`
+  # - see client_main.cpp / README.md's "Aggregator service" section.
+  aggregator-client-bbo:
+    <<: *client-base
+    image: aggregator-client-bbo
+    command: ["aggregator-service:50051", "bbo", "0", "BTC_USDT.SPOT", "BTC_USDT.PERP"]
+
+  aggregator-client-volume-bands:
+    <<: *client-base
+    image: aggregator-client-volume-bands
+    command: ["aggregator-service:50051", "volume-bands", "0", "BTC_USDT.SPOT"]
+
+  aggregator-client-price-bands:
+    <<: *client-base
+    image: aggregator-client-price-bands
+    command: ["aggregator-service:50051", "price-bands", "0", "BTC_USDT.SPOT"]
