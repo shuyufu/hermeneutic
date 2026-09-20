@@ -35,17 +35,9 @@ class AggregateOrderBook {
                                                 Size size) noexcept {
         if (!is_valid_level(price, size)) return std::unexpected(std::errc::invalid_argument);
 
-        try {
-            auto& venue_book = venues_[venue];
-            if (side == Side::Bid) {
-                apply_side(venue_book.bids, aggregate_.bids, price, size);
-            } else {
-                apply_side(venue_book.asks, aggregate_.asks, price, size);
-            }
-        } catch (const std::bad_alloc&) {
-            return std::unexpected(std::errc::not_enough_memory);
-        }
-        return {};
+        return try_apply(venue, side, [&](auto& venue_side, auto& aggregate_side) {
+            apply_side(venue_side, aggregate_side, price, size);
+        });
     }
 
     // Removes every level `venue` contributed and drops its book entirely.
@@ -80,31 +72,21 @@ class AggregateOrderBook {
             }
         }
 
-        try {
-            auto& venue_book = venues_[venue];
-            if (side == Side::Bid) {
-                apply_snapshot_side(venue_book.bids, aggregate_.bids, levels);
-            } else {
-                apply_snapshot_side(venue_book.asks, aggregate_.asks, levels);
-            }
-        } catch (const std::bad_alloc&) {
-            return std::unexpected(std::errc::not_enough_memory);
-        }
-        return {};
+        return try_apply(venue, side, [&](auto& venue_side, auto& aggregate_side) {
+            apply_snapshot_side(venue_side, aggregate_side, levels);
+        });
     }
 
     // Applies one batch of delta changes (e.g. everything one upstream
-    // exchange message carried) through a single call, rather than one
-    // apply_delta() per level - lets a caller that wants to treat the
-    // whole batch as one atomic revision (one sequence bump, one
-    // broadcast - see aggregator::SymbolBook::apply_batch) hook that
-    // behavior onto exactly one call instead of reimplementing this same
-    // validate-then-apply shape itself. Same per-level price/size
-    // rejection as apply_delta, checked for every level before any of
-    // them is applied, so a bad level anywhere in the batch leaves the
-    // book untouched rather than partially updated for that reason
-    // specifically (an allocation failure partway through is not rolled
-    // back - same documented limitation as apply_snapshot()).
+    // exchange message carried) through a single call, so a caller that
+    // wants to treat the whole batch as one atomic revision (one sequence
+    // bump, one broadcast - see aggregator::SymbolBook::apply_batch) can
+    // hook that behavior onto exactly one call instead of reimplementing
+    // this same validate-then-apply shape itself. Every level's price/size
+    // is checked before any of them is applied, so a bad level anywhere in
+    // the batch leaves the book untouched rather than partially updated
+    // for that reason specifically (an allocation failure partway through
+    // is not rolled back - same documented limitation as apply_snapshot()).
     std::expected<void, std::errc> apply_batch(const VenueId& venue,
                                                 std::span<const std::pair<Price, Size>> bids,
                                                 std::span<const std::pair<Price, Size>> asks) noexcept {
@@ -115,11 +97,16 @@ class AggregateOrderBook {
             if (!is_valid_level(price, size)) return std::unexpected(std::errc::invalid_argument);
         }
 
-        for (const auto& [price, size] : bids) {
-            if (auto result = apply_delta(venue, Side::Bid, price, size); !result) return result;
-        }
-        for (const auto& [price, size] : asks) {
-            if (auto result = apply_delta(venue, Side::Ask, price, size); !result) return result;
+        try {
+            auto& venue_book = venues_[venue];
+            for (const auto& [price, size] : bids) {
+                apply_side(venue_book.bids, aggregate_.bids, price, size);
+            }
+            for (const auto& [price, size] : asks) {
+                apply_side(venue_book.asks, aggregate_.asks, price, size);
+            }
+        } catch (const std::bad_alloc&) {
+            return std::unexpected(std::errc::not_enough_memory);
         }
         return {};
     }
@@ -128,6 +115,28 @@ class AggregateOrderBook {
     const std::unordered_map<VenueId, L2OrderBook>& venues() const noexcept { return venues_; }
 
   private:
+    // Looks up (creating on first use) `venue`'s book, picks the map
+    // matching `side`, and runs `op(venue_side, aggregate_side)` against
+    // it and the matching aggregate map. bids and asks are different map
+    // types (see l2_order_book.hpp), so this dispatch can't be done with
+    // a single reference - `op` is a generic lambda instead, letting
+    // apply_delta() and apply_snapshot() share this lookup/dispatch/
+    // bad_alloc-handling shape instead of each duplicating it.
+    template <typename Op>
+    std::expected<void, std::errc> try_apply(const VenueId& venue, Side side, Op&& op) noexcept {
+        try {
+            auto& venue_book = venues_[venue];
+            if (side == Side::Bid) {
+                op(venue_book.bids, aggregate_.bids);
+            } else {
+                op(venue_book.asks, aggregate_.asks);
+            }
+        } catch (const std::bad_alloc&) {
+            return std::unexpected(std::errc::not_enough_memory);
+        }
+        return {};
+    }
+
     // Sets `price` to `new_size` in `side` (erasing it when <= 0) and
     // returns the size that was there before, so the caller can derive a delta.
     // `new_size` is validated non-negative by the public entry points; the

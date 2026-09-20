@@ -243,5 +243,101 @@ TEST(AggregateOrderBook, ApplySnapshotRejectsNonPositivePriceAtomically) {
     EXPECT_EQ(book.venues().at(kBinance).asks.count(Price::from_raw(0)), 0u);
 }
 
+// apply_batch()'s own aggregation/atomicity behavior belongs here, not in
+// aggregator_service_test.cpp's AggregatorServiceTest.ApplyBatch* cases:
+// those go through a real SymbolBook over an actual gRPC server to check
+// SymbolBook's own diff/broadcast wiring (one seq bump per batch, diff
+// ordering, no broadcast on rejection) - concepts that don't exist on
+// AggregateOrderBook itself. That file is also gated behind
+// HERMENEUTIC_BUILD_SERVICE (needs the gRPC/protobuf vcpkg toolchain), so
+// it isn't part of the always-built hermeneutic_tests binary - these
+// cases are what actually exercise apply_batch()'s own correctness by
+// default.
+TEST(AggregateOrderBook, ApplyBatchAppliesBidsAndAsksInOneCall) {
+    AggregateOrderBook book;
+
+    std::array<std::pair<Price, Size>, 2> bids{{
+        {Price(102.0), Size(1.0)},
+        {Price(100.0), Size(2.0)},
+    }};
+    std::array<std::pair<Price, Size>, 1> asks{{
+        {Price(101.0), Size(3.0)},
+    }};
+    ASSERT_TRUE(book.apply_batch(kBinance, bids, asks).has_value());
+
+    EXPECT_EQ(book.aggregate().bids.at(Price(102.0)), Size(1.0));
+    EXPECT_EQ(book.aggregate().bids.at(Price(100.0)), Size(2.0));
+    EXPECT_EQ(book.aggregate().asks.at(Price(101.0)), Size(3.0));
+    EXPECT_EQ(book.venues().at(kBinance).bids.at(Price(102.0)), Size(1.0));
+    EXPECT_EQ(book.venues().at(kBinance).asks.at(Price(101.0)), Size(3.0));
+}
+
+TEST(AggregateOrderBook, ApplyBatchAggregatesAcrossVenuesLikeApplyDelta) {
+    AggregateOrderBook book;
+    book.apply_delta(kOkx, Side::Bid, Price(100.0), Size(5.0));
+
+    std::array<std::pair<Price, Size>, 2> bids{{
+        {Price(100.0), Size(3.0)},
+        {Price(99.0), Size(1.0)},
+    }};
+    ASSERT_TRUE(book.apply_batch(kBinance, bids, {}).has_value());
+
+    EXPECT_EQ(book.aggregate().bids.at(Price(100.0)), Size(8.0));  // okx's 5 + binance's 3
+    EXPECT_EQ(book.aggregate().bids.at(Price(99.0)), Size(1.0));   // binance only
+}
+
+TEST(AggregateOrderBook, ApplyBatchWithOneSideEmptyOnlyTouchesTheOtherSide) {
+    AggregateOrderBook book;
+    book.apply_delta(kBinance, Side::Ask, Price(101.0), Size(1.0));
+
+    std::array<std::pair<Price, Size>, 1> bids{{
+        {Price(100.0), Size(2.0)},
+    }};
+    ASSERT_TRUE(book.apply_batch(kBinance, bids, {}).has_value());
+
+    EXPECT_EQ(book.aggregate().bids.at(Price(100.0)), Size(2.0));
+    EXPECT_EQ(book.aggregate().asks.at(Price(101.0)), Size(1.0));  // untouched
+}
+
+TEST(AggregateOrderBook, ApplyBatchRejectsNegativeSizeAtomically) {
+    AggregateOrderBook book;
+    book.apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0));
+
+    std::array<std::pair<Price, Size>, 2> bad_bids{{
+        {Price(99.0), Size(1.0)},
+        {Price(98.0), Size(-1.0)},
+    }};
+    std::array<std::pair<Price, Size>, 1> asks{{
+        {Price(101.0), Size(1.0)},
+    }};
+    auto result = book.apply_batch(kBinance, bad_bids, asks);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), std::errc::invalid_argument);
+
+    // Nothing from the rejected batch was applied - not even the good bid
+    // ahead of the bad one, nor the ask side checked after it.
+    EXPECT_EQ(book.aggregate().bids.count(Price(99.0)), 0u);
+    EXPECT_EQ(book.aggregate().asks.count(Price(101.0)), 0u);
+    EXPECT_EQ(book.aggregate().bids.at(Price(100.0)), Size(1.0));
+}
+
+TEST(AggregateOrderBook, ApplyBatchRejectsNonPositivePriceAtomically) {
+    AggregateOrderBook book;
+    book.apply_delta(kBinance, Side::Ask, Price(100.0), Size(1.0));
+
+    std::array<std::pair<Price, Size>, 1> bids{{
+        {Price(99.0), Size(1.0)},
+    }};
+    std::array<std::pair<Price, Size>, 1> bad_asks{{
+        {Price::from_raw(0), Size(1.0)},
+    }};
+    auto result = book.apply_batch(kBinance, bids, bad_asks);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), std::errc::invalid_argument);
+
+    EXPECT_EQ(book.aggregate().bids.count(Price(99.0)), 0u);
+    EXPECT_EQ(book.aggregate().asks.at(Price(100.0)), Size(1.0));
+}
+
 }  // namespace
 }  // namespace bobby::hermeneutic

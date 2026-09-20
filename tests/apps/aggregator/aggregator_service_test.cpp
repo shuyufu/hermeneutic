@@ -474,6 +474,14 @@ TEST_F(AggregatorServiceTest, HeartbeatIsDeliveredAndDoesNotAdvanceSeq) {
     EXPECT_EQ(diff_msg.diff().book_seq(), 1u);
 }
 
+// The AggregateOrderBook.ApplyBatch* cases in aggregate_order_book_test.cpp
+// cover apply_batch()'s own aggregation/atomicity behavior directly and
+// cheaply, in the always-built hermeneutic_tests binary. The three cases
+// below are SymbolBook tests, not AggregateOrderBook tests that happen to
+// live in the wrong file: they check book_seq/diff broadcast semantics
+// (one seq bump per batch, diff ordering, no broadcast on rejection) that
+// only exist at this layer, which is why they need the real gRPC server
+// this fixture spins up and are gated behind HERMENEUTIC_BUILD_SERVICE.
 TEST_F(AggregatorServiceTest, ApplyBatchProducesOneSeqBumpForMultipleLevels) {
     updates_.wait_for(0);  // initial snapshot
 
@@ -504,29 +512,6 @@ TEST_F(AggregatorServiceTest, ApplyBatchProducesOneSeqBumpForMultipleLevels) {
     ASSERT_EQ(msg.diff().asks_size(), 1);
     EXPECT_EQ(msg.diff().asks(0).price_raw(), Price(101.0).raw());
     EXPECT_EQ(msg.diff().asks(0).size_raw(), Size(3.0).raw());
-}
-
-TEST_F(AggregatorServiceTest, ApplyBatchAggregatesAcrossVenuesLikeApplyDelta) {
-    updates_.wait_for(0);  // initial snapshot
-
-    ASSERT_TRUE(book().apply_delta(kOkx, Side::Bid, Price(100.0), Size(5.0)).has_value());
-    updates_.wait_for(1);
-
-    // binance's batch touches the same price okx already holds, plus a
-    // new one - the aggregate must reflect both venues' contributions.
-    std::array<std::pair<Price, Size>, 2> bids{{
-        {Price(100.0), Size(3.0)},
-        {Price(99.0), Size(1.0)},
-    }};
-    ASSERT_TRUE(book().apply_batch(kBinance, bids, {}).has_value());
-
-    L2Update msg = updates_.wait_for(2);
-    ASSERT_TRUE(msg.has_diff());
-    ASSERT_EQ(msg.diff().bids_size(), 2);
-    EXPECT_EQ(msg.diff().bids(0).price_raw(), Price(100.0).raw());
-    EXPECT_EQ(msg.diff().bids(0).size_raw(), Size(8.0).raw());  // okx's 5 + binance's new 3
-    EXPECT_EQ(msg.diff().bids(1).price_raw(), Price(99.0).raw());
-    EXPECT_EQ(msg.diff().bids(1).size_raw(), Size(1.0).raw());  // binance only
 }
 
 TEST_F(AggregatorServiceTest, ApplyBatchRejectsNegativeSizeWithoutMutatingOrBroadcasting) {

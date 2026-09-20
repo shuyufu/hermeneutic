@@ -341,18 +341,17 @@ class SymbolBook {
             before_asks.try_emplace(price, lookup_aggregate(Side::Ask, price));
         }
 
-        // Re-validates (already checked above, but book_.apply_batch() -
-        // and, one layer further in, apply_delta()'s own call to the
-        // shared is_valid_level() - has to hold that guarantee on its
-        // own for callers that don't pre-validate) then applies. Three
-        // validation layers deep by the time a level reaches
+        // Re-validates (already checked above, but book_.apply_batch()'s
+        // own call to the shared is_valid_level() has to hold that
+        // guarantee on its own for callers that don't pre-validate) then
+        // applies. Two validation layers deep by the time a level reaches
         // is_valid_level() is intentional defense in depth, not a sign
-        // any one of them is redundant to remove - each guards a
-        // different caller (this class's own pre-check above is the
-        // only one skipped by calling book_ directly).
+        // either one is redundant to remove - each guards a different
+        // caller (this class's own pre-check above is the one skipped by
+        // calling book_ directly).
         // Given this exact bids/asks already passed the check above,
         // this can only fail on allocation here, matching
-        // book_.apply_delta()'s own documented not-rolled-back-partway
+        // book_.apply_batch()'s own documented not-rolled-back-partway
         // limitation.
         if (auto result = book_.apply_batch(venue, bids, asks); !result) return result;
 
