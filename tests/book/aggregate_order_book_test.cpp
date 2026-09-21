@@ -2,9 +2,11 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #include "bobby/hermeneutic/symbol/symbol.hpp"
 
@@ -405,6 +407,93 @@ TEST(AggregateOrderBook, ApplyBatchRejectsNonPositivePriceAtomically) {
 
     EXPECT_EQ(book.aggregate().bids.count(Price(99.0)), 0u);
     EXPECT_EQ(book.aggregate().asks.at(Price(100.0)), Size(1.0));
+}
+
+// The `Sink` callbacks below are how aggregator::SymbolBook now observes
+// what changed, instead of re-deriving it itself (lookup_aggregate() +
+// before/after snapshots) - see aggregate_order_book.hpp's own class
+// comment. These cases exercise that contract directly, on the always-
+// built binary, since the SymbolBook-level tests that used to be the only
+// coverage of the underlying diff logic are gRPC-gated.
+
+TEST(AggregateOrderBook, ApplyDeltaInvokesSinkWithResultingAggregateSize) {
+    AggregateOrderBook book;
+    book.apply_delta(kOkx, Side::Bid, Price(100.0), Size(2.0));
+
+    std::vector<std::pair<Price, Size>> changes;
+    book.apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0),
+                      [&](Price price, Size new_size) { changes.emplace_back(price, new_size); });
+
+    ASSERT_EQ(changes.size(), 1u);
+    EXPECT_EQ(changes[0].first, Price(100.0));
+    EXPECT_EQ(changes[0].second, Size(3.0));  // okx's 2 + binance's new 1
+}
+
+TEST(AggregateOrderBook, ApplyDeltaSinkReportsRemovalAsZeroNotNegative) {
+    AggregateOrderBook book;
+    book.apply_delta(kBinance, Side::Ask, Price(100.0), Size(1.0));
+
+    std::vector<std::pair<Price, Size>> changes;
+    book.apply_delta(kBinance, Side::Ask, Price(100.0), Size(0.0),
+                      [&](Price price, Size new_size) { changes.emplace_back(price, new_size); });
+
+    ASSERT_EQ(changes.size(), 1u);
+    EXPECT_EQ(changes[0].first, Price(100.0));
+    EXPECT_EQ(changes[0].second, Size(0.0));
+    EXPECT_EQ(book.aggregate().asks.count(Price(100.0)), 0u);
+}
+
+TEST(AggregateOrderBook, ApplyDeltaSinkDoesNotFireForANoOp) {
+    AggregateOrderBook book;
+    book.apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0));
+
+    std::vector<std::pair<Price, Size>> changes;
+    // Re-applying the exact same size changes nothing in the aggregate.
+    book.apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0),
+                      [&](Price price, Size new_size) { changes.emplace_back(price, new_size); });
+
+    EXPECT_TRUE(changes.empty());
+}
+
+TEST(AggregateOrderBook, InvalidateVenueInvokesSinkOncePerPriceItDrops) {
+    AggregateOrderBook book;
+    book.apply_delta(kBinance, Side::Bid, Price(99.0), Size(1.0));
+    book.apply_delta(kBinance, Side::Ask, Price(101.0), Size(2.0));
+    book.apply_delta(kOkx, Side::Ask, Price(101.0), Size(5.0));  // survives binance's invalidation
+
+    std::vector<std::pair<Price, Size>> bid_changes, ask_changes;
+    book.invalidate_venue(
+        kBinance, [&](Price price, Size new_size) { bid_changes.emplace_back(price, new_size); },
+        [&](Price price, Size new_size) { ask_changes.emplace_back(price, new_size); });
+
+    ASSERT_EQ(bid_changes.size(), 1u);
+    EXPECT_EQ(bid_changes[0].first, Price(99.0));
+    EXPECT_EQ(bid_changes[0].second, Size(0.0));  // no one else held it
+
+    ASSERT_EQ(ask_changes.size(), 1u);
+    EXPECT_EQ(ask_changes[0].first, Price(101.0));
+    EXPECT_EQ(ask_changes[0].second, Size(5.0));  // okx's remaining share, not a removal
+}
+
+TEST(AggregateOrderBook, ApplySnapshotSinkFiresForRemovalsAndAdditions) {
+    AggregateOrderBook book;
+    book.apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0));
+    book.apply_delta(kBinance, Side::Bid, Price(99.0), Size(2.0));
+
+    // 100 is dropped (absent from the new snapshot), 99 is untouched (same
+    // size), 98 is a brand new price.
+    const std::array snapshot = {std::pair{Price(99.0), Size(2.0)}, std::pair{Price(98.0), Size(3.0)}};
+    std::vector<std::pair<Price, Size>> changes;
+    book.apply_snapshot(kBinance, snapshot, {},
+                         [&](Price price, Size new_size) { changes.emplace_back(price, new_size); },
+                         [](Price, Size) {});
+
+    // 99 doesn't fire: adjust_aggregate() never calls sink for a zero delta.
+    ASSERT_EQ(changes.size(), 2u);
+    EXPECT_NE(std::find(changes.begin(), changes.end(), std::pair{Price(100.0), Size(0.0)}),
+              changes.end());
+    EXPECT_NE(std::find(changes.begin(), changes.end(), std::pair{Price(98.0), Size(3.0)}),
+              changes.end());
 }
 
 }  // namespace
