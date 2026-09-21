@@ -251,13 +251,11 @@ class SymbolBook {
     std::expected<void, std::errc> apply_delta(const VenueId& venue, Side side, Price price,
                                                  Size size) {
         std::lock_guard lock(mutex_);
-        Size before = lookup_aggregate(side, price);
-        auto result = book_.apply_delta(venue, side, price, size);
-        if (result) {
-            std::vector<Change> changed;
-            collect_change(changed, side, price, before);
-            publish(changed);
-        }
+        std::vector<Change> changed;
+        auto result = book_.apply_delta(venue, side, price, size, [&](Price p, Size new_size) {
+            changed.push_back(Change{side, p, new_size});
+        });
+        if (result) publish(changed);
         return result;
     }
 
@@ -273,28 +271,13 @@ class SymbolBook {
         const VenueId& venue, std::span<const std::pair<Price, Size>> bids,
         std::span<const std::pair<Price, Size>> asks) {
         std::lock_guard lock(mutex_);
-        auto venue_it = book_.venues().find(venue);
 
-        // Captured before any mutation, one comparator-matched map per
-        // side - same trick as apply_batch()'s before_bids/before_asks
-        // below, so the eventual diff comes out in the book's own order
-        // (descending for bids, ascending for asks) without a separate
-        // sort. See capture_snapshot_before() for what "every price this
-        // could possibly change" means per side.
-        static const std::map<Price, Size, std::greater<Price>> kEmptyBids;
-        static const std::map<Price, Size, std::less<Price>> kEmptyAsks;
-        auto before_bids = capture_snapshot_before(
-            Side::Bid, venue_it != book_.venues().end() ? venue_it->second.bids : kEmptyBids, bids);
-        auto before_asks = capture_snapshot_before(
-            Side::Ask, venue_it != book_.venues().end() ? venue_it->second.asks : kEmptyAsks, asks);
-
-        auto result = book_.apply_snapshot(venue, bids, asks);
+        ChangeCollector<std::greater<Price>> bid_changes;
+        ChangeCollector<std::less<Price>> ask_changes;
+        auto result = book_.apply_snapshot(venue, bids, asks, bid_changes, ask_changes);
         if (!result) return result;
 
-        std::vector<Change> changed;
-        for (const auto& [price, before] : before_bids) collect_change(changed, Side::Bid, price, before);
-        for (const auto& [price, before] : before_asks) collect_change(changed, Side::Ask, price, before);
-        publish(changed);
+        publish(collect_changes(bid_changes, ask_changes));
         return result;
     }
 
@@ -316,8 +299,8 @@ class SymbolBook {
         // book_.apply_batch() below re-validates and is what actually
         // guarantees this (a caller skipping this class entirely and
         // calling book_.apply_batch() directly still gets the same
-        // rejection), but there is no reason to pay for before_bids/
-        // before_asks construction on a batch already known to be bad.
+        // rejection), but there is no reason to take the lock at all for
+        // a batch already known to be bad.
         for (const auto& [price, size] : bids) {
             if (!is_valid_level(price, size)) return std::unexpected(std::errc::invalid_argument);
         }
@@ -326,24 +309,6 @@ class SymbolBook {
         }
 
         std::lock_guard lock(mutex_);
-
-        // Captured before any mutation, keyed in the same order the
-        // aggregate book itself orders this side (descending for bids,
-        // ascending for asks) - same trick as capture_snapshot_before(),
-        // so the eventual diff comes out correctly ordered "for free"
-        // instead of needing a separate sort. try_emplace() also means a
-        // price repeated more than once in one batch (not expected from a
-        // real exchange message, but not assumed against either) only
-        // captures its state from before this whole batch, not an
-        // intermediate value from earlier in the same batch.
-        std::map<Price, Size, std::greater<Price>> before_bids;
-        for (const auto& [price, size] : bids) {
-            before_bids.try_emplace(price, lookup_aggregate(Side::Bid, price));
-        }
-        std::map<Price, Size, std::less<Price>> before_asks;
-        for (const auto& [price, size] : asks) {
-            before_asks.try_emplace(price, lookup_aggregate(Side::Ask, price));
-        }
 
         // Re-validates (already checked above, but book_.apply_batch()'s
         // own call to the shared is_valid_level() has to hold that
@@ -357,38 +322,38 @@ class SymbolBook {
         // this can only fail on allocation here, matching
         // book_.apply_batch()'s own documented not-rolled-back-partway
         // limitation.
-        if (auto result = book_.apply_batch(venue, bids, asks); !result) return result;
+        ChangeCollector<std::greater<Price>> bid_changes;
+        ChangeCollector<std::less<Price>> ask_changes;
+        if (auto result = book_.apply_batch(venue, bids, asks, bid_changes, ask_changes); !result) {
+            return result;
+        }
 
-        std::vector<Change> changed;
-        for (const auto& [price, before] : before_bids) collect_change(changed, Side::Bid, price, before);
-        for (const auto& [price, before] : before_asks) collect_change(changed, Side::Ask, price, before);
-        publish(changed);
+        publish(collect_changes(bid_changes, ask_changes));
         return {};
     }
 
     void invalidate_venue(const VenueId& venue) {
         std::lock_guard lock(mutex_);
 
-        std::vector<std::pair<Price, Size>> before_bids, before_asks;
+        // Pre-inserts every price book_.invalidate_venue() below could
+        // possibly report - exactly `venue`'s own current bids/asks,
+        // known upfront without calling it - so each of its sink calls
+        // only ever reassigns an existing entry (insert_or_assign() on an
+        // present key can't allocate), never inserts a new one. This is
+        // what makes it safe to hand it an allocating Sink at all: see
+        // book_.invalidate_venue()'s own doc comment for why an
+        // allocation failure *during* that call, rather than before it,
+        // would be unrecoverable rather than merely undesirable.
+        ChangeCollector<std::greater<Price>> bid_changes;
+        ChangeCollector<std::less<Price>> ask_changes;
         if (auto it = book_.venues().find(venue); it != book_.venues().end()) {
-            for (const auto& kv : it->second.bids) {
-                before_bids.emplace_back(kv.first, lookup_aggregate(Side::Bid, kv.first));
-            }
-            for (const auto& kv : it->second.asks) {
-                before_asks.emplace_back(kv.first, lookup_aggregate(Side::Ask, kv.first));
-            }
+            for (const auto& [price, size] : it->second.bids) bid_changes.by_price.try_emplace(price, Size{});
+            for (const auto& [price, size] : it->second.asks) ask_changes.by_price.try_emplace(price, Size{});
         }
 
-        book_.invalidate_venue(venue);
+        book_.invalidate_venue(venue, bid_changes, ask_changes);
 
-        std::vector<Change> changed;
-        for (const auto& [price, before] : before_bids) {
-            collect_change(changed, Side::Bid, price, before);
-        }
-        for (const auto& [price, before] : before_asks) {
-            collect_change(changed, Side::Ask, price, before);
-        }
-        publish(changed);
+        publish(collect_changes(bid_changes, ask_changes));
     }
 
     // Broadcasts a liveness signal to every subscriber of this symbol (both
@@ -525,44 +490,38 @@ class SymbolBook {
         Size size;  // resulting aggregate size; 0 means the level was removed
     };
 
-    // Must be called with mutex_ held. bids/asks are different std::map
-    // instantiations (opposite comparators), so they can't share one branch
-    // via a ternary.
-    Size lookup_aggregate(Side side, Price price) const {
-        if (side == Side::Bid) {
-            auto it = book_.aggregate().bids.find(price);
-            return it != book_.aggregate().bids.end() ? it->second : Size{};
-        }
-        auto it = book_.aggregate().asks.find(price);
-        return it != book_.aggregate().asks.end() ? it->second : Size{};
-    }
-
-    // Must be called with mutex_ held. Appends a Change if the aggregate's
-    // current size at (side, price) differs from `before`.
-    void collect_change(std::vector<Change>& out, Side side, Price price, Size before) const {
-        Size after = lookup_aggregate(side, price);
-        if (after != before) out.push_back(Change{side, price, after});
-    }
-
-    // Must be called with mutex_ held, before book_.apply_snapshot() mutates
-    // the book (captures pre-mutation aggregate sizes). Every price
-    // apply_snapshot() can possibly change: `old_venue_side`'s prices (the
-    // venue's current levels on this side) union `levels`'s prices (the new
-    // snapshot). Returned in `Compare` order - the caller passes the same
-    // comparator as the book's own bids/asks map for this side, so the
-    // eventual diff comes out in that same order without an extra sort.
+    // One side's collector for the `Sink` parameters book_'s own
+    // apply_delta()/apply_snapshot()/apply_batch()/invalidate_venue() take
+    // (see aggregate_order_book.hpp's class comment) - AggregateOrderBook
+    // calls operator() with a price and its resulting aggregate size for
+    // every price that actually changed, already netted and already
+    // filtered to real changes only, so this only has to record the
+    // latest value it's told per price. Keyed by the same comparator as
+    // the book's own bids/asks map for this side (std::greater for bids,
+    // std::less for asks - passed in as `Compare`), so the map's own
+    // iteration order already matches L2Diff's ordering contract with no
+    // separate sort needed.
     template <typename Compare>
-    std::map<Price, Size, Compare> capture_snapshot_before(
-        Side side, const std::map<Price, Size, Compare>& old_venue_side,
-        std::span<const std::pair<Price, Size>> levels) const {
-        std::map<Price, Size, Compare> before_by_price;
-        for (const auto& kv : old_venue_side) {
-            before_by_price.try_emplace(kv.first, lookup_aggregate(side, kv.first));
+    struct ChangeCollector {
+        std::map<Price, Size, Compare> by_price;
+        void operator()(Price price, Size new_size) { by_price.insert_or_assign(price, new_size); }
+    };
+
+    // Flattens two already-populated ChangeCollectors into the single
+    // Change sequence publish() wants - bids first (in bid_changes' own
+    // order), then asks. Reads only its own arguments, so - unlike most
+    // other private helpers here - this one has no mutex_ requirement.
+    template <typename BidCompare, typename AskCompare>
+    static std::vector<Change> collect_changes(const ChangeCollector<BidCompare>& bid_changes,
+                                                const ChangeCollector<AskCompare>& ask_changes) {
+        std::vector<Change> changed;
+        for (const auto& [price, size] : bid_changes.by_price) {
+            changed.push_back(Change{Side::Bid, price, size});
         }
-        for (const auto& level : levels) {
-            before_by_price.try_emplace(level.first, lookup_aggregate(side, level.first));
+        for (const auto& [price, size] : ask_changes.by_price) {
+            changed.push_back(Change{Side::Ask, price, size});
         }
-        return before_by_price;
+        return changed;
     }
 
     static PriceLevel make_level(Price price, Size size) {
@@ -599,9 +558,10 @@ class SymbolBook {
 
     // Must be called with mutex_ held. The book's own comparators make
     // begin() the best level on each side (descending for bids, ascending
-    // for asks), so no bids/asks ternary is needed here (contrast
-    // lookup_aggregate(), which does need the explicit branch because it
-    // looks up an arbitrary price, not just the best one).
+    // for asks), so no bids/asks ternary is needed here - unlike looking
+    // up an arbitrary price, which needs the explicit branch (see
+    // ChangeCollector's own comment for why nothing here has to do that
+    // any more).
     std::optional<std::pair<Price, Size>> best_bid() const {
         const auto& bids = book_.aggregate().bids;
         if (bids.empty()) return std::nullopt;
