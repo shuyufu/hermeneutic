@@ -20,6 +20,7 @@
 #include <exception>
 #include <iostream>
 #include <list>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -218,12 +219,18 @@ class VenueSession {
             // beginning and that same abort taking effect.
             if (stopping_) co_return;
 
+            // Set once connect+subscribe succeed (below), read again just
+            // before the backoff decision past the catch - see there for
+            // why this isn't reset to 0 optimistically right here the way
+            // `attempt` itself used to be.
+            std::optional<std::chrono::steady_clock::time_point> connected_at;
+
             try {
                 auto executor = co_await net::this_coro::executor;
                 auto connection = make_connection(executor);
                 co_await connection.connect(feed_.ws_host(), feed_.ws_port(), feed_.ws_target());
                 co_await connection.send(feed_.subscribe_message(symbols_));
-                attempt = 0;
+                connected_at = std::chrono::steady_clock::now();
 
                 for (auto& [symbol, sync] : symbol_syncs_) {
                     co_await execute_actions(symbol, sync.on_connected());
@@ -285,6 +292,27 @@ class VenueSession {
 
             if (stopping_) break;
 
+            // Only treat the connection that just ended as "was healthy" -
+            // and so reset the backoff counter back to a fresh start - if
+            // it actually stayed up for a while. connected_at is set only
+            // once connect+subscribe succeed above, so a failed connect
+            // attempt (connected_at still nullopt) never resets `attempt`
+            // either. Without this - `attempt = 0` unconditionally right
+            // after a successful connect, as this used to read - any tight
+            // connect-then-immediately-fail loop gets the fastest possible
+            // retry on every single cycle instead of backoff()'s intended
+            // escalation. That's reachable today via
+            // execute_actions_and_maybe_force_reconnect()'s should_force_
+            // reconnect() path (a code-review finding on that fix): a
+            // kTrustsConnectionOrder venue whose SymbolSync keeps reporting
+            // InvalidateVenue right after each reconnect would otherwise
+            // hammer the real exchange at a fixed ~1Hz forever instead of
+            // backing off. kMinHealthyUptime is deliberately generous
+            // rather than tuned - see backoff()'s own comment on its
+            // numbers being provisional.
+            if (connected_at && std::chrono::steady_clock::now() - *connected_at >= kMinHealthyUptime) {
+                attempt = 0;
+            }
             ++attempt;
             try {
                 co_await backoff(attempt);
@@ -697,6 +725,12 @@ class VenueSession {
             }
         }
     }
+
+    // How long a connection has to stay up before run() treats it as
+    // "was healthy" and resets the backoff counter on its next reconnect -
+    // see run()'s own use of this against connected_at. Provisional, same
+    // as backoff()'s own numbers below.
+    static constexpr std::chrono::seconds kMinHealthyUptime{10};
 
     // Exponential-ish backoff with jitter before a reconnect attempt.
     // Shape (per-connection, jittered) is settled; the exact numbers below

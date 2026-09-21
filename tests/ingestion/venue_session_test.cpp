@@ -400,6 +400,53 @@ net::awaitable<void> run_fake_ws_server_live_gap_then_reconnect(net::ip::tcp::ac
     co_await ws.async_read(idle_buffer, net::redirect_error(net::use_awaitable, ec));
 }
 
+// Like run_fake_ws_server_live_gap_then_reconnect above, but gaps on every
+// connection except the last (`gap_count` times in a row), recording the
+// wall-clock moment each connection is accepted into `connect_times` - what
+// BackoffEscalatesAcrossRepeatedForcedReconnects below needs to prove
+// run()'s backoff counter actually escalates across successive
+// forced-reconnect cycles rather than resetting to a fast retry every
+// single time (a code-review finding on the should_force_reconnect() fix
+// this file's other Live/BufferingState/RestSnapshot gap tests exercise).
+net::awaitable<void> run_fake_ws_server_repeated_live_gaps(
+    net::ip::tcp::acceptor acceptor, int gap_count, std::string snapshot, std::string gapped_depth,
+    std::vector<std::chrono::steady_clock::time_point>* connect_times) {
+    for (int i = 0; i < gap_count; ++i) {
+        auto socket = co_await acceptor.async_accept(net::use_awaitable);
+        connect_times->push_back(std::chrono::steady_clock::now());
+        websocket::stream<net::ip::tcp::socket> ws(std::move(socket));
+        co_await ws.async_accept(net::use_awaitable);
+        beast::flat_buffer buffer;
+        co_await ws.async_read(buffer, net::use_awaitable);
+        co_await ws.async_write(net::buffer(snapshot), net::use_awaitable);
+        co_await ws.async_write(net::buffer(gapped_depth), net::use_awaitable);
+
+        // The forced reconnect closes this connection by destroying
+        // VenueSession's own `connection` local (stack unwinding out of
+        // run()'s try block via the thrown exception - see
+        // should_force_reconnect()'s own comment), not by this server
+        // ending it - so this just waits for that instead.
+        beast::flat_buffer idle_buffer;
+        boost::system::error_code ec;
+        co_await ws.async_read(idle_buffer, net::redirect_error(net::use_awaitable, ec));
+    }
+
+    // Final connection: no gap this time, so the session goes (and stays)
+    // Live - lets the test end cleanly with io.run_for()'s deadline rather
+    // than needing a further reconnect.
+    auto socket = co_await acceptor.async_accept(net::use_awaitable);
+    connect_times->push_back(std::chrono::steady_clock::now());
+    websocket::stream<net::ip::tcp::socket> ws(std::move(socket));
+    co_await ws.async_accept(net::use_awaitable);
+    beast::flat_buffer buffer;
+    co_await ws.async_read(buffer, net::use_awaitable);
+    co_await ws.async_write(net::buffer(snapshot), net::use_awaitable);
+
+    beast::flat_buffer idle_buffer;
+    boost::system::error_code ec;
+    co_await ws.async_read(idle_buffer, net::redirect_error(net::use_awaitable, ec));
+}
+
 // For the RequestSnapshot/handle_request_snapshot() call site specifically
 // (FakeFeed's REST path), not the WS-push one above: sends two buffered
 // DEPTH events - the first bridges the snapshot the HTTP server below will
@@ -1544,6 +1591,67 @@ TEST(VenueSessionTest, FailedSnapshotFetchRetriesInPlaceWithoutTouchingTheConnec
     context.TryCancel();
     if (reader_thread.joinable()) reader_thread.join();
     server->Shutdown();
+}
+
+// code-review finding on should_force_reconnect(): run()'s reconnect loop
+// used to reset `attempt` back to 0 unconditionally the instant
+// connect+subscribe succeeded - before the connection had actually proven
+// itself healthy. Harmless for a genuine, infrequent disconnect, but for a
+// kTrustsConnectionOrder venue whose SymbolSync keeps reporting
+// InvalidateVenue right after each forced reconnect, this gave backoff()'s
+// *fastest* retry (attempt=1, ~1-1.2s) every single cycle instead of the
+// escalating series backoff() is meant to provide, risking a reconnect
+// storm against the real exchange. No grpc server/reader needed here
+// (unlike the tests above) - this is purely about run()'s own reconnect
+// timing, not book content.
+TEST(VenueSessionTest, BackoffEscalatesAcrossRepeatedForcedReconnects) {
+    std::vector<std::string> symbols{"BTCUSDT"};
+    AggregatorService service(std::vector<BookId>{TestBookId()});
+
+    net::io_context io;
+    net::ip::tcp::acceptor ws_acceptor(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    unsigned short ws_port = ws_acceptor.local_endpoint().port();
+    std::vector<std::chrono::steady_clock::time_point> connect_times;
+    net::co_spawn(io,
+                  run_fake_ws_server_repeated_live_gaps(std::move(ws_acceptor), /*gap_count=*/2,
+                                                          "SNAPSHOT:BTCUSDT:100:100.0:5.0",
+                                                          "DEPTH:BTCUSDT:105:105:0:100.0:1.0", &connect_times),
+                  fail_test_on_exception("ws server"));
+
+    FakeFeedNoRest feed(std::to_string(ws_port));
+    SymbolRegistry<SymbolBook> registry;
+    registry.add("BTCUSDT", service.book(TestBookId()));
+    VenueSession<FakeFeedNoRest, BybitSequencePolicy, beast::tcp_stream, SymbolBook> session(
+        std::move(feed), kFakeVenue, symbols, std::move(registry), io.get_executor());
+    session.start(fail_test_on_exception("session"));
+
+    // Three connections total: the first is immediate (no backoff before
+    // it), the second follows attempt=1's backoff (~1.0-1.2s), the third
+    // follows attempt=2's (~2.0-2.4s) if - and only if - the counter
+    // actually escalated instead of resetting. Comfortable margin above
+    // both.
+    io.run_for(std::chrono::seconds(8));
+
+    ASSERT_EQ(connect_times.size(), 3u) << "expected exactly 3 connections (2 forced reconnects + 1 "
+                                            "stable) within the test's time budget";
+
+    auto interval_1_to_2 = connect_times[1] - connect_times[0];
+    auto interval_2_to_3 = connect_times[2] - connect_times[1];
+
+    // attempt=1's backoff range, plus generous overhead margin for
+    // connect/subscribe/message round trips on top of the wait itself.
+    EXPECT_LT(interval_1_to_2, std::chrono::milliseconds(1800))
+        << "first reconnect should follow attempt=1's backoff, not something already escalated";
+
+    // Comfortably between attempt=1's max (~1.2s, or ~1.8s with the same
+    // overhead margin above) and attempt=2's min (~2.0s): only reachable if
+    // the second forced reconnect actually escalated to attempt=2 rather
+    // than resetting back to attempt=1's fast retry.
+    EXPECT_GT(interval_2_to_3, std::chrono::milliseconds(1900))
+        << "second forced reconnect should follow attempt=2's escalated backoff, not reset back to "
+           "attempt=1's fast retry";
+    EXPECT_GT(interval_2_to_3, interval_1_to_2)
+        << "backoff between successive forced reconnects should grow, not stay flat";
 }
 
 }  // namespace
