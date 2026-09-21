@@ -32,13 +32,12 @@ inline std::optional<symbol::BookId> to_symbol_book_id(const BookId& wire) {
         case MarketType::SPOT: type = symbol::MarketType::Spot; break;
         case MarketType::PERP: type = symbol::MarketType::Perp; break;
         // Deliberately not the exhaustive, compiler-enforced switch pattern
-        // symbol.hpp's own to_string(VenueId)/native_symbol() use (see this
-        // project's docs/ingestion_design.md 第10節第10項): proto3 enums
-        // are open on the wire - a newer client can send a MarketType this
-        // server's generated code doesn't even know the name of yet - so a
-        // catch-all is required here, not just permitted. MARKET_TYPE_UNSPECIFIED
-        // falls in here too, alongside any value this protoc-generated
-        // enum has no case for at all.
+        // symbol.hpp's own to_string(VenueId)/native_symbol() use: proto3
+        // enums are open on the wire - a newer client can send a
+        // MarketType this server's generated code doesn't even know the
+        // name of yet - so a catch-all is required here, not just
+        // permitted. MARKET_TYPE_UNSPECIFIED falls in here too, alongside
+        // any value this protoc-generated enum has no case for at all.
         case MarketType::MARKET_TYPE_UNSPECIFIED:
         default: return std::nullopt;
     }
@@ -60,11 +59,10 @@ inline void fill_wire_book_id(BookId* wire, const symbol::BookId& id) {
     // Initialized to the wire's own "something's wrong here" sentinel,
     // not left uninitialized: -Wswitch (no -Werror in this build) warns
     // but doesn't block a future symbol::MarketType value this switch
-    // hasn't been updated for, and id.type could in principle also hold
-    // an out-of-range value from memory corruption - either way, reading
-    // an uninitialized `market` afterward would be UB (a code-review
-    // finding); MARKET_TYPE_UNSPECIFIED degrades safely instead, and it's
-    // exactly the value to_symbol_book_id() already treats as an error.
+    // hasn't been updated for, and reading an uninitialized `market`
+    // afterward would be UB. MARKET_TYPE_UNSPECIFIED degrades safely
+    // instead, and it's exactly the value to_symbol_book_id() already
+    // treats as an error.
     MarketType market = MarketType::MARKET_TYPE_UNSPECIFIED;
     switch (id.type) {
         case symbol::MarketType::Spot: market = MarketType::SPOT; break;

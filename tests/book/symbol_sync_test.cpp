@@ -327,13 +327,10 @@ TEST(SymbolSyncBybitTest, SnapshotArrivingBeforeAnyBufferedEventGoesLiveDirectly
     // snapshot is the first message VenueSession ever reads for a topic -
     // on_depth_update() has never been called at all when on_snapshot()
     // runs, so buffer_ is empty. Without kTrustsConnectionOrder's
-    // empty-buffer branch, this fell into the "no bridge, retry" path
+    // empty-buffer branch, this falls into the "no bridge, retry" path
     // forever (RequestSnapshot is a no-op for a kSnapshotViaRest == false
     // Feed - nothing would ever re-request), leaving the venue stuck in
-    // Buffering permanently. Every other SymbolSyncBybitTest in this file
-    // calls on_depth_update() before on_snapshot() (Binance's REST-race
-    // order) and so never exercised this - this is the one that would have
-    // caught it.
+    // Buffering permanently.
     BybitSync sync;
     sync.on_connected();
 
@@ -363,9 +360,7 @@ TEST(SymbolSyncBybitTest, NonEmptyBufferThatDoesNotBridgeForcesAGapDespiteTrusti
     // would ever actually re-request - this must be InvalidateVenue, the
     // same treatment as every other gap in this class (see handle_gap()'s
     // own comment), not just a retry that papers over the eventual "stuck
-    // in Buffering forever" outcome. Caught by a /code-review pass, not by
-    // this test before it was rewritten - the previous version asserted
-    // exactly that dead-end RequestSnapshot-only behavior as correct.
+    // in Buffering forever" outcome.
     BybitSync sync;
     sync.on_connected();
     sync.on_depth_update(make_update(165, 165, /*prev_final_id=*/0));
@@ -478,15 +473,12 @@ TEST(SymbolSyncBybitTest, ContinuityIgnoresPrevFinalIdAndFirstIdEntirely) {
 
 }  // namespace bybit
 
-// OKX-specific tests, using OkxSequencePolicy directly (not the generic
-// TrustingSequencePolicy in the trust_connection_order namespace above,
-// which only proves the shared kTrustsConnectionOrder mechanism in the
-// abstract) - see OkxSequencePolicy's doc comment in symbol_sync.hpp for
-// the seqId/prevSeqId semantics these exercise, verified against the OKX
-// documentation text the user quoted directly. make_update()'s first_id is
-// irrelevant here (OKX has no distinct range start - OkxFeed::parse_message
-// sets first_id == final_id, and OkxSequencePolicy never reads first_id at
-// all), so it's set to whatever value each test finds clearest.
+// OKX-specific tests, using OkxSequencePolicy directly - see its doc
+// comment in symbol_sync.hpp for the seqId/prevSeqId semantics these
+// exercise. make_update()'s first_id is irrelevant here (OKX has no
+// distinct range start - OkxFeed::parse_message sets first_id == final_id,
+// and OkxSequencePolicy never reads first_id at all), so it's set to
+// whatever value each test finds clearest.
 namespace okx {
 
 using OkxSync = SymbolSync<OkxSequencePolicy>;
@@ -615,15 +607,11 @@ TEST(SymbolSyncOkxTest, BridgeIsExactPrevSeqIdEqualityNotARange) {
     EXPECT_EQ(kinds_of(actions), (std::vector{Kind::InvalidateVenue}));
 }
 
-// Traces the exact four-message worked example from OKX's own
-// documentation (quoted directly by the user, not assumed from training
-// data): a normal update, an idle-heartbeat (prevSeqId == seqId, empty
-// bids/asks), then a sequence reset (seqId itself moves backward, but
-// prevSeqId still chains from the prior seqId) - all four must apply as
-// ordinary contiguous updates, with no special-casing for the heartbeat or
-// the reset. This is the scenario OkxSequencePolicy's doc comment in
-// symbol_sync.hpp describes by hand; this test is what actually proves it
-// against the real state machine rather than a comment alone.
+// Traces OKX's own four-message worked example: a normal update, an
+// idle-heartbeat (prevSeqId == seqId, empty bids/asks), then a sequence
+// reset (seqId itself moves backward, but prevSeqId still chains from the
+// prior seqId) - all four must apply as ordinary contiguous updates, with
+// no special-casing for the heartbeat or the reset.
 TEST(SymbolSyncOkxTest, IdleHeartbeatAndSequenceResetChainLikeOkxsDocumentedExample) {
     OkxSync sync;
     sync.on_connected();

@@ -34,8 +34,7 @@ namespace bobby::hermeneutic::aggregator {
 static_assert(Price::decimals == 9);
 static_assert(Size::decimals == 6);
 
-// One bounded mailbox per subscriber. Publishers (SymbolBook::apply_snapshot/
-// apply_batch/invalidate_venue/send_heartbeat, via Fanout::broadcast())
+// One bounded mailbox per subscriber. Publishers (via Fanout::broadcast())
 // only ever push; the SubscribeL2Diff()/SubscribeBbo() handler thread that
 // owns this subscriber's ServerWriter is the only one that drains it and
 // calls Write(). Never shared across subscribers, so one slow drainer
@@ -43,28 +42,23 @@ static_assert(Size::decimals == 6);
 //
 // What a full queue should do differs by stream, hence `OverflowPolicy`:
 //
-// - Close (used for L2Update/SubscribeL2Diff): an L2Diff stream is not a
-//   series of independently useful events -- missing even one leaves the
+// - Close (L2Update/SubscribeL2Diff): missing even one diff leaves the
 //   subscriber's replica of the book genuinely wrong, not just stale, and
-//   the only valid recovery is a fresh SubscribeL2Diff() (a new full
-//   snapshot), not resuming the same stream with a gap in it. So there is
-//   nothing worth keeping once a subscriber has fallen behind past
-//   capacity; the queue is cleared and closed instead.
-// - DropOldest (used for BboUpdate/SubscribeBbo): a Bbo is the complete
-//   current top-of-book state, not a delta -- it never depends on a
-//   previously queued message for reconstruction. A slow BBO subscriber
-//   costs nothing by having a stale queued Bbo replaced by a newer one, so
-//   overflow drops the oldest entry and keeps accepting pushes instead of
-//   disconnecting the subscriber for a condition that doesn't actually
-//   corrupt anything it will eventually receive.
+//   the only valid recovery is a fresh SubscribeL2Diff() (a new snapshot).
+//   So overflow clears the queue and closes it instead of keeping stale
+//   entries.
+// - DropOldest (BboUpdate/SubscribeBbo): a Bbo is the complete current
+//   top-of-book state, not a delta, so a slow subscriber loses nothing by
+//   having a stale queued Bbo replaced by a newer one - overflow drops the
+//   oldest entry and keeps accepting pushes instead of disconnecting.
 //
 // Both policies apply at a higher (not absent) capacity during the
 // bootstrap window between a queue's registration and its owner's first
-// successful Write() - see push_or_close()/end_bootstrap() below for why.
+// successful Write() - see push_or_close()/end_bootstrap() below.
 //
-// Whichever policy is chosen, `closed_` (and DrainResult::Closed) is only
-// ever set by the Close policy's overflow path; a DropOldest queue is never
-// closed by this class, so its DrainResult is always TimedOut or Drained.
+// `closed_` (and DrainResult::Closed) is only ever set by the Close
+// policy's overflow path; a DropOldest queue's DrainResult is always
+// TimedOut or Drained.
 enum class OverflowPolicy { Close, DropOldest };
 
 template <typename T>
@@ -80,22 +74,12 @@ class SubscriberQueue {
     // capacity. While bootstrapping (see end_bootstrap() below), that
     // effective capacity is `capacity_ * kBootstrapCapacityMultiplier`,
     // not `capacity_` itself: a newly subscribed queue is registered for
-    // broadcast before its caller's own initial Write() (a blocking
-    // network call) has even completed - see SymbolBook::subscribe()'s
-    // own comment for why that ordering is required - so an ordinary
-    // burst landing in that window, while nobody has started draining
-    // yet, must not trip the same tight threshold a genuinely slow,
-    // already-draining subscriber would. This still has to be a real
-    // ceiling, not "no limit until draining starts": Write() blocking on
-    // a client that gRPC flow control has stalled is exactly the slow-
-    // client scenario Close/DropOldest exist for, and it can last as
-    // long as the peer keeps its window closed - a client that connects
-    // and then stops reading must not be able to drive unbounded memory
-    // growth here. If genuinely kBootstrapCapacityMultiplier times the
-    // steady-state capacity piles up before one Write() call returns,
-    // that Write() has stalled badly enough that applying the configured
-    // policy (closing an L2 subscriber, dropping a stale Bbo) is the
-    // right call anyway, same as it would be once draining has started.
+    // broadcast before its caller's own initial Write() has completed, so
+    // an ordinary burst landing before draining starts must not trip the
+    // same tight threshold a genuinely slow, already-draining subscriber
+    // would. Still a real ceiling, not unlimited: a client that stops
+    // reading and stalls Write() indefinitely must not be able to drive
+    // unbounded memory growth here.
     bool push_or_close(T update) {
         std::lock_guard lock(mutex_);
         if (closed_) return false;
@@ -114,13 +98,10 @@ class SubscriberQueue {
         return true;
     }
 
-    // Ends the bootstrap window described above, switching push_or_close()
-    // back to its normal capacity/policy enforcement. Called exactly once,
-    // by the subscribe() that created this queue, right after its own
-    // initial Write() has succeeded - never by anything else, so there is
-    // no race over `bootstrapping_` itself (this method and push_or_close()
-    // both take mutex_, but the write to bootstrapping_ has only ever this
-    // one caller).
+    // Ends the bootstrap window above, switching push_or_close() back to
+    // normal capacity/policy enforcement. Called exactly once, by the
+    // subscribe() that created this queue, right after its own initial
+    // Write() succeeds.
     void end_bootstrap() {
         std::lock_guard lock(mutex_);
         bootstrapping_ = false;
@@ -158,29 +139,22 @@ class SubscriberQueue {
 
 // One stream's worth of subscriber bookkeeping: create a queue, broadcast
 // into every queue, drop one. Shared by SymbolBook's L2Diff and Bbo
-// streams, which were duplicating this map/broadcast/erase logic with
-// only their element type and OverflowPolicy differing (a code-review
-// finding).
+// streams.
 //
 // Deliberately does NOT take or store the gRPC writer: SymbolBook's own
-// subscribe()/subscribe_bbo() still need `grpc::ServerWriter<T>*` to
-// perform the initial Write() (there is no way around that - something
-// has to write the first message), but nothing about *bookkeeping* a
-// subscriber's queue needs to know what a gRPC writer is, so this class
-// doesn't. Subscribers are keyed by the queue's own address, an opaque
-// identity local to this class - not the writer pointer - so
-// unsubscribe() takes the queue itself, not a gRPC type. This is also
-// what lets a caller un-subscribe using nothing but the shared_ptr it was
-// handed back at subscribe() time, with no separate writer-to-queue
-// lookup required.
+// subscribe()/subscribe_bbo() still need `grpc::ServerWriter<T>*` for the
+// initial Write(), but bookkeeping a subscriber's queue doesn't need to
+// know what a gRPC writer is. Subscribers are keyed by the queue's own
+// address, not the writer pointer, so unsubscribe() takes the queue
+// itself - letting a caller un-subscribe using nothing but the shared_ptr
+// subscribe() handed back, with no separate writer-to-queue lookup.
 //
 // Every method here must be called with the caller's own mutex_ held -
-// this class keeps no lock of its own on purpose. SymbolBook already has
-// exactly one mutex_ guarding book_/seq_/both fanouts together, and a
-// subscribe() registering a queue must be atomic with the snapshot/BBO
-// capture that goes with it (see SymbolBook::subscribe()'s own comment) -
-// giving Fanout a second, separate lock would only reintroduce the
-// coordination problem that one shared mutex_ already solves for free.
+// this class keeps no lock of its own. SymbolBook already has one mutex_
+// guarding book_/seq_/both fanouts together, and a subscribe() registering
+// a queue must be atomic with the snapshot/BBO capture that goes with it;
+// a second, separate lock here would only reintroduce that coordination
+// problem.
 template <typename T>
 class Fanout {
   public:
@@ -215,57 +189,43 @@ class Fanout {
 
 // Per-symbol aggregated book plus its gRPC fan-out state. Not a gRPC type
 // itself: AggregatorService (the sole grpc::Service in this file) owns one
-// SymbolBook per symbol and routes every SubscribeL2Diff()/SubscribeBbo()
-// call, and every ingestion call (apply_batch et al.), to the right one by
-// symbol. This is what keeps a multi-symbol deployment to one gRPC service
-// on one port instead of one process/port per symbol -- two grpc::Service
-// instances of the same generated type can't be registered on one
-// grpc::Server (their RPC method paths collide), but two SymbolBooks in one
-// map have no such restriction.
+// SymbolBook per symbol and routes every RPC/ingestion call to the right
+// one by symbol - this is what keeps a multi-symbol deployment to one gRPC
+// service on one port instead of one process/port per symbol (two
+// grpc::Service instances of the same generated type can't be registered
+// on one grpc::Server; two SymbolBooks in one map can).
 //
 // Concurrency model: `mutex_` guards only `book_`/`seq_`/the cached last-
-// published BBO -- applying a delta and computing the resulting diff, never
-// any socket I/O. Each subscriber (L2 or BBO) gets its own SubscriberQueue;
-// broadcasting is a non-blocking push into every subscriber's queue (still
-// done under `mutex_`, since it can no longer block), and the actual
-// Write() to gRPC happens later, off the caller's thread, on that
-// subscriber's own SubscribeL2Diff()/SubscribeBbo() handler thread. A stuck
-// or slow L2 subscriber can therefore only ever stall itself -- until it
-// overflows its queue and SubscriberQueue closes it -- never ingestion or
-// any other subscriber; a stuck or slow BBO subscriber never gets closed at
-// all (see SubscriberQueue's OverflowPolicy::DropOldest). A separate
-// SymbolBook (and separate `mutex_`) per symbol means two symbols never
-// contend with each other either, so ingestion for one symbol can never be
-// slowed by another's traffic.
+// published BBO, never socket I/O. Each subscriber gets its own
+// SubscriberQueue; broadcasting is a non-blocking push into every
+// subscriber's queue (under mutex_, since it can't block), and the actual
+// Write() happens later, off the caller's thread, on that subscriber's
+// own handler thread. A stuck L2 subscriber can therefore only stall
+// itself, until it overflows its queue and gets closed; a stuck BBO
+// subscriber never gets closed at all (OverflowPolicy::DropOldest). A
+// separate SymbolBook (and `mutex_`) per symbol means two symbols never
+// contend with each other either.
 //
-// `seq_` is a single counter shared by both the L2Diff stream and the Bbo
-// stream: it names the aggregate-book revision, not "how many messages this
-// stream has sent". A revision that doesn't move the top of book still
-// bumps `seq_` and produces an L2Diff, but produces no Bbo at all -- so
-// Bbo.book_seq is expected to skip values relative to L2Diff.book_seq. This
-// is also what lets a client correlate a Bbo against the L2Diff stream (or
-// a recording of it), which two independent per-stream counters could not
-// do.
+// `seq_` is shared by both the L2Diff and Bbo streams: it names the
+// aggregate-book revision, not "messages sent on this stream". A revision
+// that doesn't move the top of book still bumps `seq_` and produces an
+// L2Diff but no Bbo, so Bbo.book_seq is expected to skip values relative
+// to L2Diff.book_seq - this is what lets a client correlate a Bbo against
+// the L2Diff stream.
 class SymbolBook {
   public:
     // Resyncs both sides of `venue`'s book from a REST snapshot as a
     // single book revision: one seq bump, one broadcast - mirrors
     // apply_batch() below in both shape and reasoning. book_.apply_snapshot()
     // itself validates both sides before touching either, so a bad level
-    // on one side no longer leaves this venue's *other*, perfectly valid
-    // side resynced while the bad one is rejected (a past code-review
-    // finding, back when this took one side per call - see
-    // venue_session.hpp's own historical comment on it).
+    // on one side doesn't leave this venue's other, valid side resynced
+    // while the bad one is rejected.
     std::expected<void, std::errc> apply_snapshot(
         const VenueId& venue, std::span<const std::pair<Price, Size>> bids,
         std::span<const std::pair<Price, Size>> asks) {
-        // Cheap enough to reject before taking mutex_/doing any lookups -
-        // book_.apply_snapshot() below re-validates and is what actually
-        // guarantees this (a caller skipping this class entirely and
-        // calling book_.apply_snapshot() directly still gets the same
-        // rejection), but there is no reason to take the lock at all for
-        // a snapshot already known to be bad - mirrors apply_batch()'s
-        // own pre-lock check below.
+        // Cheap enough to reject before taking mutex_: book_.apply_snapshot()
+        // below re-validates regardless, but there's no reason to take the
+        // lock for a snapshot already known to be bad.
         for (const auto& [price, size] : bids) {
             if (!is_valid_level(price, size)) return std::unexpected(std::errc::invalid_argument);
         }
@@ -287,22 +247,17 @@ class SymbolBook {
     // exchange message carried) as a single book revision: one seq bump,
     // one broadcast - unlike bumping and broadcasting once per level, which
     // would fragment what the exchange meant as one atomic update into
-    // several separate revisions on our own wire protocol. Every level's
-    // price/size is checked (a non-positive price or a negative size)
-    // for every level before any of them is applied, so a bad level
-    // anywhere in the batch leaves the book untouched rather than
-    // partially updated for that reason specifically (an allocation
-    // failure partway through is not rolled back - same documented
-    // limitation as apply_snapshot()).
+    // several separate revisions on our own wire protocol. Every level is
+    // checked before any of them is applied, so a bad level anywhere in
+    // the batch leaves the book untouched (an allocation failure partway
+    // through is not rolled back - same documented limitation as
+    // apply_snapshot()).
     std::expected<void, std::errc> apply_batch(const VenueId& venue,
                                                 std::span<const std::pair<Price, Size>> bids,
                                                 std::span<const std::pair<Price, Size>> asks) {
-        // Cheap enough to reject before taking mutex_/doing any lookups -
-        // book_.apply_batch() below re-validates and is what actually
-        // guarantees this (a caller skipping this class entirely and
-        // calling book_.apply_batch() directly still gets the same
-        // rejection), but there is no reason to take the lock at all for
-        // a batch already known to be bad.
+        // Cheap enough to reject before taking mutex_: book_.apply_batch()
+        // below re-validates regardless, but there's no reason to take the
+        // lock for a batch already known to be bad.
         for (const auto& [price, size] : bids) {
             if (!is_valid_level(price, size)) return std::unexpected(std::errc::invalid_argument);
         }
@@ -312,18 +267,10 @@ class SymbolBook {
 
         std::lock_guard lock(mutex_);
 
-        // Re-validates (already checked above, but book_.apply_batch()'s
-        // own call to the shared is_valid_level() has to hold that
-        // guarantee on its own for callers that don't pre-validate) then
-        // applies. Two validation layers deep by the time a level reaches
-        // is_valid_level() is intentional defense in depth, not a sign
-        // either one is redundant to remove - each guards a different
-        // caller (this class's own pre-check above is the one skipped by
-        // calling book_ directly).
-        // Given this exact bids/asks already passed the check above,
-        // this can only fail on allocation here, matching
-        // book_.apply_batch()'s own documented not-rolled-back-partway
-        // limitation.
+        // book_.apply_batch() re-validates on its own (it must hold that
+        // guarantee for callers that skip this class's pre-check), so
+        // this can only fail on allocation here, given the same bids/asks
+        // already passed the check above.
         SideChanges changes;
         if (auto result = book_.apply_batch(venue, bids, asks, changes.bids, changes.asks); !result) {
             return result;
@@ -335,9 +282,8 @@ class SymbolBook {
 
     // book_.invalidate_venue() finishes mutating its own state for every
     // price before invoking either Sink at all (see its own doc comment),
-    // so - unlike an earlier version of this method - nothing here needs
-    // to pre-populate the collectors to keep a mid-report allocation
-    // failure from corrupting book_'s state; a plain SideChanges is safe.
+    // so a plain SideChanges is safe here - a mid-report allocation
+    // failure in the Sink can't corrupt book_'s already-committed state.
     void invalidate_venue(const VenueId& venue) {
         std::lock_guard lock(mutex_);
 
@@ -348,20 +294,16 @@ class SymbolBook {
     }
 
     // Broadcasts a liveness signal to every subscriber of this symbol (both
-    // the L2Diff and the Bbo stream), independent of any book change -
-    // unlike publish(), this never touches seq_ (a heartbeat is not a book
-    // revision). Callers (e.g. AggregatorService::send_heartbeat(), driven
-    // by server_main.cpp) are expected to invoke this on a fixed
-    // interval; this class has no internal timer of its own.
+    // streams), independent of any book change - unlike publish(), this
+    // never touches seq_ (a heartbeat is not a book revision). Callers are
+    // expected to invoke this on a fixed interval; this class has no
+    // internal timer of its own.
     //
     // live_venues is read from book_.venues() here, inside this same
     // mutex_ critical section, rather than captured separately - reading
-    // it outside the lock (even "just before" this call) would race
-    // against a concurrent apply_batch()/invalidate_venue() and could
-    // report a venue as live that was invalidated a moment earlier, or
-    // vice versa. This is what keeps the heartbeat's validity snapshot
-    // consistent with whatever L2Diff/Bbo updates this same call to
-    // mutex_ might otherwise be interleaved with on the wire.
+    // it outside the lock could race against a concurrent
+    // apply_batch()/invalidate_venue() and report a venue as live that
+    // was invalidated a moment earlier, or vice versa.
     void send_heartbeat() {
         std::lock_guard lock(mutex_);
         auto ts_ns = now_ns();
@@ -369,13 +311,8 @@ class SymbolBook {
         L2Update l2_update;
         auto* l2_heartbeat = l2_update.mutable_heartbeat();
         l2_heartbeat->set_ts_ns(ts_ns);
-        // book_.venues() is walked (and symbol::to_string()'d) a single
-        // time under this lock, straight into l2_heartbeat's own field;
-        // bbo_heartbeat below then copies that already-built
-        // RepeatedPtrField wholesale (one copy) instead of re-deriving
-        // the identical list a second time or round-tripping through an
-        // intermediate std::vector<std::string> (two copies) for what's
-        // otherwise a very short critical section.
+        // Walked once here; bbo_heartbeat below copies the resulting
+        // RepeatedPtrField wholesale instead of re-deriving the same list.
         for (const auto& [venue, venue_book] : book_.venues()) {
             l2_heartbeat->add_live_venues(symbol::to_string(venue));
         }
@@ -391,12 +328,9 @@ class SymbolBook {
     // Writes the initial snapshot to `writer` and, if that succeeds,
     // registers it for subsequent updates and returns its queue. Returns
     // nullptr (without leaving it registered) if the initial Write() fails -
-    // the caller (AggregatorService::SubscribeL2Diff()) should end the RPC
-    // without draining a queue that was never meant to be used. See
-    // subscribe_impl() below for the shared implementation both this and
-    // subscribe_bbo() call - including why Write() must not run under
-    // mutex_, why registering before it is safe, and why the resulting
-    // queue starts in SubscriberQueue's "bootstrapping" mode.
+    // the caller should end the RPC without draining a queue that was
+    // never meant to be used. See subscribe_impl() below for the shared
+    // implementation this and subscribe_bbo() call.
     std::shared_ptr<SubscriberQueue<L2Update>> subscribe(grpc::ServerWriter<L2Update>* writer) {
         return subscribe_impl(l2_fanout_, writer, [this] { return build_snapshot(); });
     }
@@ -412,11 +346,9 @@ class SymbolBook {
 
     // Writes the current complete BBO state to `writer` and, if that
     // succeeds, registers it for subsequent updates and returns its queue.
-    // Returns nullptr (without leaving it registered) if the initial
-    // Write() fails - mirrors subscribe() above via the same
-    // subscribe_impl() helper. Uses OverflowPolicy::DropOldest, not
-    // Close: see SubscriberQueue's class comment for why a slow BBO
-    // subscriber should never be disconnected for falling behind.
+    // Mirrors subscribe() above via the same subscribe_impl() helper.
+    // Uses OverflowPolicy::DropOldest, not Close: see SubscriberQueue's
+    // class comment for why a slow BBO subscriber is never disconnected.
     std::shared_ptr<SubscriberQueue<BboUpdate>> subscribe_bbo(
         grpc::ServerWriter<BboUpdate>* writer) {
         return subscribe_impl(bbo_fanout_, writer, [this] { return build_bbo(); });
@@ -432,45 +364,29 @@ class SymbolBook {
   private:
     static constexpr std::size_t kSubscriberQueueCapacity = 256;
 
-    // Shared by subscribe()/subscribe_bbo() (a code-review finding: they
-    // used to hand-duplicate this whole sequence, differing only in
-    // update type, snapshot-builder, and which fanout to use - exactly
-    // the kind of duplication Fanout<T> itself was extracted to remove
-    // one layer down).
+    // Shared by subscribe()/subscribe_bbo(), differing only in update
+    // type, snapshot-builder, and which fanout to use.
     //
-    // `writer->Write()` is a blocking network call (gRPC flow control/TCP
-    // backpressure) - it must never run while mutex_ is held, or one new
-    // subscriber's slow/high-latency connection stalls ingestion
-    // (apply_batch/apply_snapshot/invalidate_venue) and every *other*
-    // subscriber's broadcast for as long as this one Write() takes. So
-    // this registers into `fanout` *before* calling Write() (both under
-    // one lock, atomically with the snapshot/BBO capture via
-    // `build_initial`, matching the previous single-critical-section
-    // guarantee that no update between "initial state captured" and
-    // "registered for future updates" is ever missed), releases the
-    // lock, then writes. Safe against a concurrent broadcast landing in
-    // that gap: Fanout::broadcast() only ever pushes into `queue` (a
-    // non-blocking, thread-safe enqueue) and never calls Write() itself,
-    // so there is no writer->Write() vs. writer->Write() race - only
-    // this thread ever calls Write() on this particular `writer`.
+    // `writer->Write()` is a blocking network call - it must never run
+    // while mutex_ is held, or one new subscriber's slow connection stalls
+    // ingestion and every other subscriber's broadcast for as long as
+    // Write() takes. So this registers into `fanout` *before* calling
+    // Write() (atomically with the snapshot/BBO capture via
+    // `build_initial`, so no update between "state captured" and
+    // "registered" is missed), releases the lock, then writes. Safe
+    // against a concurrent broadcast landing in that gap: broadcast()
+    // only ever pushes into `queue` (non-blocking) and never calls
+    // Write() itself - only this thread ever calls Write() on this
+    // particular `writer`.
     //
-    // The queue Fanout::subscribe() returns starts in SubscriberQueue's
-    // "bootstrapping" mode (see that class's own comment): registered-
-    // but-not-yet-Write()-succeeded, it accumulates broadcasts against a
-    // higher capacity than usual, rather than risking a Close-policy
-    // queue closing itself on the tight steady-state threshold -
-    // disconnecting a client with RESOURCE_EXHAUSTED before it ever
-    // received anything - just because an ordinary burst landed while
-    // this one blocking Write() is still in flight (a real, code-review-
-    // flagged race in an earlier version of this function, before
-    // end_bootstrap() existed). end_bootstrap() is
-    // called the moment Write() succeeds, immediately before handing the
-    // queue back - from that point on, capacity/OverflowPolicy apply
-    // exactly as SubscriberQueue's own class comment documents.
+    // The queue starts in SubscriberQueue's bootstrapping mode (see that
+    // class's own comment for why); end_bootstrap() below is called
+    // unconditionally, before branching on Write()'s result, so the
+    // queue's mode never depends on which path is taken.
     //
-    // On failure, the provisional registration is undone under a
-    // second, separate critical section - Fanout::unsubscribe() erasing
-    // a key that isn't present is a no-op, not an error.
+    // On failure, the provisional registration is undone under a second,
+    // separate critical section - Fanout::unsubscribe() erasing a key
+    // that isn't present is a no-op.
     template <typename T, typename BuildInitial>
     std::shared_ptr<SubscriberQueue<T>> subscribe_impl(Fanout<T>& fanout, grpc::ServerWriter<T>* writer,
                                                          BuildInitial&& build_initial) {
@@ -481,13 +397,6 @@ class SymbolBook {
             initial = build_initial();
             queue = fanout.subscribe();
         }
-        // Unconditional, not just on the success path: nothing about
-        // leaving bootstrapping_ true depends on whether Write()
-        // succeeded, and running this before branching means the
-        // queue's mode never depends on which path is taken - a defensive
-        // habit, not a fix for a live bug (the failure path's `queue`
-        // goes out of scope right after unsubscribe() below, with no
-        // other owner today).
         bool wrote = writer->Write(initial);
         queue->end_bootstrap();
         if (wrote) return queue;
@@ -504,14 +413,13 @@ class SymbolBook {
     };
 
     // One side's collector for the `Sink` parameters book_'s own
-    // apply_snapshot()/apply_batch()/invalidate_venue() take
-    // (see aggregate_order_book.hpp's class comment) - AggregateOrderBook
-    // calls operator() with a price and its resulting aggregate size for
-    // every price that actually changed, already netted and already
-    // filtered to real changes only, so this only has to record the
-    // latest value it's told per price. Keyed by the same comparator as
-    // the book's own bids/asks map for this side (std::greater for bids,
-    // std::less for asks - passed in as `Compare`), so the map's own
+    // apply_snapshot()/apply_batch()/invalidate_venue() take.
+    // AggregateOrderBook calls operator() with a price and its resulting
+    // aggregate size for every price that actually changed, already
+    // netted and filtered to real changes only, so this only has to
+    // record the latest value it's told per price. Keyed by the same
+    // comparator as the book's own bids/asks map for this side
+    // (std::greater for bids, std::less for asks), so the map's own
     // iteration order already matches L2Diff's ordering contract with no
     // separate sort needed.
     template <typename Compare>
@@ -520,20 +428,19 @@ class SymbolBook {
         void operator()(Price price, Size new_size) { by_price.insert_or_assign(price, new_size); }
     };
 
-    // The bid/ask ChangeCollector pair every one of apply_snapshot()/
-    // apply_batch()/invalidate_venue() above needs one of, one per call -
-    // named here instead of each declaring its own `bid_changes`/
-    // `ask_changes` pair so there is exactly one place holding "bids use
-    // std::greater, asks use std::less", not three.
+    // The bid/ask ChangeCollector pair each of apply_snapshot()/
+    // apply_batch()/invalidate_venue() above needs one of - named here so
+    // there is exactly one place holding "bids use std::greater, asks use
+    // std::less", not three.
     struct SideChanges {
         ChangeCollector<std::greater<Price>> bids;
         ChangeCollector<std::less<Price>> asks;
     };
 
     // Flattens an already-populated SideChanges into the single Change
-    // sequence publish() wants - bids first (in their own order), then
-    // asks. Reads only its own argument, so - unlike most other private
-    // helpers here - this one has no mutex_ requirement.
+    // sequence publish() wants - bids first, then asks. Reads only its
+    // own argument, so unlike most other private helpers here, this one
+    // has no mutex_ requirement.
     static std::vector<Change> collect_changes(const SideChanges& changes) {
         std::vector<Change> changed;
         for (const auto& [price, size] : changes.bids.by_price) {
@@ -579,10 +486,7 @@ class SymbolBook {
 
     // Must be called with mutex_ held. The book's own comparators make
     // begin() the best level on each side (descending for bids, ascending
-    // for asks), so no bids/asks ternary is needed here - unlike looking
-    // up an arbitrary price, which needs the explicit branch (see
-    // ChangeCollector's own comment for why nothing here has to do that
-    // any more).
+    // for asks), so no bids/asks branch is needed here.
     std::optional<std::pair<Price, Size>> best_bid() const {
         const auto& bids = book_.aggregate().bids;
         if (bids.empty()) return std::nullopt;
@@ -608,12 +512,10 @@ class SymbolBook {
     }
 
     // Must be called with mutex_ held. No-op if `changed` is empty, so seq_
-    // only advances on an observable change. Also emits a Bbo to
-    // bbo_subscribers_, sharing this same (already-bumped) seq_ value, but
-    // only when the best bid or best ask actually changed - a deep-book
-    // change that doesn't touch the top of book produces an L2Diff here but
-    // no Bbo at all, which is why Bbo.book_seq is allowed to skip values
-    // (see Bbo's proto comment).
+    // only advances on an observable change. Also emits a Bbo, sharing this
+    // same (already-bumped) seq_ value, but only when the best bid or ask
+    // actually changed - a deep-book change produces an L2Diff but no Bbo,
+    // which is why Bbo.book_seq is allowed to skip values.
     void publish(const std::vector<Change>& changed) {
         if (changed.empty()) return;
 
@@ -701,12 +603,11 @@ class AggregatorService final : public Aggregator::Service {
         auto queue = target->subscribe(writer);
         if (!queue) return grpc::Status::OK;
 
-        // This thread is the sole owner of `writer`/`queue` from here on:
-        // it's the only one that calls Write() on `writer`, and the only one
-        // that drains `queue`. gRPC's synchronous API has no primitive to
-        // block on "cancelled or a new update queued"; the 50ms timeout is
-        // only there to re-check IsCancelled() -- an actual push wakes this
-        // thread immediately via SubscriberQueue's condition variable.
+        // This thread is the sole owner of `writer`/`queue` from here on.
+        // gRPC's synchronous API has no primitive to block on "cancelled
+        // or a new update queued"; the 50ms timeout only re-checks
+        // IsCancelled() - an actual push wakes this thread immediately via
+        // SubscriberQueue's condition variable.
         std::vector<L2Update> batch;
         while (true) {
             batch.clear();
@@ -746,13 +647,10 @@ class AggregatorService final : public Aggregator::Service {
         auto queue = target->subscribe_bbo(writer);
         if (!queue) return grpc::Status::OK;
 
-        // Same single-owner-thread shape as SubscribeL2Diff() above. Unlike
-        // there, DrainResult::Closed is unreachable in practice - this
-        // queue uses OverflowPolicy::DropOldest, which never closes - but
-        // the branch is kept for switch-style exhaustiveness, and returns
-        // OK rather than RESOURCE_EXHAUSTED: a BBO subscriber has no
-        // resync obligation, so that status code would be the wrong signal
-        // even if this path were ever reached.
+        // Same single-owner-thread shape as SubscribeL2Diff() above.
+        // DrainResult::Closed is unreachable here (DropOldest never
+        // closes) but kept for exhaustiveness, and returns OK rather than
+        // RESOURCE_EXHAUSTED: a BBO subscriber has no resync obligation.
         std::vector<BboUpdate> batch;
         while (true) {
             batch.clear();

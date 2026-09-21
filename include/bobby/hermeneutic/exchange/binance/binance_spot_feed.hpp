@@ -19,13 +19,11 @@
 
 namespace bobby::hermeneutic::ingestion {
 
-// VenueFeed for Binance Spot: parse/encode only, no I/O. See
-// docs/ingestion_design.md for the design this implements and the primary
-// sources (developers.binance.com) the wire format and resync semantics
-// were verified against - in particular, Spot's depthUpdate has no `pu`
-// field (unlike Futures'), so BinanceSpotSequencePolicy (symbol_sync.hpp)
-// validates continuity via `first_id == last_applied_final_id + 1`
-// instead, and DepthUpdate::prev_final_id is simply left at 0 below.
+// VenueFeed for Binance Spot: parse/encode only, no I/O. Spot's
+// depthUpdate has no `pu` field (unlike Futures'), so
+// BinanceSpotSequencePolicy (symbol_sync.hpp) validates continuity via
+// `first_id == last_applied_final_id + 1` instead, and
+// DepthUpdate::prev_final_id is simply left at 0 below.
 class BinanceSpotFeed {
   public:
     // Same as Futures: snapshot comes from a REST call, not pushed over
@@ -35,10 +33,8 @@ class BinanceSpotFeed {
     // Bare /ws (not /stream, the combined-stream endpoint that wraps
     // payloads as {"stream":...,"data":...}) accepts the same dynamic
     // SUBSCRIBE method Futures uses and delivers unwrapped depthUpdate
-    // events, matching what parse_message() expects - verified directly
-    // against developers.binance.com's WebSocket Streams doc, not assumed
-    // from Futures' /ws (different port: Spot's plaintext WS port is 9443,
-    // not 443).
+    // events, matching what parse_message() expects. Different port from
+    // Futures: Spot's plaintext WS port is 9443, not 443.
     std::string_view ws_host() const { return "stream.binance.com"; }
     std::string_view ws_port() const { return "9443"; }
     std::string_view ws_target() const { return "/ws"; }
@@ -107,12 +103,11 @@ class BinanceSpotFeed {
         }
     }
 
-    // GET /api/v3/depth?symbol=<symbol>&limit=5000 -- see
-    // developers.binance.com's Order Book REST endpoint doc. limit=5000 is
-    // the maximum Spot allows (Futures caps at 1000); a full-depth
-    // snapshot minimizes how often on_snapshot() has to retry when Spot's
-    // <= drop rule (BinanceSpotSequencePolicy, unlike Futures' strict <)
-    // empties the buffer on a quiet symbol - see docs/ingestion_design.md.
+    // GET /api/v3/depth?symbol=<symbol>&limit=5000. limit=5000 is the
+    // maximum Spot allows (Futures caps at 1000); a full-depth snapshot
+    // minimizes how often on_snapshot() has to retry when Spot's <= drop
+    // rule (BinanceSpotSequencePolicy, unlike Futures' strict <) empties
+    // the buffer on a quiet symbol.
     HttpRequestSpec snapshot_request(const NativeSymbol& symbol) const {
         return HttpRequestSpec{"api.binance.com", "443", "/api/v3/depth?symbol=" + symbol + "&limit=5000"};
     }

@@ -162,21 +162,15 @@ class AggregateOrderBook {
     // Levels within one side are applied in `bids`/`asks` order without
     // deduplicating a repeated price - a real exchange message never
     // repeats a price within one update, so this doesn't defend against
-    // one that does, unlike the before/after diff this class's own
-    // callers used to compute for themselves (deleted - see this class's
-    // git history) - that comparison was, incidentally, immune to this
-    // exact case, and the Sink-based replacement is a real if narrow
-    // regression on it. If a repeated price ever happened, each
-    // occurrence would still land correctly on `venue_side` and the
-    // aggregate (apply_level() sets an absolute size, so applying the
-    // same price twice in sequence converges to the same final state as
-    // applying it once), but `Sink` would see one call per occurrence,
-    // and - if the net effect of all of them together happened to match
-    // this price's size from before the batch - a caller collecting "the
-    // last size `Sink` saw per price" would report a no-op price as
-    // changed. Low-severity (one spurious broadcast, not incorrect
-    // state) and not reachable by real exchange data, so not worth the
-    // extra pass this class would need to dedupe it away.
+    // one that does. If a repeated price ever happened, each occurrence
+    // would still land correctly on `venue_side` and the aggregate
+    // (apply_level() sets an absolute size, so applying the same price
+    // twice in sequence converges to the same final state as applying it
+    // once), but `Sink` would see one call per occurrence, and a caller
+    // collecting "the last size `Sink` saw per price" could report a
+    // no-op price as changed. Low-severity (one spurious broadcast, not
+    // incorrect state) and not reachable by real exchange data, so not
+    // worth the extra pass this class would need to dedupe it away.
     template <typename BidSink = NoopSink, typename AskSink = NoopSink>
     std::expected<void, std::errc> apply_batch(const VenueId& venue,
                                                 std::span<const std::pair<Price, Size>> bids,

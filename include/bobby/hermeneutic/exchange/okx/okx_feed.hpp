@@ -22,26 +22,16 @@ namespace bobby::hermeneutic::ingestion {
 // Serves both spot and perpetual-swap instIds - OKX's `books` channel is
 // identical at the protocol level for both (same endpoint, same channel
 // name, same message shape); only the instId string subscribed differs.
-// See docs/ingestion_design.md for the design this implements and OKX's
-// own documented order-book-maintenance semantics (quoted directly by the
-// user, not assumed from training data - see OkxSequencePolicy's comment
-// in symbol_sync.hpp for the verification).
 //
 // No client-initiated keepalive is implemented (no periodic "ping" text,
-// no VenueSession changes) - verified live rather than assumed, given
-// general OKX docs describe a recommended client ping for connection
-// health: a live subscription to wss://ws.okx.com:8443/ws/v5/public
-// books/BTC-USDT ran 40s, and books/TRX-USDT ran 80s (past the documented
-// ~60s "extended idle period" heartbeat threshold), with the client
-// sending nothing beyond the initial subscribe request in either case
-// (2026-09-18). Both connections stayed open throughout, continuously
-// receiving real updates or OKX's own documented idle-heartbeat message
-// (empty bids/asks) - the server's own outgoing traffic appears to be
-// what keeps the connection alive on OKX's side, not anything the client
-// sends. VenueSession is always subscribed to at least one instId once
-// connected, so this project's actual usage never hits a scenario this
-// evidence doesn't cover; parse_message()'s "pong" check above is kept
-// as a harmless no-op in case that assessment ever needs revisiting.
+// no VenueSession changes): OKX's own outgoing traffic (real updates, or
+// its documented idle-heartbeat message with empty bids/asks) keeps the
+// connection alive without the client sending anything beyond the
+// initial subscribe - this holds only because VenueSession is always
+// subscribed to at least one instId once connected; a VenueSession that
+// could be connected with zero subscriptions would need to revisit this.
+// parse_message()'s "pong" check below is kept as a harmless no-op in
+// case that ever changes.
 class OkxFeed {
   public:
     // OKX pushes its own snapshot as the first message on a fresh
@@ -117,9 +107,9 @@ class OkxFeed {
             // left to fall through to *it below: dereferencing an on-demand
             // array's end() iterator is not a simdjson_error (it trips a
             // hard assert in a debug build, or is undefined behavior under
-            // NDEBUG - verified empirically), so the catch around this
-            // function would never see it and this could abort or corrupt
-            // the whole ingestion process on a single malformed message.
+            // NDEBUG), so the catch around this function would never see
+            // it, and a single malformed message could abort or corrupt
+            // the whole ingestion process.
             if (it == data.end()) return std::unexpected(std::errc::bad_message);
             simdjson::ondemand::object entry = (*it).get_object();
 

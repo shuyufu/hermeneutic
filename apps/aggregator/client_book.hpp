@@ -6,14 +6,13 @@
 #include "bobby/hermeneutic/core/fixed_point.hpp"
 
 // hermeneutic_aggregator_client's own local-book bookkeeping - split out of
-// client_main.cpp (rather than left in its anonymous namespace) so it has a
-// header a test target can include: apply_levels()'s size_raw==0-means-
+// client_main.cpp (rather than left in its anonymous namespace) so it has
+// a header a test target can include: apply_levels()'s size_raw==0-means-
 // delete convention and is_book_seq_gap()'s contiguity check are the two
-// pieces of real logic in that file (both diagnosed and fixed at least once
-// before - see git history's "hang on gap/short-lived stream" fix), and
-// neither could be unit-tested without either duplicating them into a test
-// file or exposing them like this. client_main.cpp itself now only does
-// argv parsing, gRPC plumbing, and printing.
+// pieces of real logic in that file, and neither could be unit-tested
+// without either duplicating them into a test file or exposing them like
+// this. client_main.cpp itself now only does argv parsing, gRPC plumbing,
+// and printing.
 namespace bobby::hermeneutic::aggregator {
 
 // Applies one side of a snapshot or diff onto the local book. A snapshot
@@ -26,18 +25,14 @@ namespace bobby::hermeneutic::aggregator {
 //
 // Deliberately does not validate price_raw/size_raw itself (unlike
 // AggregateOrderBook::apply_batch()'s is_valid_level() check on the server
-// side, which rejects a non-positive price or negative size before it ever
-// reaches a book): a wire-level malformed value here would still get caught
-// downstream, by price_band_depth()/volume_band_prices() erroring out on
-// the next print_bands() call in client_main.cpp - printing "ERROR" for
-// that side going forward rather than silently computing a wrong band.
-// That's an accepted, known-limited response (the bad level stays in the
-// local book forever; nothing here removes it or breaks the stream the way
-// a book_seq gap does), not an oversight - this is a diagnostic client, and
-// "ERROR" already surfaces the problem to whoever's watching it, which was
-// this fix's actual goal. A gap-triggered break()-out-of-read-loop
-// treatment for this case, if ever wanted, is future scope, not implied by
-// fixing the validation gap itself.
+// side): a wire-level malformed value here still gets caught downstream,
+// by price_band_depth()/volume_band_prices() erroring out on the next
+// print_bands() call in client_main.cpp - printing "ERROR" for that side
+// going forward rather than silently computing a wrong band. That's an
+// accepted, known-limited response (the bad level stays in the local book
+// forever; nothing here removes it or breaks the stream the way a
+// book_seq gap does), not an oversight - this is a diagnostic client, and
+// "ERROR" already surfaces the problem to whoever's watching it.
 template <typename Map, typename Levels>
 void apply_levels(Map& side, const Levels& levels) {
     for (const auto& level : levels) {

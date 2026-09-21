@@ -88,12 +88,12 @@ std::optional<Mode> parse_mode(const std::string& token) {
     return std::nullopt;
 }
 
-// Notional/bps thresholds are fixed by this tool, not caller-configurable -
-// see client_main.cpp's own mode list above. Kept as two parallel arrays
-// (values for volume_band_prices()/price_band_depth(), labels for display)
-// rather than a struct-of-two-fields array, since std::span<const Notional>/
-// std::span<const int> - the shape those functions actually take - needs a
-// contiguous run of just the values.
+// Notional/bps thresholds are fixed by this tool, not caller-configurable.
+// Kept as two parallel arrays (values for volume_band_prices()/
+// price_band_depth(), labels for display) rather than a struct-of-two-
+// fields array, since std::span<const Notional>/std::span<const int> -
+// the shape those functions actually take - needs a contiguous run of
+// just the values.
 constexpr std::array<const char*, 5> kVolumeBandLabels = {"1M", "5M", "10M", "25M", "50M+"};
 constexpr std::array<Notional, 5> kVolumeBandThresholds = {
     Notional(1e6), Notional(5e6), Notional(10e6), Notional(25e6), Notional(50e6),
@@ -102,19 +102,14 @@ constexpr std::array<Notional, 5> kVolumeBandThresholds = {
 constexpr std::array<int, 5> kPriceBandBps = {50, 100, 200, 500, 1000};
 constexpr std::array<const char*, 5> kPriceBandLabels = {"50bps", "100bps", "200bps", "500bps", "1000bps+"};
 
-// BasicFixedPoint's own operator<< streams to_double() through the
-// ostream's ambient (default) precision, which is only 6 significant
-// digits - fine for a Price/Size around 80000.5, but a Notional in this
-// tool's own 1M-50M+ band range overflows that into scientific notation
-// ("1.23457e+07"), defeating the readability these two publisher modes
-// exist for. Precision is FixedPoint::decimals (Price/Notional=9,
-// Size=6) rather than a fixed "2" - that's the exact number of decimal
-// digits the type's raw scale actually stores, so it prints losslessly
-// for a small value (e.g. a sub-cent VWAP) instead of a fixed "2"
-// truncating it to "0.00", while std::fixed still keeps a large Notional
-// out of scientific notation. Used for every fixed-point value
-// volume-bands/price-bands print, not just Notional, so a VWAP/size
-// prints with the same style rather than mixing formatting conventions.
+// BasicFixedPoint's own operator<< streams to_double() through ostream's
+// default precision (6 significant digits) - fine for a Price/Size around
+// 80000.5, but a Notional in this tool's 1M-50M+ band range overflows
+// that into scientific notation. Precision is FixedPoint::decimals
+// (Price/Notional=9, Size=6), not a fixed "2": that's the exact number of
+// decimal digits the type's raw scale stores, so a small value (e.g. a
+// sub-cent VWAP) still prints losslessly while std::fixed keeps a large
+// Notional out of scientific notation.
 template <typename FixedPoint>
 std::string format_fixed(FixedPoint value) {
     std::ostringstream out;
@@ -123,29 +118,21 @@ std::string format_fixed(FixedPoint value) {
 }
 
 // Raw wire values reconstructed into their real fixed-point types before
-// formatting (rather than the raw int64 divided by a literal 1e9/1e6 and
-// streamed at ostream's default precision) so this shares format_fixed()'s
-// fix for the same scientific-notation risk - this is the bbo mode's own
-// price/size display and every mode's DONE line, not just volume-bands/
-// price-bands.
+// formatting, rather than the raw int64 divided by a literal 1e9/1e6 and
+// streamed at ostream's default precision, so this shares format_fixed()'s
+// fix for the same scientific-notation risk.
 std::string format_level(const PriceLevel& level) {
     std::ostringstream out;
     out << format_fixed(Price::from_raw(level.price_raw())) << "@" << format_fixed(Size::from_raw(level.size_raw()));
     return out.str();
 }
 
-// Formats Heartbeat.live_venues as "[venue venue ...]" - shared by both
-// publisher modes below (bbo and volume-bands/price-bands) so this per-
-// symbol validity signal (aggregator.proto's own doc comment: empty means
-// "no venue currently backs this book") is actually visible somewhere in
-// this repo's one first-party gRPC consumer, not just present on the wire.
-//
-// Sorted, not printed in wire order: live_venues.proto's own comment says
-// element order is unspecified (the server builds it from an
-// unordered_map) and may change between heartbeats even when the live set
-// itself hasn't. Both publisher modes below print this only when it
-// changes from the last one printed - without sorting first, a pure
-// reorder with no actual liveness change would look like one.
+// Formats Heartbeat.live_venues as "[venue venue ...]" - empty means "no
+// venue currently backs this book" (aggregator.proto). Sorted, not printed
+// in wire order: element order off the wire is unspecified and may change
+// between heartbeats even when the live set itself hasn't; both publisher
+// modes below print this only when it changes from the last one printed,
+// so an unsorted reorder with no actual liveness change would look like one.
 std::string format_live_venues(const Heartbeat& heartbeat) {
     std::vector<std::string> venues(heartbeat.live_venues().begin(), heartbeat.live_venues().end());
     std::sort(venues.begin(), venues.end());
@@ -169,12 +156,9 @@ void print_line(const std::string& line) {
         std::lock_guard lock(out_mutex);
         std::cout << line << '\n';
     }
-    // Flushed outside the lock: the write above (the part that must not
-    // interleave with another thread's line) is already complete once the
-    // lock is released, so the flush syscall's cost no longer serializes
-    // across every symbol thread - only actual writes to std::cout do,
-    // which the standard library's own stream synchronization still
-    // protects against corruption.
+    // Flushed outside the lock: the write above is already complete once
+    // the lock is released, so the flush syscall's cost doesn't serialize
+    // across every symbol thread.
     std::cout.flush();
 }
 
@@ -213,19 +197,15 @@ class StreamCanceller;
 // Registry of every currently-live StreamCanceller, so main()'s global
 // `stop` flag can wake each one individually through its own private
 // condition_variable, instead of every canceller sharing one cv/mutex
-// pair the way an earlier version of this class did - a design where
-// any single stream's own *natural* completion (nothing to do with a
-// global stop) woke every other concurrently-subscribed stream's
-// canceller thread too, each re-acquiring the one shared mutex just to
-// find its own predicate still false: a thundering-herd wakeup on every
-// individual stream teardown, not just at actual shutdown, scaling with
-// subscription count (a code-review finding).
+// pair - which would make any single stream's *natural* completion wake
+// every other concurrently-subscribed stream's canceller thread too, a
+// thundering-herd wakeup on every individual stream teardown, not just at
+// actual shutdown, scaling with subscription count.
 //
 // This registry's own mutex is held only briefly, for registration/
 // deregistration/notify-everyone bookkeeping - never while any canceller
-// thread is actually blocked waiting - so it introduces no new
-// contention on the wait path itself, unlike the shared cv/mutex pair
-// it replaces.
+// thread is actually blocked waiting - so it introduces no new contention
+// on the wait path itself.
 std::mutex& canceller_registry_mutex() {
     static std::mutex m;
     return m;
@@ -259,17 +239,12 @@ class StreamCanceller {
     }
 
     ~StreamCanceller() {
-        // Deregister first, before touching anything else this
-        // instance owns: notify_stop() (called by main()'s stop path,
-        // possibly from another thread, concurrently with this
-        // destructor running) only ever reaches instances still in the
-        // registry, so removing `this` here - before mutex_/cv_/
-        // thread_ are torn down below - guarantees notify_stop() can
-        // never be called on a partially-destroyed object. The two
-        // registry-mutex critical sections (this erase, and
-        // notify_all_of_stop()'s own iteration below) are mutually
-        // exclusive, so whichever runs first fully finishes before the
-        // other can start.
+        // Deregister first, before touching anything else this instance
+        // owns: notify_stop() (called concurrently from another thread by
+        // main()'s stop path) only ever reaches instances still in the
+        // registry, so removing `this` here - before mutex_/cv_/thread_
+        // are torn down below - guarantees notify_stop() can never be
+        // called on a partially-destroyed object.
         {
             std::lock_guard<std::mutex> lock(canceller_registry_mutex());
             std::erase(canceller_registry(), this);
@@ -287,14 +262,12 @@ class StreamCanceller {
 
     // Called by main()'s stop path (via notify_all_of_stop() below) to
     // wake this one instance without touching any other canceller's own
-    // wait. Must take `mutex_` - the same lock run()'s wait() uses -
-    // even though `*stop_` itself is already a plain atomic write done
-    // by the caller before this runs: the atomicity of the *value* does
-    // not, on its own, close the lost-wakeup window between a waiter
-    // re-checking its predicate and actually starting to block (see
-    // main()'s own comment on the identical hazard this project already
-    // hit once with the previous shared-mutex design). Taking `mutex_`
-    // here serializes against exactly that transition.
+    // wait. Must take `mutex_` - the same lock run()'s wait() uses - even
+    // though `*stop_` itself is already a plain atomic write done by the
+    // caller before this runs: the atomicity of the *value* alone doesn't
+    // close the lost-wakeup window between a waiter re-checking its
+    // predicate and actually starting to block. Taking `mutex_` here
+    // serializes against exactly that transition.
     void notify_stop() {
         std::lock_guard<std::mutex> lock(mutex_);
         cv_.notify_all();
@@ -324,11 +297,9 @@ void notify_all_of_stop() {
     for (StreamCanceller* canceller : canceller_registry()) canceller->notify_stop();
 }
 
-// Shared by publish_bbo()/publish_l2_bands()/list_books() - all three used
-// to each construct their own channel/stub with identical arguments, so any
-// future change to how a channel is built (credentials, keepalive,
-// message-size limits) would otherwise have to be made at three call sites
-// in lockstep.
+// Shared by publish_bbo()/publish_l2_bands()/list_books() so a future
+// change to how a channel is built (credentials, keepalive, message-size
+// limits) doesn't have to be made at three call sites in lockstep.
 std::unique_ptr<Aggregator::Stub> make_stub(const std::string& address) {
     auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
     return Aggregator::NewStub(channel);
@@ -380,14 +351,11 @@ void publish_bbo(const std::string& address, const BookId& book_id, std::atomic<
 }
 
 // Unlike publish_bbo()/publish_l2_bands(), this is a single blocking unary
-// call, not a stream - so it has no StreamCanceller/duration handling and
-// runs straight from main(), never on its own thread. Given its own
-// deadline below rather than main()'s duration mechanism (list intentionally
-// takes no duration argument): without one, a server that accepts the
-// connection but never replies would hang this call forever. Returns false
-// (having already printed the error) on a non-OK status, so main() can turn
-// that into a non-zero exit code the way the streaming modes' own DONE lines
-// only report, never enforce.
+// call, not a stream, so it has no StreamCanceller/duration handling and
+// runs straight from main(). Given its own deadline below (list takes no
+// duration argument): without one, a server that accepts the connection
+// but never replies would hang this call forever. Returns false on a
+// non-OK status so main() can turn that into a non-zero exit code.
 constexpr std::chrono::seconds kListBooksTimeout{10};
 
 bool list_books(const std::string& address) {
@@ -405,21 +373,18 @@ bool list_books(const std::string& address) {
     }
 
     // fill_wire_book_id() (the only thing that produces this response,
-    // server-side) never emits a malformed BookId - see to_symbol_book_id()'s
-    // own comment for when it returns nullopt - so this is unreached against
-    // this project's own server. Kept as a defensive fallback anyway, same
-    // as fill_wire_book_id() itself defends against an out-of-range
-    // symbol::MarketType: a future/buggy server on the other end of this
-    // wire is still bound by the .proto contract, not by this binary.
+    // server-side) never emits a malformed BookId, so this is unreached
+    // against this project's own server. Kept as a defensive fallback
+    // anyway: a future/buggy server on the other end of this wire is still
+    // bound by the .proto contract, not by this binary.
     std::vector<std::string> labels;
     for (const auto& wire_book : response.books()) {
         auto book_id = to_symbol_book_id(wire_book);
         labels.push_back(book_id ? to_string(*book_id) : "(malformed book in response)");
     }
-    // ListBooksResponse.books' own proto comment says order isn't
-    // guaranteed (it comes off the server's std::unordered_map iteration
-    // order) - sorted here purely so this CLI's own output is stable across
-    // runs for a human diffing them, not because the wire contract requires it.
+    // Order isn't guaranteed on the wire (server-side unordered_map
+    // iteration) - sorted here purely so this CLI's output is stable
+    // across runs for a human diffing them.
     std::sort(labels.begin(), labels.end());
 
     // An OK status with zero books printed would look identical to any
@@ -491,14 +456,12 @@ void publish_l2_bands(Mode mode, const std::string& address, const BookId& book_
                 ++diff_count;
                 const auto& diff = update.diff();
                 // book_seq is contiguous by contract on this stream (unlike
-                // Bbo's) - see aggregator.proto's L2Diff.book_seq comment. A
-                // gap means a revision was missed, and per that same comment
-                // the locally reconstructed book is no longer valid - so this
-                // stops applying/publishing immediately rather than computing
-                // bands off a book that's silently wrong from here on. This
-                // tool doesn't resubscribe to recover (that needs a whole new
-                // RPC, not just a fresh snapshot on this one) - a GAP line is
-                // the operator's signal to restart it.
+                // Bbo's). A gap means a revision was missed and the locally
+                // reconstructed book is no longer valid, so this stops
+                // applying/publishing immediately rather than computing
+                // bands off a silently-wrong book. This tool doesn't
+                // resubscribe to recover - a GAP line is the operator's
+                // signal to restart it.
                 if (is_book_seq_gap(last_seq, diff.book_seq())) {
                     ++gap_count;
                     std::ostringstream gap_line;
@@ -585,12 +548,10 @@ int main(int argc, char** argv) {
     try {
         std::size_t consumed = 0;
         duration_s = std::stoi(duration_str, &consumed);
-        // std::stoi is a partial parse by design (stops at the first
-        // non-digit and returns what it has, e.g. "10abc" -> 10, "5.5" ->
-        // 5, "3,600" -> 3) rather than rejecting trailing garbage - so
-        // the try/catch below alone doesn't actually validate the whole
-        // argument. `consumed` short of the full string length is that
-        // trailing-garbage case.
+        // std::stoi is a partial parse by design (e.g. "10abc" -> 10)
+        // rather than rejecting trailing garbage, so the try/catch below
+        // alone doesn't validate the whole argument; `consumed` short of
+        // the full string length is that trailing-garbage case.
         if (consumed != duration_str.size()) {
             std::cerr << "invalid duration_seconds \"" << duration_str << "\" (trailing characters after the integer)\n";
             print_usage();
@@ -629,15 +590,10 @@ int main(int argc, char** argv) {
 
     if (duration_s > 0) {
         std::this_thread::sleep_for(std::chrono::seconds(duration_s));
-        // `stop` itself is a plain atomic write - the lost-wakeup window
-        // this project already hit once (see StreamCanceller::
-        // notify_stop()'s own comment) is closed on the *reader* side
-        // instead now: notify_all_of_stop() takes each canceller's own
-        // mutex_ before notifying it, which is what actually serializes
-        // against a canceller thread that's mid-transition into
-        // wait()'s blocked state - writing `stop` under a lock here
-        // wouldn't help, since no single lock covers every canceller's
-        // own wait() any more.
+        // `stop` itself is a plain atomic write; the lost-wakeup window is
+        // closed on the reader side instead (see StreamCanceller::
+        // notify_stop()) - writing `stop` under a lock here wouldn't help,
+        // since no single lock covers every canceller's own wait().
         stop = true;
         notify_all_of_stop();
     }

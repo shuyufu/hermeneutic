@@ -42,35 +42,25 @@ class BasicFixedPoint {
 
     // Like from_raw(), but for a __int128 intermediate that's already been
     // rescaled to this type's raw storage and just needs narrowing back down
-    // to raw_type - the last step of every __int128-intermediate computation
-    // in this codebase (notional.hpp's operator*/operator/, volume_bands.hpp's
-    // vwap_at_partial_fill, price_bands.hpp's offset_by_bps all used to repeat
-    // this exact debug-assert-then-narrow shape by hand). Debug-only, same as
-    // those call sites always were: no realistic Price/Size/Notional magnitude
-    // in this codebase reaches raw_type's ~9.2e18 range, so this documents an
-    // invariant rather than handling a reachable error - a caller with a
-    // genuine runtime-reachable overflow risk (unlike these internal
-    // fixed-point helpers) should check before calling this, not rely on it.
+    // to raw_type. The assert is debug-only: no realistic Price/Size/Notional
+    // magnitude in this codebase reaches raw_type's ~9.2e18 range, so this
+    // documents an invariant rather than handling a reachable error - a
+    // caller with a genuine runtime-reachable overflow risk should check
+    // before calling this, not rely on it (see from_raw_safe() below).
     static constexpr BasicFixedPoint from_raw_checked(__int128 value) noexcept {
         assert(value >= static_cast<__int128>(std::numeric_limits<raw_type>::min()));
         assert(value <= static_cast<__int128>(std::numeric_limits<raw_type>::max()));
         return from_raw(static_cast<raw_type>(value));
     }
 
-    // Same narrowing as from_raw_checked(), but for a caller with a genuine
-    // runtime-reachable overflow risk - std::errc::result_out_of_range
-    // instead of a debug-only assert. price_bands.hpp's offset_by_bps() is
-    // exactly that caller: this project validates no upper bound on Price
-    // anywhere (is_valid_level() only checks price > 0), so a boundary
-    // computed from an unbounded price and a large-but-otherwise-valid bps
-    // threshold is a real way to overflow raw_type, not a "no realistic
-    // input reaches this" case the way from_raw_checked()'s other call
-    // sites are - see offset_by_bps()'s own comment. Also what a caller
-    // accumulating many individually-valid values (e.g. price_band_depth()'s
-    // running cum_notional) uses to catch the running total itself
-    // overflowing, which from_raw_checked()'s per-call assert can't -
-    // each individual add can be in-range while the accumulated series
-    // isn't.
+    // Same narrowing as from_raw_checked(), but returns
+    // std::errc::result_out_of_range instead of a debug-only assert, for a
+    // caller with a genuine runtime-reachable overflow risk - e.g.
+    // price_bands.hpp's offset_by_bps() (no upper bound on Price is
+    // validated anywhere, so a boundary computed from it can genuinely
+    // overflow) or a caller accumulating many individually-valid values
+    // (e.g. a running cum_notional) where the total can overflow even
+    // though each individual add was in-range.
     static constexpr std::expected<BasicFixedPoint, std::errc> from_raw_safe(__int128 value) noexcept {
         constexpr __int128 kRawMax = static_cast<__int128>(std::numeric_limits<raw_type>::max());
         constexpr __int128 kRawMin = static_cast<__int128>(std::numeric_limits<raw_type>::min());
@@ -83,39 +73,22 @@ class BasicFixedPoint {
                                       (value >= 0 ? 0.5 : -0.5))) {}
 
     // Parses a decimal string directly into raw integer scale, entirely in
-    // integer arithmetic - no double intermediate anywhere, unlike
-    // std::from_chars (string -> double) + BasicFixedPoint(double)
-    // (double -> raw int64_t, via `value * scale + 0.5`): a 2026-09-19
-    // measurement (see this project's git history for the brute-force
-    // numbers) found that two-step path safe below 15 total significant
-    // digits and unsafe above it, and the unsafety isn't confined to the
-    // first step either - BasicFixedPoint(double)'s own multiply is an
-    // independent double-precision rounding, unmeasured by that first pass
-    // and not fixed by improving the first step alone. Removing the double
-    // intermediate entirely, not just narrowing one of its two uses, is the
-    // only way to close both at once.
+    // integer arithmetic - no double intermediate anywhere (a double
+    // intermediate loses precision above 15 total significant digits, and
+    // the loss isn't confined to one step, so nothing short of avoiding it
+    // entirely closes the gap).
     //
-    // Accepted grammar: an optional leading '-' (never '+' - std::from_
-    // chars<double> itself rejects a leading '+', so this isn't a
-    // narrowing versus the path this replaces), then digits, optionally
-    // followed by '.' and more digits, with at least one digit somewhere
-    // (rejects "", "-", ".", and "-."). Deliberately narrower than
-    // std::from_chars<double>'s own grammar in two ways, both confirmed
-    // safe against every wire fixture this project parses at the time this
-    // was written: scientific notation ("1e5") is rejected as a format
-    // error, and so are "nan"/"inf"/"infinity" (which std::from_chars
-    // <double> parses successfully) - the latter an incidental fix for a
-    // real, if never-observed-in-the-wild, gap in the path this replaces: a
-    // literal "NaN" would previously parse into a double NaN, then into
-    // `static_cast<raw_type>(NaN * scale + 0.5)`, which is undefined
-    // behavior, not a caught parse error.
+    // Accepted grammar: an optional leading '-' (never '+'), then digits,
+    // optionally followed by '.' and more digits, with at least one digit
+    // somewhere (rejects "", "-", ".", and "-."). Deliberately narrower
+    // than std::from_chars<double>'s grammar: scientific notation ("1e5")
+    // is a format error, and so are "nan"/"inf"/"infinity".
     //
     // Reports malformed input or an out-of-range result via std::expected
     // rather than throwing, so this file stays free of any particular
-    // error-reporting convention (exceptions, error codes, ...) a caller
-    // might want - a wire parser that needs to fold this into its own
-    // exception-based error handling (see exchange/feed_wire.hpp) does that
-    // translation at its own call site instead.
+    // error-reporting convention a caller might want - a wire parser that
+    // needs exceptions (see exchange/feed_wire.hpp) translates at its own
+    // call site instead.
     static constexpr std::expected<BasicFixedPoint, std::errc> from_decimal_string(
         std::string_view text) noexcept {
         constexpr __int128 kRawMax = static_cast<__int128>(std::numeric_limits<raw_type>::max());
@@ -140,14 +113,11 @@ class BasicFixedPoint {
         }
 
         // Integer part: digit validation and accumulation fused into one
-        // pass. Accumulated in a 128-bit intermediate. Bailing as soon as
-        // it exceeds raw_type's own max (not raw_type's max/scale - the
-        // final, tight bound is applied after scaling below) is a looser
-        // check, but it's what keeps this loop itself safe from ever
-        // overflowing __int128 on a maliciously long digit string:
-        // __int128 has roughly 20 more decimal digits of headroom than
-        // raw_type::max, so this trips long before that could happen,
-        // however many digits `int_part` has.
+        // pass, accumulated in a 128-bit intermediate. Bailing as soon as
+        // it exceeds raw_type's own max (a looser check than the final,
+        // tight post-scale bound below) is what keeps this loop itself
+        // safe from ever overflowing __int128 on a maliciously long digit
+        // string, however many digits `int_part` has.
         unsigned __int128 int_value = 0;
         for (char c : int_part) {
             if (c < '0' || c > '9') return std::unexpected(std::errc::invalid_argument);
@@ -158,18 +128,11 @@ class BasicFixedPoint {
         }
 
         // Fractional part: every character still has to be validated
-        // (this is untrusted input - "1.23abc" must still be rejected,
-        // not silently truncated to "1.23"), but only the first
-        // kDecimals+1 characters are ever *accumulated*: under "round half
-        // up, ties away from zero", the single digit immediately after
-        // the cut point already fully determines the outcome (>=5 always
-        // rounds up regardless of what follows, since further digits can
-        // only make the discarded remainder larger, never pull it back
-        // under half; <=4 always rounds down for the same reason in
-        // reverse) - so digits beyond that one can never change the
-        // result. One pass over the whole of frac_part does both at once,
-        // rather than a full validation pass followed by a separate
-        // (shorter) accumulation pass - same fusion as int_part above.
+        // (untrusted input - "1.23abc" must be rejected, not truncated to
+        // "1.23"), but only the first kDecimals+1 characters are ever
+        // *accumulated*: under "round half up, ties away from zero", the
+        // single digit right after the cut point already fully determines
+        // the outcome, so digits beyond it can never change the result.
         std::size_t take = std::min(frac_part.size(), static_cast<std::size_t>(decimals) + 1);
         __int128 frac_numerator = 0;
         for (std::size_t i = 0; i < frac_part.size(); ++i) {
@@ -195,35 +158,28 @@ class BasicFixedPoint {
 
         // Rounding the fractional part up can carry into the integer part
         // (e.g. "0.999" at 2 decimals rounds to "1.00") - round_div_
-        // nearest_away can push frac_value to exactly kScale (never
-        // beyond: the largest possible frac_numerator, kDecimals+1 nines,
-        // rounds to exactly 10^kDecimals), so a single carry is the only
-        // case to handle.
+        // nearest_away can push frac_value to exactly kScale and no
+        // further (the largest possible frac_numerator, kDecimals+1
+        // nines, rounds to exactly 10^kDecimals), so a single carry is
+        // the only case this `==` check needs to handle.
         if (frac_value == static_cast<__int128>(scale)) {
             int_value += 1;
             frac_value = 0;
         }
         // Re-checks the same loose bound as the accumulation loop above,
         // now including the carry - only load-bearing for a hypothetical
-        // Decimals=0 type (where int_value IS the final magnitude, so a
-        // carry landing exactly on kRawMax needs to be caught here). For
-        // Price/Size (Decimals=9/6), int_value at this point is still
-        // many orders of magnitude below kRawMax whenever the final
-        // result is going to be valid at all - the real guard for those
-        // is the tight post-scale check just below, not this one.
+        // Decimals=0 type, where int_value is the final magnitude. The
+        // tight post-scale check below is the real guard for Price/Size.
         if (int_value > static_cast<unsigned __int128>(kRawMax)) {
             return std::unexpected(std::errc::result_out_of_range);
         }
 
-        // Final, tight bound: against raw_type::max after scaling, the
-        // actual overflow condition for the raw_type this returns (unlike
-        // the loose checks above, which only protect the accumulation
-        // loop itself and the Decimals=0 edge case). Applies the same
-        // bound to both signs rather than letting a negative result use
-        // raw_type::min's one-unit-larger magnitude (two's complement) -
-        // real price/size data never comes remotely close to either
-        // bound, so this asymmetry has no practical effect, and treating
-        // both signs identically here is simpler than the alternative.
+        // Final, tight bound against raw_type::max after scaling - the
+        // actual overflow condition for the raw_type this returns. Applies
+        // the same bound to both signs rather than letting a negative
+        // result use raw_type::min's one-unit-larger magnitude, since
+        // treating both signs identically here is simpler and real
+        // price/size data never comes close to either bound.
         __int128 magnitude =
             static_cast<__int128>(int_value) * static_cast<__int128>(scale) + frac_value;
         if (magnitude > kRawMax) return std::unexpected(std::errc::result_out_of_range);
@@ -240,13 +196,10 @@ class BasicFixedPoint {
     friend constexpr auto operator<=>(const BasicFixedPoint&,
                                        const BasicFixedPoint&) noexcept = default;
 
-    // Widened to __int128 before the actual add/subtract/negate, same as
-    // every other arithmetic op in this codebase (from_decimal_string above,
-    // notional.hpp's operator*), rather than operating on raw_type directly
-    // and asserting after the fact - raw_ + other.raw_ overflowing int64_t
-    // is itself undefined behavior, so an assert on the result would have
-    // to run after UB has already happened to reach it. from_raw_checked()'s
-    // debug-only assert then narrows back down, same as everywhere else.
+    // Widened to __int128 before the actual add/subtract/negate rather than
+    // operating on raw_type directly and asserting after the fact:
+    // raw_ + other.raw_ overflowing int64_t is itself undefined behavior,
+    // so an assert on the result would run after UB already happened.
     constexpr BasicFixedPoint operator+(BasicFixedPoint other) const noexcept {
         return from_raw_checked(static_cast<__int128>(raw_) + static_cast<__int128>(other.raw_));
     }
@@ -260,10 +213,8 @@ class BasicFixedPoint {
     }
 
     // raw_ updated directly from the checked __int128 result, rather than
-    // `*this = *this + other`: the latter widens/checks/narrows via
-    // operator+ and then copy-assigns the whole (one-member) object back -
-    // an extra copy this hot path (e.g. price_bands.hpp's/volume_bands.hpp's
-    // per-level cum_size accumulation) doesn't need on top of the widen
+    // `*this = *this + other`, to avoid an extra copy-assignment on this
+    // hot path (e.g. per-level cum_size accumulation) on top of the widen
     // that's actually required for overflow safety.
     constexpr BasicFixedPoint& operator+=(BasicFixedPoint other) noexcept {
         raw_ = from_raw_checked(static_cast<__int128>(raw_) + static_cast<__int128>(other.raw_)).raw();
@@ -301,24 +252,17 @@ constexpr __int128 pow10() noexcept {
 }
 
 // Cross-width multiply: A::raw() * B::raw(), widened to __int128 for the
-// multiply itself (same reason as every other __int128 intermediate in this
-// codebase - the product can exceed raw_type's range even when both
-// operands and the final rescaled result fit), then rescaled down to
-// Result's precision and narrowed back via from_raw_checked. The rescale
-// direction (A::decimals + B::decimals - Result::decimals) is always a
-// right-shift (a division) for the type combinations this codebase actually
-// uses (Price*Size -> Notional, at scale 10^15 rescaled to Notional's
-// 10^9) - the static_assert below is what makes that a checked precondition
+// multiply itself since the product can exceed raw_type's range even when
+// both operands and the final rescaled result fit, then rescaled down to
+// Result's precision and narrowed back via from_raw_checked. The
+// static_assert below makes the rescale direction a checked precondition
 // rather than an assumption.
 //
 // Deliberately kept in detail:: rather than exposed as a public, directly
 // callable helper: it's a building block for the explicit, individually-
-// declared operators in notional.hpp (and similar files), not a substitute
-// for declaring them. A public fixed_multiply<A, B, Result> would let any
-// caller instantiate a meaningless combination (fixed_multiply<Price,
-// Price, Notional>) that no operator* actually exposes - keeping it in
-// detail:: confines that possibility to this file's own operator
-// definitions, which only ever instantiate the combinations they declare.
+// declared operators in notional.hpp (and similar files). A public
+// fixed_multiply<A, B, Result> would let any caller instantiate a
+// meaningless combination that no operator* actually exposes.
 template <typename A, typename B, typename Result>
 constexpr Result fixed_multiply(A a, B b) noexcept {
     constexpr int shift = A::decimals + B::decimals - Result::decimals;
@@ -336,22 +280,16 @@ constexpr Result fixed_multiply(A a, B b) noexcept {
 // Cross-width divide: Dividend::raw() / Divisor::raw() -> Result, rescaled
 // by 10^(Result::decimals + Divisor::decimals - Dividend::decimals) so the
 // integer division lands directly on Result's precision. Mirrors
-// fixed_multiply's shape and the same non-templated logic every
-// hand-written rescaling operator/ in notional.hpp used to repeat, and the
-// same detail:: reasoning as fixed_multiply above for why this isn't public.
+// fixed_multiply's shape and detail:: reasoning above.
 template <typename Dividend, typename Divisor, typename Result>
 constexpr std::expected<Result, std::errc> fixed_divide(Dividend a, Divisor b) noexcept {
-    // This rejects a non-positive divisor, but that's a domain judgment
-    // inherited from the types this is used with, not a property of
-    // division in general: Price, Size, and Notional are all non-negative
-    // quantities, so a non-positive divisor here always means malformed
-    // input (a default-constructed or corrupt value), not a legitimate
-    // signed division. It also happens to be what round_div_nearest_away
-    // below requires (a strictly positive denominator) - but that mechanical
-    // requirement is a coincidence of the current all-non-negative type set,
-    // not the reason for the check. A future signed Divisor type would need
-    // sign-normalization here instead of outright rejection - see
-    // round_div_nearest_away's own doc comment on the same distinction.
+    // Rejects a non-positive divisor as a domain judgment inherited from
+    // the types this is used with (Price, Size, Notional are all
+    // non-negative), not a property of division in general - so a
+    // non-positive divisor here always means malformed input, not a
+    // legitimate signed division. A future signed Divisor type would need
+    // sign-normalization here instead of outright rejection (see
+    // round_div_nearest_away's own doc comment on the same distinction).
     if (b.raw() <= 0) return std::unexpected(std::errc::argument_out_of_domain);
 
     constexpr int shift = Result::decimals + Divisor::decimals - Dividend::decimals;

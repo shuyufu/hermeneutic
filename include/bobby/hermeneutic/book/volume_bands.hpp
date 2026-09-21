@@ -34,13 +34,14 @@ namespace detail {
 // quantity -- deliberately: this is the exact quantity needed to reach
 // `remaining` at `price` (an interpolated point on the book's liquidity
 // curve), not a simulation of an order actually resting at a
-// Size-quantized size. An earlier version computed this as two divisions
-// -- `take_size = remaining / price` (Notional/Price -> Size), then
-// `vwap = (cum_notional + remaining) / (cum_size + take_size)`
-// (Notional/Size -> Price) -- which rounded the partial-fill quantity to
-// Size's 6-decimal precision *before* the final division, discarding up to
-// 0.5e-6 of it. For a small cum_size (e.g. a partial fill within the very
-// first level) that error can exceed Price's own 1e-9 resolution.
+// Size-quantized size. The naive two-division approach - `take_size =
+// remaining / price` (Notional/Price -> Size), then `vwap = (cum_notional
+// + remaining) / (cum_size + take_size)` (Notional/Size -> Price) -
+// rounds the partial-fill quantity to Size's 6-decimal precision *before*
+// the final division, discarding up to 0.5e-6 of it; for a small cum_size
+// (e.g. a partial fill within the very first level) that error can exceed
+// Price's own 1e-9 resolution. The single-fraction algebra below avoids
+// that intermediate rounding entirely.
 //
 // Algebraically, this is one fraction with the inner division cleared out
 // of the denominator:

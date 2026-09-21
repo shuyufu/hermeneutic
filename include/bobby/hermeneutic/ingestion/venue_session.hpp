@@ -59,23 +59,19 @@ inline void log_exception(std::string_view component, std::string_view action, s
     }
 }
 
-// symbol -> Book*, built once at startup (e.g. from
-// AggregatorService::book(symbol) for every symbol a VenueSession covers)
-// and never modified afterward - no dynamic add/remove.
+// symbol -> Book*, built once at startup and never modified afterward - no
+// dynamic add/remove.
 //
 // Templated on Book (duck-typed, like Feed/Policy below), not hardcoded to
 // aggregator::SymbolBook: VenueSession only ever calls apply_snapshot/
 // apply_batch/invalidate_venue on it (see execute_action() below), all
-// three of which AggregateOrderBook (book/aggregate_order_book.hpp,
-// zero-dependency) already provides. Hardcoding SymbolBook here would
-// force this header - and every ingestion-tier consumer, real or test -
-// to pull in aggregator_service.hpp's gRPC/protobuf dependency just to
-// route a parsed delta into a book, even though VenueSession itself never
-// touches SymbolBook's actual gRPC surface (subscribe/subscribe_bbo/
-// send_heartbeat). A production binary still supplies SymbolBook here
-// (see apps/aggregator/server_main.cpp) to get its gRPC fan-out; a test that
-// only cares about VenueSession's own mechanics can supply plain
-// AggregateOrderBook instead and stay off that dependency entirely.
+// three of which AggregateOrderBook (zero-dependency) already provides.
+// Hardcoding SymbolBook here would force this header, and every
+// ingestion-tier consumer, to pull in aggregator_service.hpp's gRPC/
+// protobuf dependency just to route a parsed delta into a book. A
+// production binary still supplies SymbolBook (see server_main.cpp) for
+// its gRPC fan-out; a test that only cares about VenueSession's own
+// mechanics can supply plain AggregateOrderBook instead.
 template <typename Book>
 class SymbolRegistry {
   public:
@@ -99,10 +95,9 @@ class SymbolRegistry {
 //
 // Templated the same way WebSocketConnection/http_get are: `NextLayer`
 // picks plain TCP (tests, against a local server) or an SSL stream
-// (production, wss://). `Feed`/`Policy` are per-exchange - see
-// docs/ingestion_design.md. `Book` is the SymbolRegistry element type -
-// see SymbolRegistry's own comment for why this isn't hardcoded to
-// aggregator::SymbolBook.
+// (production, wss://). `Feed`/`Policy` are per-exchange. `Book` is the
+// SymbolRegistry element type - see SymbolRegistry's own comment for why
+// this isn't hardcoded to aggregator::SymbolBook.
 template <typename Feed, typename Policy, typename NextLayer, typename Book>
 class VenueSession {
   public:
@@ -128,41 +123,18 @@ class VenueSession {
 
     const VenueId& venue() const { return venue_; }
 
-    // Spawns run() on this session's own strand, bound to run_sig_ so
-    // stop() can actually abort an in-flight read or backoff wait rather
-    // than only asking cooperatively. `on_done` fires once run() actually
-    // returns - i.e. once shutdown (including draining any in-flight
-    // snapshot fetch, see stop()) is fully complete, not when stop() itself
-    // returns.
+    // Precondition (not enforced at runtime): call at most once per
+    // session. A second call would silently orphan the run() already in
+    // flight - stop() would then only ever reach the new one. `on_done`
+    // fires when run() itself returns (after any in-flight snapshot fetch
+    // has drained via stop()), not when stop() returns.
     //
-    // Precondition: call at most once per session. A second call would
-    // bind_cancellation_slot() a fresh run_sig_ registration on top of the
-    // first (a slot only forwards to the most recently bound operation -
-    // the same reasoning behind giving each snapshot fetch its own signal
-    // below), silently orphaning whichever run() was already in flight:
-    // stop() would then only ever reach the second one. Not enforced at
-    // runtime - IngestionRunner's only caller today calls this exactly
-    // once per session by construction (see add()) - but a future caller
-    // adding e.g. a retry/reload path must not call start() again on a
-    // session that already has one.
-    //
-    // Deferred through net::post rather than co_spawn'ing directly here -
-    // this is the actual fix, not the stopping_ check below. Binding
-    // run_sig_'s slot to a coroutine (what co_spawn + bind_cancellation_slot
-    // does) and then having stop() emit() on it *before* that coroutine has
-    // taken its first step aborts the whole co_spawn'd operation before
-    // run()'s body ever executes a single line (verified empirically two
-    // ways: a stopping_ check at the top of run()'s own loop never even
-    // runs in that case; reverting just this net::post back to a direct
-    // co_spawn() call, with the stopping_ check below left in place, still
-    // reproduces the failure). Posting the bind itself onto strand_ orders
-    // it against any stop() already queued there - if stop() ran first,
-    // run_sig_.emit() lands on an unbound slot (a true no-op), so binding
-    // afterward starts run() from a genuinely fresh, uncancelled state.
-    // The stopping_ check is then just an optimization on top of that
-    // correct ordering: no need to spawn a coroutine at all if we already
-    // know it would immediately co_return - see
-    // docs/ingestion_design.md 第 10 節第 2 項 for the full account.
+    // The net::post is required, not just an optimization alongside the
+    // stopping_ check below: binding run_sig_ directly inside co_spawn
+    // would let a stop() already queued on strand_ abort run() before its
+    // body executes a single line. Posting the bind onto strand_ instead
+    // orders it after any pending stop(), so run() always starts from a
+    // fresh, uncancelled state.
     template <typename CompletionHandler>
     void start(CompletionHandler&& on_done) {
         net::post(strand_, [this, on_done = std::forward<CompletionHandler>(on_done)]() mutable {
@@ -192,19 +164,15 @@ class VenueSession {
         net::post(strand_, [this] {
             stopping_ = true;
             run_sig_.emit(net::cancellation_type::terminal);
-            // A plain range-for is safe here only because the fetches'
-            // completion handler (see execute_action()'s RequestSnapshot
-            // branch) defers its snapshot_sigs_.erase() with its own
-            // net::post rather than erasing inline: emit() can
+            // A plain range-for is safe here only because emit() can
             // synchronously resume the cancelled operation to completion
-            // (confirmed for the WS read/timer case, not specifically
+            // (confirmed for the WS read/timer case; not specifically
             // ruled out for the http_get resolve/connect/read chain a
-            // snapshot fetch runs through), and a `cancellation_signal`
-            // can't be copied or moved out of harm's way first - the only
-            // thing that actually keeps this loop safe against a
-            // reentrant erase of *any* node (not just the one currently
-            // being visited) is that nothing can erase from snapshot_sigs_
-            // while this task is still running on the strand.
+            // snapshot fetch runs through), and its completion handler
+            // (execute_action()'s RequestSnapshot branch) defers
+            // snapshot_sigs_.erase() with its own net::post instead of
+            // erasing inline - nothing can mutate snapshot_sigs_ while
+            // this loop is still walking it.
             for (auto& sig : snapshot_sigs_) sig.emit(net::cancellation_type::terminal);
         });
     }
@@ -219,20 +187,15 @@ class VenueSession {
     net::awaitable<void> run() {
         int attempt = 0;
         while (true) {
-            // Defense in depth, not the primary guard against "stop()
-            // before this coroutine has properly started" - start() itself
-            // already refuses to spawn run() at all once stopping_ is set
-            // (see there for why: emitting on an already-bound-but-never-
-            // resumed coroutine aborts it before this line would ever run
-            // anyway). This check exists for whatever narrow window, if
-            // any, sits between run()'s first resumption actually
-            // beginning and that same abort taking effect.
+            // Defense in depth, not the primary guard: start() already
+            // refuses to spawn run() at all once stopping_ is set. This
+            // covers whatever narrow window sits between run()'s first
+            // resumption and that abort taking effect.
             if (stopping_) co_return;
 
-            // Set once connect+subscribe succeed (below), read again just
-            // before the backoff decision past the catch - see there for
-            // why this isn't reset to 0 optimistically right here the way
-            // `attempt` itself used to be.
+            // Set only once connect+subscribe succeed (below); read again
+            // near the backoff decision past the catch, which is what
+            // decides whether this connection counted as healthy.
             std::optional<std::chrono::steady_clock::time_point> connected_at;
 
             try {
@@ -259,67 +222,44 @@ class VenueSession {
                     }
                 }
             } catch (const std::exception&) {
-                // The inner while(true) above has no break/return of its
-                // own, so the only way this try block is ever left is
-                // through this catch - connect failed, the read loop
-                // threw, or a coroutine we co_await'ed inside it did.
-                // Either way the connection is gone and every symbol it
-                // carried is now untrustworthy; co_await isn't allowed
-                // inside a catch handler itself (coroutine suspension
-                // can't interleave with unwinding), so invalidation
-                // happens once, unconditionally, right below instead of
-                // behind a "did we actually disconnect" flag that would
-                // never actually be false here. stop()'s terminal
-                // cancellation surfaces exactly the same way
-                // (connection.read() throwing operation_aborted), which is
-                // why it's stopping_ - not a separate exception type -
-                // that tells the two apart below.
+                // The only way out of the try block above (connect
+                // failure, a thrown read, or stop()'s terminal
+                // cancellation surfacing as connection.read() throwing
+                // operation_aborted). Either way the connection is gone,
+                // so invalidation below runs unconditionally; stopping_,
+                // not the exception type, is what tells a real drop apart
+                // from stop() below.
             }
 
             // Must happen here, in run()'s own frame, immediately before
-            // the call - not as invalidate_all()'s own first statement.
-            // Verified the hard way: entering *any* nested co_await'ed
-            // coroutine while the caller's ambient cancellation state is
-            // already latched throws immediately, before the callee's own
-            // body - including a reset sitting at its top - ever runs. A
-            // "self-resetting helper" looks structurally safer but doesn't
-            // actually work under Boost.Asio's cancellation model; see
-            // docs/ingestion_design.md 第 10 節第 2 項 for the full account
-            // of both directions of this mistake.
+            // the call - not inside invalidate_all() itself. Entering any
+            // nested co_await'ed coroutine while the ambient cancellation
+            // state is already latched throws before the callee's body
+            // runs at all, so a reset at the top of the callee is too
+            // late under Boost.Asio's cancellation model.
             co_await net::this_coro::reset_cancellation_state();
             try {
                 co_await invalidate_all();
             } catch (const std::exception&) {
-                // invalidate_venue()/apply_*() only touch in-memory
-                // SymbolBook state and shouldn't normally throw, but if
-                // one ever does (e.g. bad_alloc), the stopping_ check and
-                // drain_pending_snapshots() below still have to run - an
-                // uncaught exception here would otherwise escape run()
-                // entirely, taking the "safe to destroy this session once
-                // on_done fires" contract with it while a snapshot fetch
-                // might still be in flight (第 7 節坑 2, again).
+                // invalidate_venue()/apply_*() only touch in-memory state
+                // and shouldn't normally throw, but if one ever does, the
+                // stopping_ check and drain_pending_snapshots() below
+                // still have to run - an uncaught exception here would
+                // escape run() entirely while a snapshot fetch might
+                // still be in flight.
             }
 
             if (stopping_) break;
 
-            // Only treat the connection that just ended as "was healthy" -
-            // and so reset the backoff counter back to a fresh start - if
-            // it actually stayed up for a while. connected_at is set only
-            // once connect+subscribe succeed above, so a failed connect
-            // attempt (connected_at still nullopt) never resets `attempt`
-            // either. Without this - `attempt = 0` unconditionally right
-            // after a successful connect, as this used to read - any tight
-            // connect-then-immediately-fail loop gets the fastest possible
-            // retry on every single cycle instead of backoff()'s intended
-            // escalation. That's reachable today via
-            // execute_actions_and_maybe_force_reconnect()'s should_force_
-            // reconnect() path (a code-review finding on that fix): a
-            // kTrustsConnectionOrder venue whose SymbolSync keeps reporting
-            // InvalidateVenue right after each reconnect would otherwise
-            // hammer the real exchange at a fixed ~1Hz forever instead of
-            // backing off. kMinHealthyUptime is deliberately generous
-            // rather than tuned - see backoff()'s own comment on its
-            // numbers being provisional.
+            // Only reset the backoff counter if the connection that just
+            // ended actually stayed up for a while (connected_at is set
+            // only once connect+subscribe succeed, so a failed connect
+            // never resets `attempt` either). Resetting unconditionally on
+            // every successful connect would let a venue that force-
+            // reconnects right after every connect (e.g. a
+            // kTrustsConnectionOrder venue whose SymbolSync keeps
+            // reporting InvalidateVenue) hammer the exchange at a fixed
+            // rate instead of backing off.
             if (connected_at && std::chrono::steady_clock::now() - *connected_at >= kMinHealthyUptime) {
                 attempt = 0;
             }
@@ -328,34 +268,26 @@ class VenueSession {
                 co_await backoff(attempt);
             } catch (const std::exception&) {
                 // stop() cancelled the backoff wait itself (no connection
-                // was even open to drop) - fall through to the stopping_
-                // check below instead of looping back to reconnect. Without
-                // this, a stop() that lands mid-backoff would be silently
-                // ignored: the timer is what stop() actually cancelled, so
-                // if this exception weren't caught here it would escape
-                // run() entirely and skip draining snapshot_sigs_ below.
+                // was open to drop) - fall through to the stopping_ check
+                // below instead of looping back to reconnect. Left
+                // uncaught, this would escape run() entirely and skip
+                // draining snapshot_sigs_ below.
             }
             if (stopping_) break;
         }
 
         // Only reachable via stopping_, so this is the one place run()
-        // returns for good rather than looping back to reconnect. A
-        // handle_request_snapshot() spawned before stop() was called may
-        // still be in flight (see execute_action()'s RequestSnapshot
-        // branch) - it was handed the same cancellation treatment as the
-        // read/backoff above, but until it has actually unwound, its
-        // coroutine frame still holds a `this` pointing at this session.
-        // Returning before it drains would let whatever destroys this
-        // session next (IngestionRunner::stop_all()'s caller) do so while
-        // that frame is still pending - the exact use-after-free
-        // docs/ingestion_design.md's 第 7 節坑 2 already describes, just at
-        // a different trigger.
-        // run_sig_ has already emit()ed terminal by this point (that's how
-        // we got here), which - as established above - leaves the ambient
-        // cancellation state latched. The reset has to happen here, in
-        // run()'s own frame, immediately before this call - resetting
-        // inside drain_pending_snapshots() itself would be too late, for
-        // the same reason explained at the reset above.
+        // returns for good. A handle_request_snapshot() spawned before
+        // stop() may still be in flight - its coroutine frame holds a
+        // `this` pointing at this session until it unwinds, so returning
+        // before it drains would let whatever destroys this session next
+        // do so while that frame is still pending.
+        //
+        // run_sig_'s terminal emit() (that's how this point is reached)
+        // leaves the ambient cancellation state latched, so the reset must
+        // happen here, in run()'s own frame, immediately before this call -
+        // resetting inside drain_pending_snapshots() itself would be too
+        // late (see the same reset earlier in this function).
         co_await net::this_coro::reset_cancellation_state();
         co_await drain_pending_snapshots();
     }
@@ -402,68 +334,42 @@ class VenueSession {
         co_return gap_detected;
     }
 
-    // Executes `actions`, then - only for a SequencePolicy that trusts the
-    // WebSocket connection's own ordering to deliver its snapshot as the
-    // first message (kTrustsConnectionOrder) - forces this whole
-    // connection to drop and reconnect if any of them was InvalidateVenue.
-    //
-    // Why this is necessary: a Live-state gap (on_depth_update()) or a
-    // book-level rejection (execute_action()'s apply_failed branch) both
-    // reset the affected SymbolSync back to Buffering, but on_connected()
-    // is the only thing that ever re-requests a snapshot - and
-    // kTrustsConnectionOrder implies kSnapshotViaRest == false in this
-    // codebase (see symbol_sync.hpp's own doc comment), so RequestSnapshot
-    // on an already-open connection is a no-op. Without a genuine
-    // reconnect, this symbol would buffer live events forever and never
-    // resync (docs/ingestion_design.md 第 10 節第 8 項). A
-    // kTrustsConnectionOrder == false venue (Binance) keeps its own, less
-    // severe version of this limitation for now - its RequestSnapshot
-    // really does perform a REST fetch, so a future fix there can retry in
-    // place rather than tearing down the whole connection; that's out of
-    // scope here.
-    //
-    // Throwing rather than adding a dedicated SyncAction: this reuses
-    // run()'s existing reconnect machinery (backoff, invalidate_all() for
-    // every symbol this connection covers) verbatim - a
-    // kTrustsConnectionOrder venue's resync degrading to "reconnect the
-    // whole session" is already what a real disconnect does, and this is
-    // the same situation: one ordered stream per connection is the whole
-    // premise kTrustsConnectionOrder relies on, so every other symbol
-    // sharing this connection needs the same fresh start.
-    //
-    // Re-requests a snapshot directly for a kTrustsConnectionOrder == false
-    // venue after a gap, since nothing else ever would: VenueSession never
-    // forces a reconnect for these venues (see the kTrustsConnectionOrder
-    // == true branch at each caller below), and on_connected() - the only
-    // other thing that ever emits RequestSnapshot - only fires on a *real*
-    // reconnect, which a gap alone doesn't trigger. Mirrors on_connected()'s
-    // own "Buffering and not yet requested" logic directly rather than
-    // SymbolSync hand-writing a second copy of that same rule internally (a
-    // /code-review finding on an earlier version of this fix, where
-    // SymbolSync::handle_gap() itself branched on kTrustsConnectionOrder -
-    // moved here so this is the *only* place that decision is made, not
-    // split across two files/abstraction levels, which is what let a
-    // fourth trigger point for this same bug class, the apply_failed
-    // resync below, fall through the cracks when the other three were
-    // fixed - see docs/ingestion_design.md).
+    // The kTrustsConnectionOrder == false counterpart to
+    // execute_actions_and_maybe_force_reconnect()'s forced-reconnect
+    // branch below: re-requests a snapshot directly, since VenueSession
+    // never forces a reconnect for these venues and on_connected() - the
+    // only other thing that emits RequestSnapshot - only fires on a real
+    // reconnect. Mirrors on_connected()'s own "Buffering and not yet
+    // requested" logic; that decision belongs only here (and in
+    // execute_action()'s apply_failed branch below) - SymbolSync must not
+    // duplicate it internally.
     net::awaitable<void> resync_rest_venue_after_gap(const NativeSymbol& symbol) {
         if (auto it = symbol_syncs_.find(symbol); it != symbol_syncs_.end()) {
             co_await execute_actions(symbol, it->second.on_connected());
         }
     }
 
-    // Only usable by a caller that's directly co_await'ed from inside
-    // run()'s own try block (dispatch_snapshot()/dispatch_depth_update()) -
-    // the thrown exception needs run()'s try/catch to actually reach it.
-    // handle_request_snapshot() runs detached (net::co_spawn, not
-    // co_await'ed by run() - see execute_action()'s RequestSnapshot
-    // branch), so it can't use this: a throw there would only reach its own
-    // completion handler, which logs and discards it rather than
-    // forwarding it anywhere run() would see. It has its own near-identical
-    // wrapper below that emits instead of throwing for the
-    // kTrustsConnectionOrder == true case, but shares
-    // resync_rest_venue_after_gap() for the other one - see there for why
-    // that part isn't split in two either.
+    // Executes `actions`, then - only for a SequencePolicy that trusts the
+    // WebSocket connection's own ordering to deliver its snapshot as the
+    // first message (kTrustsConnectionOrder) - forces this whole
+    // connection to drop and reconnect if any of them was InvalidateVenue.
+    // Necessary because on_connected() is the only thing that ever
+    // re-requests a snapshot, and kTrustsConnectionOrder implies
+    // kSnapshotViaRest == false (see symbol_sync.hpp), so RequestSnapshot
+    // on an already-open connection is a no-op: without a genuine
+    // reconnect, a gapped symbol would buffer live events forever.
+    //
+    // Throws rather than adding a dedicated SyncAction so this reuses
+    // run()'s existing reconnect machinery verbatim - every symbol sharing
+    // this connection needs the same fresh start a real disconnect gives
+    // them, since one ordered stream per connection is the whole premise
+    // kTrustsConnectionOrder relies on.
+    //
+    // Only usable by a caller directly co_await'ed from inside run()'s own
+    // try block (dispatch_snapshot()/dispatch_depth_update()) - the throw
+    // needs run()'s try/catch to reach it. handle_request_snapshot() runs
+    // detached, so it can't use this; it has its own near-identical
+    // wrapper below that emits instead of throwing.
     net::awaitable<void> execute_actions_and_maybe_force_reconnect(const NativeSymbol& symbol,
                                                                      std::vector<SyncAction> actions) {
         bool gap_detected = co_await execute_actions(symbol, std::move(actions));
@@ -501,46 +407,38 @@ class VenueSession {
     // and handle_request_snapshot()).
     net::awaitable<bool> execute_action(const NativeSymbol& symbol, SyncAction action) {
         if (std::holds_alternative<RequestSnapshot>(action)) {
-            // Spawned rather than co_await'ed: the snapshot fetch can take
-            // a while, and the whole point of buffering is that live
-            // events keep being read and buffered *while it's in flight*,
-            // not only after it returns. Awaiting it inline here would
-            // starve the read loop below until the fetch completed, so
-            // on_snapshot() would always find an empty buffer and nothing
-            // to bridge with - see docs/ingestion_design.md.
+            // Spawned rather than co_await'ed: buffering only works if
+            // live events keep being read *while the fetch is in flight*.
+            // Awaiting it inline here would starve the read loop below
+            // until the fetch completed, so on_snapshot() would always
+            // find an empty buffer.
             //
-            // Don't start a new one once stop() has been requested: a
-            // fetch begun after that point would just be one more thing
-            // drain_pending_snapshots() has to wait out below, for no
-            // benefit (its result can never reach a live connection).
+            // Don't start a new one once stop() has been requested: its
+            // result could never reach a live connection, so it would
+            // just be one more thing drain_pending_snapshots() waits out.
             if (stopping_) co_return false;
 
             // Its own cancellation_signal, not run_sig_: a
             // cancellation_slot only forwards to the most recently bound
             // operation, so sharing run_sig_ here would silently steal
             // run()'s own cancellation registration the moment a second
-            // snapshot fetch (a second symbol also gapped, say) was
-            // spawned - and clobber it again for every fetch after that.
-            // snapshot_sigs_ is a std::list so this iterator - captured
-            // below for the fetch's own completion handler to erase itself
-            // with - stays valid across insertions/erasures of every other
-            // element.
+            // snapshot fetch was spawned, and clobber it again for every
+            // fetch after that. snapshot_sigs_ is a std::list so this
+            // iterator, captured below for the fetch's own completion
+            // handler to erase itself with, stays valid across
+            // insertions/erasures of every other element.
             auto sig_it = snapshot_sigs_.emplace(snapshot_sigs_.end());
             auto executor = co_await net::this_coro::executor;
             net::co_spawn(
                 executor, handle_request_snapshot(symbol),
                 net::bind_cancellation_slot(sig_it->slot(), [this, sig_it](std::exception_ptr e) {
                     // Deferred via net::post, not erased inline: this
-                    // handler runs on strand_ (same as everything else
-                    // here - see execute_action()'s own executor lookup
-                    // above), and stop()'s emit() loop over snapshot_sigs_
-                    // can synchronously resume this very coroutine to
-                    // completion. Erasing sig_it reentrant, mid-loop,
-                    // would mutate the list stop() (or a sibling
-                    // completion handler) is still walking. Posting the
-                    // erase guarantees it only runs once the current
-                    // strand task has fully finished - snapshot_sigs_ is
-                    // then never mutated while anything is iterating it.
+                    // handler runs on strand_, and stop()'s emit() loop
+                    // over snapshot_sigs_ can synchronously resume this
+                    // very coroutine to completion. Erasing sig_it
+                    // reentrantly, mid-loop, would mutate the list stop()
+                    // is still walking; posting the erase guarantees it
+                    // only runs once the current strand task has finished.
                     net::post(strand_, [this, sig_it] { snapshot_sigs_.erase(sig_it); });
                     log_exception("venue_session", "snapshot fetch failed", e);
                 }));
@@ -549,28 +447,20 @@ class VenueSession {
 
         // RequestSnapshot returned above before reaching here. Everything
         // below is synchronous (SymbolBook's own methods never suspend),
-        // so this visitor is a plain function, not a coroutine - it must
-        // not be declared to return net::awaitable<void>, since with no
-        // co_await/co_return in its body it would fall off the end
-        // without ever actually producing one (this was the real cause of
-        // a SIGTRAP: Clang traps on falling off the end of a non-void,
-        // non-coroutine function instead of silently returning garbage).
+        // so this visitor must stay a plain function, not be declared to
+        // return net::awaitable<void>: with no co_await/co_return in its
+        // body it would fall off the end without producing one, which
+        // traps (SIGTRAP) rather than silently returning garbage.
         //
         // `apply_failed`, set inside the visitor and checked after it
-        // returns, is how a book-level rejection reaches the resync logic
-        // below without needing the visitor itself to co_await anything -
-        // a book rejecting a level (malformed venue data, not a sequence
-        // gap SymbolSync itself would have already caught) used to have
-        // its std::expected<void, std::errc> result silently discarded
-        // here (a code-review finding). ApplySnapshot and ApplyDelta both
-        // route through a single book call (apply_snapshot()/apply_batch())
-        // that validates every level across both bids and asks before
-        // applying any of them - a rejection here means nothing from this
-        // action was applied, not a harder-to-detect case of one side
-        // silently landing while the other didn't (ApplySnapshot used to
-        // be two independent per-side calls, which could do exactly that;
-        // see AggregateOrderBook::apply_snapshot()'s own doc comment for
-        // why it no longer can).
+        // returns, is how a book-level rejection (malformed venue data,
+        // not a sequence gap SymbolSync would have already caught) reaches
+        // the resync logic below without the visitor itself co_awaiting
+        // anything. apply_snapshot()/apply_batch() each validate every
+        // level across both sides before applying any of them, so a
+        // rejection here means nothing from this action was applied - not
+        // a case of one side landing while the other didn't (see
+        // AggregateOrderBook::apply_snapshot()'s own doc comment).
         //
         // Captured before std::visit() below moves out of `action`:
         // holds_alternative() only inspects the active alternative, not the
@@ -604,46 +494,27 @@ class VenueSession {
         if (!apply_failed) co_return is_invalidate;
 
         // A rejected level means this venue's data for `symbol` can no
-        // longer be trusted - same reasoning as a lost connection (see
-        // AggregateOrderBook::invalidate_venue()'s own doc comment), so
-        // this goes through SymbolSync::on_disconnected() exactly like a
-        // real drop does - it stays a plain InvalidateVenue either way;
-        // what a kTrustsConnectionOrder == false venue does in response
-        // (re-request a snapshot, since the connection is presumably
-        // still up and no reconnect is coming to trigger one otherwise) is
+        // longer be trusted, so this goes through
+        // SymbolSync::on_disconnected() exactly like a real drop does.
+        // What a kTrustsConnectionOrder == false venue does in response is
         // decided once, centrally, by resync_rest_venue_after_gap() at the
-        // outermost caller below - not duplicated into SymbolSync itself
-        // (see that method's own comment for why: splitting the decision
-        // across both files is exactly what let this trigger point go
-        // unfixed the first two times this same bug class got fixed).
-        // Logged here, not inside the visitor, since std::cerr is fine to
-        // call from a plain function but this project's convention (see
-        // log_exception) is to keep I/O out of the visitor itself.
+        // outermost caller below - not duplicated into SymbolSync itself.
+        // Logged here, not inside the visitor, to keep I/O out of it (see
+        // log_exception).
         std::cerr << "[venue_session] " << symbol
                   << ": rejected level(s) from this venue (malformed data) - invalidating and "
                      "resyncing\n";
         // Recurses into execute_action() exactly one level deep, not
         // further: on_disconnected() only ever returns {InvalidateVenue{}},
-        // and InvalidateVenue's own branch above never sets apply_failed,
-        // so this nested execute_actions() call can't loop back into this
-        // same resync path again. Routed through the plain execute_actions()
-        // (which reports whether this nested resync was itself an
-        // InvalidateVenue - on_disconnected() always is), not the throwing
+        // whose own branch above never sets apply_failed. Routed through
+        // the plain execute_actions(), not the throwing
         // execute_actions_and_maybe_force_reconnect(): this call can be
         // reached partway through the *outer* batch execute_actions() is
-        // still iterating (e.g. this rejection was action 1 of 3 in a
-        // snapshot-bridge batch) - throwing here would abort that outer
-        // loop and skip whatever's still queued after this action, even
-        // though it was already fully computed as valid, contiguous data
-        // by SymbolSync before any of this ran (a real bug a second
-        // /code-review pass caught: throwing from inside a mid-batch nested
-        // call silently dropped the batch's remaining actions). Instead,
-        // this just reports the gap upward like any other action would, and
-        // the outermost caller (whichever of
-        // execute_actions_and_maybe_force_reconnect()/
-        // handle_request_snapshot() started the whole batch) decides once,
-        // after every action in it has actually run, whether to force a
-        // reconnect or (kTrustsConnectionOrder == false) resync in place.
+        // still iterating, and throwing here would abort that outer loop
+        // and drop whatever's still queued after this action. Instead this
+        // just reports the gap upward, and the outermost caller decides
+        // once, after every action in the batch has run, whether to force
+        // a reconnect or resync in place.
         if (auto it = symbol_syncs_.find(symbol); it != symbol_syncs_.end()) {
             bool nested_gap = co_await execute_actions(symbol, it->second.on_disconnected());
             co_return nested_gap;
@@ -658,43 +529,30 @@ class VenueSession {
     // the WebSocket instead, this is a no-op - nothing to fetch.
     //
     // `symbol` is taken *by value*, not by reference: this coroutine is
-    // handed to co_spawn() (see execute_action()) rather than co_await'ed
-    // directly, so it outlives its caller's stack/coroutine frame - a
-    // reference parameter would dangle the moment that caller's frame is
-    // destroyed, which happens well before this resumes from the
-    // `co_await fetch(...)` below (the fetch takes real time; the caller
-    // returns almost immediately after spawning it). Caught the hard way:
-    // this was a genuine use-after-free that surfaced as a SIGTRAP crash.
+    // handed to co_spawn() rather than co_await'ed directly, so it outlives
+    // its caller's coroutine frame - a reference parameter would dangle
+    // once that frame is destroyed, well before this resumes from
+    // `co_await fetch(...)` below.
     net::awaitable<void> handle_request_snapshot(NativeSymbol symbol) {
         if constexpr (!Feed::kSnapshotViaRest) {
             co_return;
         } else {
             auto spec = feed_.snapshot_request(symbol);
             std::expected<std::string, std::errc> body;
-            // Retries the fetch itself in place - same connection, no WS
-            // involvement at all - rather than giving up after one failure.
-            // The comment this replaced ("next reconnect or steady-state
-            // gap retries") was wrong: kSnapshotViaRest == true only pairs
-            // with kTrustsConnectionOrder == false in this codebase (see
-            // symbol_sync.hpp's own doc comment), and for that combination
-            // the symbol never reaches Live at all if its very first
-            // snapshot fetch fails - on_depth_update() while Buffering just
-            // buffers, with no gap check of any kind (that check only
-            // exists in the Live branch), so "steady-state gap retries"
-            // can't ever fire, and nothing but an unrelated transport-level
-            // disconnect would ever re-request. Caught by another session
-            // working on a related connection-event/book-validity design
-            // question, not by any test in this file.
+            // Retries the fetch itself in place (same connection, no WS
+            // involvement) rather than giving up after one failure: if
+            // this very first snapshot fetch fails, the symbol never
+            // reaches Live at all (on_depth_update() while Buffering just
+            // buffers, with no gap check), so nothing but an unrelated
+            // transport-level disconnect would otherwise ever re-request.
             //
             // Deliberately not run_sig_.emit() (the kTrustsConnectionOrder
             // == true treatment below): kSnapshotViaRest == true implies
-            // kTrustsConnectionOrder == false for every venue that can even
-            // reach this branch, and a REST venue's fix for a failed fetch
-            // is to retry in place, not tear down the whole connection (and
-            // every other symbol sharing it) over one HTTP failure. Reusing backoff()
-            // (the same helper run()'s own reconnect loop uses) keeps this
-            // consistent with that connection-level shape rather than
-            // inventing a second one.
+            // kTrustsConnectionOrder == false for every venue that reaches
+            // this branch, and a REST venue's fix for a failed fetch is to
+            // retry in place, not tear down the whole connection over one
+            // HTTP failure. Reuses backoff(), the same helper run()'s own
+            // reconnect loop uses.
             for (int attempt = 0;; ++attempt) {
                 if (stopping_) co_return;
                 body = co_await fetch(spec.host, spec.port, spec.target);
@@ -703,14 +561,11 @@ class VenueSession {
             }
 
             // stop() emits on this fetch's own cancellation_signal too
-            // (see stop()), but per-op cancellation for the resolve/
-            // connect/read chain fetch() runs through hasn't been
-            // specifically verified the way the WS read/timer path has -
-            // if it doesn't land before this response arrives, this
-            // result must still be discarded rather than applied:
+            // (see stop()), but if that cancellation doesn't land before
+            // this response arrives, the result must still be discarded:
             // invalidate_all() may have already invalidated this venue's
-            // contribution for this exact shutdown, and applying a
-            // snapshot after that would silently revive it.
+            // contribution for this shutdown, and applying a snapshot
+            // after that would silently revive it.
             if (stopping_) co_return;
 
             auto snapshot = feed_.parse_snapshot_response(symbol, *body);
@@ -719,39 +574,26 @@ class VenueSession {
             auto it = symbol_syncs_.find(symbol);
             if (it == symbol_syncs_.end()) co_return;
             // Can't use execute_actions_and_maybe_force_reconnect() here -
-            // that throws to reach run()'s try/catch, but this coroutine is
-            // net::co_spawn'ed detached (see execute_action()'s
-            // RequestSnapshot branch), not co_await'ed by run(). A throw
-            // here would only reach this spawn's own completion handler
-            // (execute_action() above), which logs and discards it - it was
-            // never actually reaching run() at all (a bug a second
-            // /code-review pass caught: the comment this replaced claimed
-            // this path was covered, but nothing here ever forwarded the
-            // exception anywhere that would force a reconnect).
+            // it throws to reach run()'s try/catch, but this coroutine is
+            // net::co_spawn'ed detached, not co_await'ed by run(). A throw
+            // here would only reach this spawn's own completion handler,
+            // which logs and discards it rather than forcing a reconnect.
             //
-            // A no-op today either way for the kTrustsConnectionOrder ==
-            // true branch (kSnapshotViaRest == true never pairs with
-            // kTrustsConnectionOrder == true in this codebase, so
-            // gap_detected is always false here) - but on_snapshot() can
-            // return InvalidateVenue from its own bridge-tail gap check,
-            // not just on_depth_update()'s Live-state one, so a future
-            // venue combining both flags needs this to actually work, not
-            // just look like it does. The kTrustsConnectionOrder == false
-            // branch is very much live, though: this is exactly how a gap
-            // discovered while resyncing (not just the plain first-time
-            // fetch above) gets a *second* snapshot fetch requested for a
-            // REST venue.
+            // A no-op today for the kTrustsConnectionOrder == true branch
+            // (that combination never occurs in this codebase, so
+            // gap_detected is always false here), kept working anyway for
+            // a future venue that combines both flags. The
+            // kTrustsConnectionOrder == false branch is live: this is how
+            // a gap discovered while resyncing gets a second snapshot
+            // fetch requested for a REST venue.
             bool gap_detected = co_await execute_actions(symbol, it->second.on_snapshot(std::move(*snapshot)));
             if (!gap_detected) co_return;
             if constexpr (Policy::kTrustsConnectionOrder) {
                 // Same outcome as the thrown exception at every other call
-                // site (abort the in-flight read/backoff wait, land in
-                // run()'s catch, invalidate_all(), backoff, reconnect)
-                // reached the other way: this coroutine runs on strand_
-                // itself (spawned via the executor obtained in
-                // execute_action(), which is strand_'s own executor there),
-                // the same strand stop() emits run_sig_ from - so emitting
-                // directly here, with no net::post needed, is exactly as
+                // site, reached the other way: this coroutine runs on
+                // strand_ itself (the executor it was spawned with, in
+                // execute_action()), the same strand stop() emits
+                // run_sig_ from - so emitting directly here is exactly as
                 // safe as stop()'s own emit() call.
                 run_sig_.emit(net::cancellation_type::terminal);
             } else {
@@ -766,9 +608,8 @@ class VenueSession {
     // as backoff()'s own numbers below.
     static constexpr std::chrono::seconds kMinHealthyUptime{10};
 
-    // Exponential-ish backoff with jitter before a reconnect attempt.
-    // Shape (per-connection, jittered) is settled; the exact numbers below
-    // are provisional - see docs/ingestion_design.md's open items.
+    // Exponential-ish backoff with jitter before a reconnect attempt. The
+    // exact numbers below are provisional.
     net::awaitable<void> backoff(int attempt) {
         auto base_ms = std::min(30'000, 500 * (1 << std::min(attempt, 6)));
         thread_local std::mt19937 rng(std::random_device{}());
@@ -780,30 +621,20 @@ class VenueSession {
         co_await timer.async_wait(net::use_awaitable);
     }
 
-    // Polls until every in-flight handle_request_snapshot() spawned by
-    // execute_action() has actually unwound. stop() cancels them, but
-    // cancellation only takes effect at their next suspension point - this
-    // is what run() awaits before actually returning, so the caller of
-    // start()'s on_done never sees "done" while one of those coroutines
-    // still holds a `this` pointing at this session. A short poll rather
-    // than a proper async event/condition variable: these fetches are
-    // single HTTP GETs already being cancelled, so the wait is expected to
-    // be at most a couple of poll ticks, and this session has no other use
-    // for a general-purpose async wait primitive.
+    // Polls until every in-flight handle_request_snapshot() has unwound.
+    // stop() cancels them, but cancellation only takes effect at their
+    // next suspension point, so run() awaits this before returning - the
+    // caller of start()'s on_done must never see "done" while one of those
+    // coroutines still holds a `this` pointing at this session. A short
+    // poll rather than an event/condition variable: these are single HTTP
+    // GETs already being cancelled, so the wait is at most a couple of
+    // ticks. Caller (run()) must reset the ambient cancellation state
+    // immediately before calling this. net::redirect_error on each poll
+    // wait besides, as a second line of defense in case a stop() lands
+    // during this loop.
     //
-    // Caller (run()) must reset the ambient cancellation state immediately
-    // before calling this - see the comment on that call. net::redirect_error
-    // on each poll wait besides, as a second line of defense: if a future
-    // stop() lands *during* this loop (unlikely - stopping_ is already
-    // true and nothing schedules another emit - but not provably
-    // impossible), an aborted poll tick just becomes an immediate
-    // re-check instead of an unhandled throw escaping run() before
-    // snapshot_sigs_ is actually drained.
-    //
-    // snapshot_sigs_.empty() is the drain condition directly - no separate
-    // counter alongside it. A counter incremented/decremented at the exact
-    // same two call sites as this list's insert/erase would just be a
-    // second piece of state that could drift out of sync with it.
+    // snapshot_sigs_.empty() is the drain condition directly, not a
+    // separate counter that could drift out of sync with it.
     net::awaitable<void> drain_pending_snapshots() {
         while (!snapshot_sigs_.empty()) {
             auto executor = co_await net::this_coro::executor;

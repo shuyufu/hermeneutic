@@ -39,7 +39,7 @@ struct SnapshotMessage {
 
 // Actions SymbolSync emits for its driver to actually carry out -
 // SymbolSync itself never touches a socket, a timer, or SymbolBook
-// directly. See docs/ingestion_design.md for the full design.
+// directly.
 struct RequestSnapshot {};
 
 struct ApplySnapshot {
@@ -75,12 +75,10 @@ using SyncAction = std::variant<RequestSnapshot, ApplySnapshot, ApplyDelta, Inva
 //     every diff (kSnapshotViaRest == false in practice - see
 //     venue_session.hpp); false for a venue whose snapshot arrives via a
 //     separate REST call raced against the already-flowing diff stream.
-//     Governs on_snapshot()'s empty-buffer branch below - see there for why
-//     this needs to exist at all.
+//     Governs on_snapshot()'s empty-buffer branch below.
 // Everything else here is venue-agnostic; see
 // exchange/binance/binance_futures_sequence_policy.hpp's
-// BinanceFuturesSequencePolicy for the concrete USDS-M Futures predicates
-// this was designed against.
+// BinanceFuturesSequencePolicy for a concrete example.
 template <typename SequencePolicy>
 class SymbolSync {
   public:
@@ -149,65 +147,39 @@ class SymbolSync {
             // message on an ordered connection (SequencePolicy::
             // kTrustsConnectionOrder), an *empty* buffer here isn't a gap -
             // it's the expected, common case: the snapshot IS the first
-            // thing this symbol has ever seen, so there was never anything
-            // to buffer in the first place. Trust transport order and go
+            // thing this symbol has ever seen. Trust transport order and go
             // live directly from the snapshot. A *non-empty* buffer that
-            // still doesn't bridge is still treated as a real gap below
-            // (some event arrived despite the snapshot supposedly being
-            // first - genuinely unexpected for this kind of venue, not
-            // something to silently paper over).
+            // still doesn't bridge is still a real gap below (some event
+            // arrived despite the snapshot supposedly being first).
             //
             // Without this branch, a venue like this would never leave
-            // Buffering at all: kSnapshotViaRest is false for these venues
-            // (see venue_session.hpp), so the RequestSnapshot this would
-            // otherwise return is a no-op - nothing would ever re-request,
-            // and every subsequent depth update would buffer forever
-            // instead of applying. Caught by a test
-            // (SnapshotArrivingBeforeAnyBufferedEventGoesLiveDirectly) that
-            // fails without this, not found by inspection - every existing
-            // SymbolSync test drove events in Binance's REST-race order
-            // (on_depth_update() before on_snapshot()), which never
-            // exercises an empty buffer at snapshot time.
+            // Buffering: kSnapshotViaRest is false for these venues (see
+            // venue_session.hpp), so the RequestSnapshot this would
+            // otherwise return is a no-op, and every subsequent depth
+            // update would buffer forever instead of applying.
             if constexpr (SequencePolicy::kTrustsConnectionOrder) {
                 if (nothing_was_ever_buffered) {
                     last_final_id_ = snapshot.last_update_id;
                     state_ = State::Live;
                     // Not `return {ApplySnapshot{std::move(...)}};` - same
-                    // reasoning as on_depth_update()'s own comment above:
-                    // a braced initializer-list forces a copy of
-                    // snapshot.bids/asks here too, and this snapshot is a
-                    // full order book (hundreds to thousands of levels in
-                    // practice), not one diff's worth - the wasted copy is
-                    // much larger per occurrence than on_depth_update()'s,
-                    // even though this branch only runs once per connection.
+                    // reasoning as on_depth_update()'s own comment above,
+                    // and the wasted copy is larger here: a snapshot is a
+                    // full order book, not one diff's worth.
                     std::vector<SyncAction> actions;
                     actions.emplace_back(ApplySnapshot{std::move(snapshot.bids), std::move(snapshot.asks)});
                     return actions;
                 }
-                // A *non-empty* buffer that still doesn't bridge is the
-                // "genuinely unexpected" case flagged above - some event
-                // arrived despite this venue's ordering guarantee. Unlike
-                // kTrustsConnectionOrder == false (Binance), the plain
-                // RequestSnapshot retry below is a dead end here: it's a
-                // no-op for these venues (kSnapshotViaRest == false - see
-                // venue_session.hpp), so "stay in Buffering and ask for
-                // another one" would never actually get a fresh snapshot -
-                // this symbol would sit in Buffering forever with no
-                // further trigger short of an unrelated transport-level
-                // disconnect, the same "stuck forever" failure mode
-                // handle_gap()'s other two call sites exist to prevent
-                // (docs/ingestion_design.md 第 10 節第 8 項; caught by a
-                // second /code-review pass on this file's other two fixes,
-                // not by any test - the existing
-                // NonEmptyBufferThatDoesNotBridgeStillRetriesDespiteTrustingConnectionOrder
-                // test only ever checked SymbolSync's return value in
-                // isolation, never a driven-through-VenueSession scenario
-                // where that no-op RequestSnapshot's consequence would
-                // actually show up). Handled the same way as every other
-                // gap in this class: invalidate, reset, and keep whatever's
-                // left in `buffer_` around in case it bridges the *next*
-                // (post-reconnect) snapshot. buffer_.begin() erases
-                // nothing - the whole (post-drop-filter) buffer survives.
+                // A *non-empty* buffer that still doesn't bridge is a real
+                // gap - some event arrived despite this venue's ordering
+                // guarantee. The plain RequestSnapshot retry below is a
+                // dead end here: it's a no-op for these venues
+                // (kSnapshotViaRest == false - see venue_session.hpp), so
+                // this symbol must go through handle_gap() (force a real
+                // reconnect via VenueSession) instead of staying in
+                // Buffering forever waiting on a snapshot that never
+                // arrives. buffer_.begin() erases nothing - the whole
+                // (post-drop-filter) buffer survives, in case it bridges
+                // the *next* (post-reconnect) snapshot.
                 return handle_gap(buffer_.begin());
             }
             // No buffered event bridges this snapshot - either nothing
@@ -217,55 +189,37 @@ class SymbolSync {
             // bridge a fresher snapshot), ask for another one.
             return {RequestSnapshot{}};
         }
-        // For a policy whose sequence numbers only increase (Binance,
-        // Bybit), should_drop_buffered() already removed everything below
-        // the snapshot's coverage, so the first surviving event always
-        // either bridges or nothing does - bridge lands on buffer_.begin()
-        // whenever it's found at all. This is NOT a precondition the loop
-        // below actually depends on, though: applying from bridge onward
-        // and discarding anything before it (in arrival order) is correct
-        // regardless of bridge's position, because the snapshot itself is
-        // the authoritative state as of its own sequence number - anything
-        // buffered before the bridge event is superseded by the snapshot no
-        // matter why it didn't survive should_drop_buffered's own filter.
-        // This matters for a policy whose sequence numbers are explicitly
-        // NOT assumed monotonic (see exchange/okx/okx_sequence_policy.hpp's
-        // OkxSequencePolicy documented sequence-reset case): should_drop_buffered's numeric comparison
-        // can under-drop across a reset, leaving a stale earlier survivor
-        // in front of the real bridge - asserting bridge == begin() here
-        // would be a false alarm in a debug build (or, worse, would have
-        // silently been relied upon to always hold), not a real invariant
-        // violation. There used to be an assert(bridge == buffer_.begin())
-        // here for exactly that now-incorrect reason - removed rather than
-        // conditioned on a new policy trait, since the loop needs no such
-        // guarantee to behave correctly either way.
+        // Do not assert bridge == buffer_.begin() here. For a
+        // monotonic-sequence policy (Binance, Bybit) it always holds, but
+        // for a policy with a documented sequence-reset case (see
+        // exchange/okx/okx_sequence_policy.hpp's OkxSequencePolicy),
+        // should_drop_buffered's numeric comparison can under-drop across
+        // a reset and leave a stale earlier survivor in front of the real
+        // bridge. The loop below doesn't need bridge == begin() to be
+        // correct anyway: applying from bridge onward and discarding
+        // anything before it is correct regardless of bridge's position,
+        // since the snapshot is authoritative as of its own sequence
+        // number and supersedes everything buffered before the bridge.
 
         std::vector<SyncAction> actions;
         actions.emplace_back(ApplySnapshot{std::move(snapshot.bids), std::move(snapshot.asks)});
 
         // bridge itself is only guaranteed to bridge the *snapshot*
-        // (SequencePolicy::bridges_snapshot) - nothing guarantees it's
-        // contiguous with whatever buffered event follows it. Two events
-        // that both survived should_drop_buffered's numeric filter can
-        // still have a real gap between them (e.g. a message this
-        // SymbolSync never saw - dropped upstream, or a parse failure the
-        // driver's read loop skipped). Replaying the tail blindly would
-        // silently apply across that gap and leave last_final_id_ pointing
-        // past it, so every subsequent on_depth_update() is_contiguous()
-        // check would pass despite the missing update. Every tail event
-        // except bridge itself - which is validated by bridges_snapshot(),
-        // not is_contiguous() - must pass the same is_contiguous() check
-        // on_depth_update() applies in Live state; `it != bridge` is what
-        // skips that check for exactly (and only) the first iteration,
-        // letting one loop apply the whole tail instead of bridge getting
-        // its own separate, near-identical copy of the apply step above it.
+        // (SequencePolicy::bridges_snapshot), not to be contiguous with
+        // whatever buffered event follows it - two events that both
+        // survived should_drop_buffered's numeric filter can still have a
+        // real gap between them. Every tail event except bridge itself
+        // must pass the same is_contiguous() check on_depth_update()
+        // applies in Live state, or last_final_id_ would silently jump
+        // past a missing update; `it != bridge` skips that check for
+        // exactly the first iteration, letting one loop apply the whole
+        // tail instead of bridge needing its own separate apply step.
         for (auto it = bridge; it != buffer_.end(); ++it) {
             if (it != bridge && !SequencePolicy::is_contiguous(*it, last_final_id_)) {
                 // Same treatment as on_depth_update()'s Live-state gap
-                // branch (handle_gap()): invalidate, reset, and keep
-                // everything from this point on (including the
-                // gap-triggering event) buffered - it may still bridge the
-                // *next* snapshot.
+                // branch: invalidate, reset, and keep everything from this
+                // point on buffered - it may still bridge the *next*
+                // snapshot.
                 auto gap_actions = handle_gap(it);
                 actions.insert(actions.end(), std::make_move_iterator(gap_actions.begin()),
                                 std::make_move_iterator(gap_actions.end()));
@@ -293,34 +247,28 @@ class SymbolSync {
     enum class State { Buffering, Live };
 
     // Shared by on_depth_update()'s Live-state gap branch and both of
-    // on_snapshot()'s gap checks (no-bridge-with-a-non-empty-buffer, and
-    // bridge-tail) - all three need to invalidate, reset back to Buffering,
-    // and keep buffer_'s unresolved suffix around: it may still bridge the
-    // *next* snapshot. A single helper instead of each writing its own
-    // copy, so the three can't quietly drift out of sync on a future change
-    // to any one of them.
+    // on_snapshot()'s gap checks - all three invalidate, reset back to
+    // Buffering, and keep buffer_'s unresolved suffix around (it may still
+    // bridge the *next* snapshot) via a single helper so they can't drift
+    // out of sync on a future change to any one of them.
     //
-    // Takes an iterator *into buffer_ itself* - everything from
-    // `first_unresolved` onward is what survives, and it's kept by erasing
-    // the already-resolved prefix in place rather than building a separate
-    // vector to swap in. That's not just tidiness: a venue like Bybit hits
-    // this path as a routine, not rare, event (see the callers' own
-    // comments), so the allocation/copy a separate vector would cost on
-    // every occurrence is worth avoiding. on_depth_update()'s call site has
-    // nothing yet in buffer_ to erase a prefix of (buffer_ is always empty
-    // in Live state) - it pushes its one gap-triggering event in first,
-    // then passes buffer_.begin(), making the erase a no-op.
+    // Takes an iterator *into buffer_ itself* and erases the resolved
+    // prefix in place rather than building a separate vector to swap in:
+    // a venue like Bybit hits this path as a routine, not rare, event, so
+    // the allocation/copy a separate vector would cost is worth avoiding.
+    // on_depth_update()'s call site passes buffer_.begin() (buffer_ is
+    // always empty in Live state before it pushes its one gap-triggering
+    // event), making the erase a no-op there.
+    //
     // Deliberately venue-shape-agnostic: this class never decides what a
-    // gap *means* for the driver (force a reconnect? re-request a
-    // snapshot in place? both are wrong for the other venue shape - see
-    // docs/ingestion_design.md) - it only ever reports that one happened.
-    // VenueSession::maybe_resync_after_gap() is the one place that
-    // decision is made, for every trigger point (this one, plus
-    // on_disconnected() reached via a book-level rejection) - not split
-    // between here and there, which is exactly what let one of those
-    // trigger points fall through the cracks when the others were fixed
-    // (a /code-review finding on an earlier version of this function that
-    // did branch on SequencePolicy::kTrustsConnectionOrder here).
+    // gap *means* for the driver (force a reconnect vs. re-request a
+    // snapshot in place - both are wrong for the other venue shape) - it
+    // only ever reports that one happened. VenueSession is the one place
+    // that decision is made, for every trigger point (execute_actions_
+    // and_maybe_force_reconnect(), handle_request_snapshot(), and
+    // resync_rest_venue_after_gap() as the kTrustsConnectionOrder ==
+    // false counterpart both of those call) - not split between here and
+    // there.
     std::vector<SyncAction> handle_gap(std::vector<DepthUpdate>::iterator first_unresolved) {
         buffer_.erase(buffer_.begin(), first_unresolved);
         state_ = State::Buffering;

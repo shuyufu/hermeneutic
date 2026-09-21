@@ -10,58 +10,39 @@
 // pair plus which market it covers) and how that identity maps to each
 // venue's own wire format. Zero dependency beyond the standard library -
 // deliberately its own tier (like core/book), not folded into ingestion/,
-// so anything that needs to talk about symbols/venues (a CLI config
-// parser today, a future client-side config or REST surface tomorrow)
-// depends on this alone rather than pulling in gRPC/simdjson/Boost. See
-// docs/ingestion_design.md's OKX section for the naming-ambiguity problem
-// this exists to solve.
+// so anything that needs to talk about symbols/venues depends on this
+// alone rather than pulling in gRPC/simdjson/Boost.
 namespace bobby::hermeneutic::symbol {
 
 // Which market a book covers - the suffix on a BookId's human-readable form
 // ("BTC_USDT.SPOT"/"BTC_USDT.PERP", see to_string() below) and, transitively,
 // which of a venue's feeds native_symbol() below resolves to. Named to match
-// aggregator.proto's own MarketType enum (BookId.market) - the two are
-// distinct types in distinct namespaces (this one never depends on proto,
-// see this file's own header comment; apps/aggregator/book_id.hpp is the
-// seam that converts between them), but book_id.hpp already treats them as
-// the same concept 1:1, so there's no reason for them to spell it two ways.
+// aggregator.proto's own MarketType enum (BookId.market); the two are
+// distinct types in distinct namespaces (this one never depends on proto;
+// apps/aggregator/book_id.hpp is the seam that converts between them).
 //
-// No Unspecified/Invalid member: unlike aggregator.proto's MarketType,
-// which needs MARKET_TYPE_UNSPECIFIED purely because proto3 gives every
-// unset enum field an implicit zero value on the wire, this type has no
-// such requirement - a symbol::MarketType value is only ever produced by
-// something that already knows Spot or Perp (parse_book_id(),
-// book_subscription.hpp's JSON parsing, a literal at a call site).
-// "Unknown/malformed" is represented by the ABSENCE of a MarketType
-// (std::optional/std::expected returning nullopt at the parse boundary -
-// see book_id.hpp's to_symbol_book_id(), which converts
-// MARKET_TYPE_UNSPECIFIED to exactly that), the same pattern Asset/
-// BaseQuote/BookId/Exchange all use - never an extra enumerator inside
-// the type itself. Adding one would also gain nothing at that one seam:
-// its switch already keeps a default: catch-all regardless (proto enums
-// are open on the wire - see its own comment), so there's no exhaustive-
-// switch protection to symmetrize.
+// No Unspecified/Invalid member: a symbol::MarketType value is only ever
+// produced by something that already knows Spot or Perp, unlike
+// aggregator.proto's MarketType, which needs MARKET_TYPE_UNSPECIFIED
+// because proto3 gives every unset enum field an implicit zero value on
+// the wire. "Unknown/malformed" is represented by the ABSENCE of a
+// MarketType (std::optional/std::expected returning nullopt at the parse
+// boundary - see book_id.hpp's to_symbol_book_id()), the same pattern
+// Asset/BaseQuote/BookId/Exchange all use - never an extra enumerator
+// inside the type itself.
 //
 // Adding a market type means adding a case to every switch on this type
 // (to_string(BookId), to_string(VenueId), native_symbol(), book_id.hpp's
 // fill_wire_book_id()) - each is a real exhaustive switch (no default:),
-// not a binary ternary, specifically so a missed case is a compiler
-// warning rather than a silent misclassification. Verified empirically
-// (this project sets no -Wall/-Werror anywhere): AppleClang on this
-// machine emits -Wswitch for an uncovered enum case with no extra flags
-// needed - GCC needs -Wall for the same check, so treat this as "a
-// warning on at least one compiler in common use," not a portable
-// guarantee, let alone a hard build failure.
+// not a binary ternary, so a missed case is a compiler warning rather
+// than a silent misclassification.
 enum class MarketType { Spot, Perp };
 
 // Exchanges this project can source liquidity from. Deliberately just an
-// enum, never a Feed type: this header (and anything that parses a
-// venue list against it, e.g. bobby::hermeneutic::ingestion's subscription
-// config) stays usable - and unit-testable - without linking simdjson or
-// gRPC at all. Adding an exchange means adding a case to native_symbol()/
-// venue_naming() (to_string(VenueId)'s own helper, below)/parse_exchange(),
-// and separately wiring its Feed/Policy into apps/aggregator/server_main.cpp's
-// own dispatch.
+// enum, never a Feed type: this header stays usable - and unit-testable -
+// without linking simdjson or gRPC at all. Adding an exchange means adding
+// a case to native_symbol()/venue_naming()/parse_exchange(), and
+// separately wiring its Feed/Policy into server_main.cpp's own dispatch.
 enum class Exchange { Binance, Bybit, Okx };
 
 inline std::optional<Exchange> parse_exchange(std::string_view token) {
@@ -131,14 +112,10 @@ inline std::optional<BaseQuote> split_base_quote(std::string_view token) {
 // A book's identity as a structured value - the type this project uses
 // everywhere a book is looked up, keyed, or compared (AggregatorService's
 // map, book_subscription.hpp's dedup, the gRPC BookId message a client
-// actually subscribes with - see aggregator.proto). Replaces the earlier
-// concatenated string key ("BTCUSDT.SPOT"): that format could not be parsed
-// back into (base, quote) without a maintained quote-asset dictionary (the
-// same ambiguity split_base_quote()'s own comment describes, and the same
-// reason OKX's own instId is never guessed at from one), so an invalid book
-// was only ever a runtime NOT_FOUND, never something the type system ruled
-// out. See docs/ingestion_design.md's 第10節第10項 for the full history of
-// why this replaced book_key().
+// subscribes with - see aggregator.proto). A concatenated string key
+// ("BTCUSDT.SPOT") can't be parsed back into (base, quote) without a
+// maintained quote-asset dictionary (the same ambiguity split_base_quote()
+// describes), so this keeps the base/quote boundary in the type instead.
 //
 // Equality/hash only, not ordered (same rationale as Asset's own comment):
 // nothing here needs to sort books, only to use one as a map/set key.
@@ -174,13 +151,9 @@ inline std::string to_string(const BookId& id) {
 // don't themselves contain '_' (Asset's own comment allows any non-empty
 // code, but split_base_quote() below only recognizes a single separating
 // underscore - a code containing one is already unrepresentable in the
-// "BASE_QUOTE" input spelling this project uses everywhere else, not a new
-// limitation this function introduces). Within that domain: nullopt unless
-// `token` is "BASE_QUOTE.SPOT" or "BASE_QUOTE.PERP" with a valid
-// split_base_quote() base/quote. Unlike the old book_key() this replaces,
-// this direction is well-defined precisely because to_string() never
-// discards the base/quote boundary the way concatenation did - there is no
-// ambiguity left to guess at.
+// "BASE_QUOTE" input spelling this project uses everywhere else). Within
+// that domain: nullopt unless `token` is "BASE_QUOTE.SPOT" or
+// "BASE_QUOTE.PERP" with a valid split_base_quote() base/quote.
 inline std::optional<BookId> parse_book_id(std::string_view token) {
     std::string_view suffix = ".SPOT";
     MarketType type = MarketType::Spot;
@@ -200,14 +173,7 @@ inline std::optional<BookId> parse_book_id(std::string_view token) {
 // invalidate_venue()). This is the real "venue" concept this project
 // means everywhere else it says "venue": an Exchange scoped to a market
 // (e.g. "binance_spot" and "binance_futures" are two different venues
-// even though the same company runs both) - see Exchange's own comment
-// above for why the bare exchange enum isn't this. Replaces a
-// hand-spelled std::string that used to be the map key directly: nothing
-// stopped that string from drifting out of sync with the real (Exchange,
-// MarketType) pair it was supposed to represent (a typo, or a second
-// caller inventing its own spelling), the same "identity in the type
-// system, not a string convention" reasoning that replaced book_key()
-// with BookId above.
+// even though the same company runs both).
 //
 // Equality/hash only, not ordered (same rationale as BookId's own comment).
 struct VenueId {
@@ -220,30 +186,17 @@ struct VenueId {
 // The human-readable form of a VenueId - venue-native vocabulary
 // ("futures"/"linear"/"swap", each exchange's own term for its derivatives
 // market), not the venue-neutral "SPOT"/"PERP" BookId's own to_string()
-// uses. Deliberately not unified with BookId's vocabulary: a log line or
-// AggregateOrderBook's per-venue bookkeeping (when dumped for debugging)
-// should still read the way each exchange's own docs do, and BookId only
-// gets to stay venue-agnostic because it doesn't have to pick one
-// exchange's term as "the" answer. For display only, same as
-// to_string(BookId) above - nothing parses this back into a VenueId, and
-// nothing needs to: nothing constructs a VenueId from a string any more.
-// to_string(VenueId)'s own naming table: `exchange_part` is the lowercase
-// log-facing exchange name ("binance"/"bybit"/"okx" - distinct from
-// exchange_name()'s uppercase config-facing "BINANCE"/"BYBIT"/"OKX", a
-// different vocabulary for a different audience), `spot_suffix`/
-// `perp_suffix` are that exchange's own term for each market segment
-// ("futures"/"linear"/"swap" all mean the same thing - a perpetual swap -
-// but each exchange's own docs use a different word for it, and this
-// stays venue-native rather than picking one).
+// uses: a log line should still read the way each exchange's own docs do.
+// For display only - nothing constructs a VenueId from a string.
+// `exchange_part` is the lowercase log-facing exchange name (distinct from
+// exchange_name()'s uppercase config-facing spelling); `spot_suffix`/
+// `perp_suffix` are that exchange's own term for each market segment.
 //
 // Factored out of to_string(VenueId) itself so that function needs only
-// one flat switch(MarketType) - not this switch(Exchange) nested inside
-// every one of its cases (a code-review finding: 6 leaf returns, 3 dead
-// `break`s, and an unreachable trailing return, to cover what's really
-// two independent, individually-exhaustive 2-and-3-way choices). Both
-// switches stay real exhaustive switches (no default:), same reasoning
-// as every other switch over Exchange/MarketType in this file - a future
-// third value of either enum should still be a compiler warning here.
+// one flat switch(MarketType), not a switch(Exchange) nested inside every
+// one of its cases. Both switches stay real exhaustive switches (no
+// default:) - a future third value of either enum should be a compiler
+// warning here.
 //
 // Declared at namespace scope, not as a function-local struct returned
 // via `auto`: a function-local type's name isn't visible to its own
@@ -284,15 +237,11 @@ inline std::string to_string(const VenueId& id) {
 using NativeSymbol = std::string;
 
 // Computes that wire-format spelling for one (exchange, symbol, type)
-// triple. Binance/Bybit use the same concatenated spelling for both spot and
-// their derivatives market ("BTCUSDT" either way - see
-// apps/aggregator/server_main.cpp's registry-building loop, which relies on
-// this); OKX separates base/quote with its own dash and tags a swap with
-// "-SWAP" (matching the instId shape OkxFeed::parse_message() reads back
-// verbatim - see okx_feed.hpp). Unambiguous by construction - `symbol`
-// already carries the base/quote boundary the caller supplied, rather than
-// this having to recover it from a concatenated string the way
-// split_base_quote()'s own comment explains this project avoids.
+// triple. Binance/Bybit use the same concatenated spelling for both spot
+// and their derivatives market ("BTCUSDT" either way - server_main.cpp's
+// registry-building loop relies on this); OKX separates base/quote with
+// its own dash and tags a swap with "-SWAP" (matching the instId shape
+// OkxFeed::parse_message() reads back verbatim).
 inline NativeSymbol native_symbol(Exchange exchange, const BaseQuote& symbol, MarketType type) {
     switch (exchange) {
         case Exchange::Binance:

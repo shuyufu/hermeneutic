@@ -20,16 +20,13 @@ namespace bobby::hermeneutic::ingestion {
 
 namespace detail {
 
-// Shared by every Bybit v5 public orderbook Feed (linear, spot - verified
-// live against both wss://stream.bybit.com/v5/public/linear and .../spot,
-// 2026-09-18: identical envelope shape, identical single-update-id `u`
-// semantics on every delta). The only thing that actually differs between
-// Bybit's market segments is which WS path a Feed connects to
-// (BybitLinearFeed/BybitSpotFeed's own ws_target()) - not documented by
-// Bybit as a formal guarantee that will hold for every future product
-// (inverse/option aren't verified at all), so this is deliberately kept
-// separate from a given Feed's endpoint constants rather than assumed to
-// extend automatically to a market segment nobody has actually checked.
+// Shared by every Bybit v5 public orderbook Feed (linear, spot): identical
+// envelope shape and single-update-id `u` semantics on every delta. The
+// only thing that actually differs between Bybit's market segments is
+// which WS path a Feed connects to (BybitLinearFeed/BybitSpotFeed's own
+// ws_target()), so this stays separate from a given Feed's endpoint
+// constants rather than being assumed to extend automatically to a market
+// segment (inverse/option) nobody has checked.
 //
 // Pure function: the JSON to send right after connecting, to subscribe
 // every symbol's orderbook diff topic. Topic name pattern is
@@ -72,9 +69,7 @@ inline std::expected<ParsedMessage, std::errc> parse_bybit_orderbook_message(std
             // returned simdjson_result (here, converting it to
             // std::string_view) does. A discarded `root["topic"].get_string();`
             // statement would silently never throw NO_SUCH_FIELD at all,
-            // defeating this whole check - caught the hard way, by a test
-            // (SubscribeAckHasNoTopicFieldAndIsIgnored) that failed until
-            // this value was actually bound to something.
+            // defeating this whole check.
             std::string_view topic = root["topic"].get_string();
             (void)topic;
         } catch (const simdjson::simdjson_error&) {

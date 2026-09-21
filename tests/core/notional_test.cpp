@@ -98,12 +98,10 @@ TEST(Notional, DivideByZeroSizeReturnsArgumentOutOfDomain) {
 }
 
 // Regression test: round_div_nearest_away() requires a strictly positive
-// denominator specifically because "numerator +/- denominator/2, then
-// divide" (the shape used before it was extracted) rounds the wrong way
-// for a negative one. A negative Price/Size used to only be rejected when
-// exactly zero; a negative price or size must be rejected too, both
-// because it's not a meaningful price/size and because it would otherwise
-// reach the (denominator-must-be-positive) rounding math.
+// denominator, since "numerator +/- denominator/2, then divide" rounds
+// the wrong way for a negative one. A negative price or size must be
+// rejected, both because it's not a meaningful price/size and because it
+// would otherwise reach the (denominator-must-be-positive) rounding math.
 TEST(Notional, DivideByNegativePriceReturnsArgumentOutOfDomain) {
     Notional notional(500.0);
     Price negative_price(-100.0);
@@ -189,12 +187,12 @@ TEST(Notional, RoundTripThroughMultiplyThenDivideIsNotAlwaysExact) {
     EXPECT_EQ(recovered_price->raw(), 1);  // this direction happens to land exactly
 }
 
-// Regression coverage for the #17 refactor: fixed_multiply/fixed_divide
-// (fixed_point.hpp) must generalize to a decimal width that has nothing to
-// do with Price/Size/Notional, not just the trio they were extracted from.
-// `Rate` is defined locally, here, rather than in production code - the
-// point is to prove the templates work for an arbitrary new width without
-// growing the production type surface just to demonstrate it.
+// fixed_multiply/fixed_divide (fixed_point.hpp) must generalize to a
+// decimal width that has nothing to do with Price/Size/Notional, not just
+// the trio they were extracted from. `Rate` is defined locally, here,
+// rather than in production code - the point is to prove the templates
+// work for an arbitrary new width without growing the production type
+// surface just to demonstrate it.
 TEST(FixedPointArithmeticHelpers, GeneralizeToAFixedPointWidthOtherThanPriceSizeNotional) {
     using Rate = BasicFixedPoint<8>;
 

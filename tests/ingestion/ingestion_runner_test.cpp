@@ -98,8 +98,8 @@ net::awaitable<void> run_single_shot_ws_server(net::ip::tcp::acceptor acceptor) 
     co_await ws.async_read(buffer, net::use_awaitable);
 }
 
-// docs/ingestion_design.md 第 10 節第 2 項's 驗收標準: after stop_all(),
-// io_thread.join() should return on its own - no io.stop() needed - because
+// After stop_all(), io_thread.join() should return on its own - no
+// io.stop() needed - because
 // every session's own drain (cancel the in-flight read/backoff wait, wait
 // out any in-flight snapshot fetch) has actually finished. Uses two
 // *differently-typed* VenueSessionAdapter instantiations (FakeFeedA vs

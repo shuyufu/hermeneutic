@@ -21,16 +21,12 @@ namespace bobby::hermeneutic::ingestion {
 
 // ParsedMessage is defined once in feed_wire.hpp - see its own comment.
 
-// VenueFeed for Binance USDS-M Futures: parse/encode only, no I/O. See
-// docs/ingestion_design.md for the design this implements and the primary
-// sources (developers.binance.com) the wire format and resync semantics
-// were verified against.
+// VenueFeed for Binance USDS-M Futures: parse/encode only, no I/O.
 class BinanceFuturesFeed {
   public:
     // Snapshot comes from a REST call (the RequestSnapshot action triggers
     // an actual HTTP GET), not pushed over the WebSocket -- unlike some
-    // other venues (see docs/ingestion_design.md's TrustConnectionOrderPolicy
-    // note).
+    // other venues (see kTrustsConnectionOrder in symbol_sync.hpp).
     static constexpr bool kSnapshotViaRest = true;
 
     // Combined-stream endpoint used with the SUBSCRIBE message below -

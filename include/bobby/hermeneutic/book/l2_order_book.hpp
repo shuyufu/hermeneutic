@@ -26,16 +26,13 @@ struct L2OrderBook {
 //
 // Shared by AggregateOrderBook::apply_snapshot/apply_batch,
 // price_band_depth(), volume_band_prices(), and
-// aggregator::SymbolBook::apply_batch's own pre-check, all of which used
-// to hand-roll this identical `price.raw() <= 0 || size.raw() < 0`
-// predicate separately (a code-review finding). Deliberately a plain
-// bool, not an std::expected<void, std::errc>: the sites above disagree
-// on which std::errc code this condition should produce
+// aggregator::SymbolBook::apply_batch's own pre-check. Deliberately a
+// plain bool, not an std::expected<void, std::errc>: the call sites above
+// disagree on which std::errc code this condition should produce
 // (invalid_argument vs argument_out_of_domain) - that's each call site's
-// own API contract with ITS OWN callers (AggregateOrderBook's is public,
-// documented, and tested), not something a dedup of the underlying
-// predicate should silently change. Each caller wraps this in its own
-// std::unexpected(...) with whichever code it already returned.
+// own API contract with its own callers, not something a shared predicate
+// should decide. Each caller wraps this in its own std::unexpected(...)
+// with whichever code it already returned.
 constexpr bool is_valid_level(Price price, Size size) noexcept {
     return price.raw() > 0 && size.raw() >= 0;
 }

@@ -12,7 +12,7 @@ namespace {
 // `books` channel field semantics (seqId/prevSeqId, action, arg.instId,
 // 4-element level arrays) - not a live capture the way Bybit's feed test
 // examples are. A short live smoke test against wss://ws.okx.com:8443
-// before this ships to production is recommended (see docs/ingestion_design.md).
+// before this ships to production is recommended.
 
 TEST(OkxFeedTest, ParsesSnapshotMessageExample) {
     constexpr std::string_view kText =
@@ -126,9 +126,9 @@ TEST(OkxFeedTest, UnrecognizedActionUnderARealDataEnvelopeIsIgnored) {
 TEST(OkxFeedTest, EmptyDataArrayFailsWithBadMessageRatherThanCrashing) {
     // A recognized envelope ("arg"/"action" present) but an empty "data"
     // array - dereferencing an on-demand array's end() iterator is not a
-    // simdjson_error (it's a hard assert in debug, undefined behavior under
-    // NDEBUG, verified empirically against this project's simdjson build),
-    // so this must be checked explicitly rather than left to *data.begin().
+    // simdjson_error (it's a hard assert in debug, undefined behavior
+    // under NDEBUG), so this must be checked explicitly rather than left
+    // to *data.begin().
     OkxFeed feed;
     auto result = feed.parse_message(
         R"({"arg":{"channel":"books","instId":"BTC-USDT"},"action":"update","data":[]})");

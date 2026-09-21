@@ -122,12 +122,9 @@ TEST(BasicFixedPoint, TotalOrdering) {
 // wouldn't be invisible to the comparison test below. Implements "round
 // half up, ties away from zero" for however many fractional digits `text`
 // has, even when that's more than `decimals` - the general case
-// from_decimal_string itself has to handle, unlike the narrower one-off
-// script from the original double-vs-exact measurement (that script only
-// ever generated exactly-decimals-digit fractional strings, so it never
-// needed a rounding rule at all). Assumes a well-formed "[-]digits[.digits]"
-// string; malformed input is covered by the dedicated error tests below
-// instead.
+// from_decimal_string itself has to handle. Assumes a well-formed
+// "[-]digits[.digits]" string; malformed input is covered by the
+// dedicated error tests below instead.
 __int128 exact_decimal_raw(std::string_view text, int decimals) {
     bool negative = false;
     std::size_t i = 0;
@@ -352,17 +349,14 @@ TEST(FromDecimalString, NanAndInfinityTextAreRejected) {
 }
 
 // Brute-force cross-check against an independently-written exact ground
-// truth (exact_decimal_raw above), across every shape the original
-// double-vs-exact measurement covered plus the specific high-risk
-// combination it flagged (a 7-digit integer part with a fractional part
-// at or beyond the type's own full precision, 16+ total significant
-// digits - where the double-intermediate path used to disagree with
-// exact decimal rounding up to ~29% of the time). Since both sides here
-// compute exact base-10 rounding with no double anywhere, a correct
-// implementation matches 100% of the time by construction - this test
-// exists to catch an implementation bug in either side, not to measure a
-// probabilistic error rate the way the original double-vs-exact
-// measurement did.
+// truth (exact_decimal_raw above), including the specific high-risk
+// combination of a 7-digit integer part with a fractional part at or
+// beyond the type's own full precision (16+ total significant digits) -
+// where a double-intermediate path disagrees with exact decimal rounding
+// up to ~29% of the time. Both sides here compute exact base-10 rounding
+// with no double anywhere, so a correct implementation matches 100% of
+// the time by construction; this test exists to catch an implementation
+// bug in either side.
 template <typename FixedPointType>
 void assert_matches_ground_truth_for_shape(int int_digits, int frac_digits, int total, std::mt19937_64& rng) {
     constexpr int kDecimals = FixedPointType::decimals;
@@ -404,13 +398,12 @@ TEST(FromDecimalString, MatchesExactGroundTruthAcrossRealisticShapes) {
 }
 
 TEST(FromDecimalString, MatchesExactGroundTruthForTheOriginalHighRiskCombination) {
-    // The exact combination the 2026-09-19 double-vs-exact measurement
-    // flagged: a 7-digit integer part combined with Price's full 9
-    // fractional digits at once (16 total significant digits, past
-    // double's ~15.95-digit exact round-trip range) - measured ~29%
-    // mismatch rate for the old string->double->BasicFixedPoint(double)
-    // path. The new path has no double anywhere, so this must be 100%,
-    // not ~71%.
+    // The high-risk combination: a 7-digit integer part combined with
+    // Price's full 9 fractional digits at once (16 total significant
+    // digits, past double's ~15.95-digit exact round-trip range) - a
+    // string->double->BasicFixedPoint(double) path mismatches exact
+    // decimal rounding up to ~29% of the time here. This path has no
+    // double anywhere, so it must be 100%.
     std::mt19937_64 rng(20260920);
     assert_matches_ground_truth_for_shape<Price>(7, 9, 2000000, rng);
     // One digit further past that boundary, and with excess fractional

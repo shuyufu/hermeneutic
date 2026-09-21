@@ -12,12 +12,10 @@
 namespace bobby::hermeneutic::ingestion {
 
 // VenueFeed for Bybit's v5 public orderbook stream, linear market segment
-// (i.e. USDT perpetuals) - see docs/ingestion_design.md for the design this
-// implements and bybit-exchange.github.io/docs/v5/websocket/public/orderbook,
-// the primary source the wire format and resync semantics were verified
-// against (both by reading the doc and by a live probe, see there for why
-// both were needed). Parsing itself is shared with BybitSpotFeed via
-// bybit_wire.hpp - this class only supplies the linear endpoint. Kept in
+// (i.e. USDT perpetuals):
+// bybit-exchange.github.io/docs/v5/websocket/public/orderbook. Parsing
+// itself is shared with BybitSpotFeed via bybit_wire.hpp - this class
+// only supplies the linear endpoint. Kept in
 // the same file as BybitSpotFeed (unlike Binance's Futures/Spot, which are
 // genuinely different wire semantics and stay in separate files): the two
 // Bybit classes differ only in ws_target() and their doc comments,
@@ -46,16 +44,12 @@ class BybitLinearFeed {
     }
 };
 
-// VenueFeed for Bybit's v5 public orderbook stream, spot market segment -
-// see docs/ingestion_design.md for the design this implements. Wire format
-// and resync semantics verified live against
-// wss://stream.bybit.com/v5/public/spot (orderbook.50.BTCUSDT, 2026-09-18):
+// VenueFeed for Bybit's v5 public orderbook stream, spot market segment:
 // identical envelope shape and single-update-id `u` semantics to
-// BybitLinearFeed's own linear-market verification - not assumed to carry
-// over from linear without checking, since Bybit doesn't document this as a
-// formal cross-product guarantee (see bybit_wire.hpp's shared-parsing
-// comment). Parsing itself is shared with BybitLinearFeed via
-// bybit_wire.hpp - this class only supplies the spot endpoint.
+// BybitLinearFeed's own linear market (see bybit_wire.hpp's
+// shared-parsing comment for why that isn't assumed to carry over from
+// linear without checking). Parsing itself is shared with BybitLinearFeed
+// via bybit_wire.hpp - this class only supplies the spot endpoint.
 class BybitSpotFeed {
   public:
     // Same reasoning as BybitLinearFeed::kSnapshotViaRest: Bybit pushes its

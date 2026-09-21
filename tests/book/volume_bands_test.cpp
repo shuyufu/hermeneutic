@@ -440,14 +440,12 @@ TEST(VolumeBands, AskWalksUpwardAndBidWalksDownwardFromTheSameBookStructure) {
     EXPECT_EQ(*(*bid_result)[0].vwap, Price(102.0));  // highest bid first
 }
 
-// code-review finding: cum_notional accumulates via a checked add now (see
-// volume_band_prices()'s own comment), not a plain operator+= - each
+// Regression test: cum_notional must accumulate via a checked add (see
+// volume_band_prices()'s own comment), not a plain operator+=. Each
 // level's own price*size here is comfortably in range (~5e9, well under
 // Notional::raw_type's ~9.22e9 max), so this specifically exercises the
 // *running total* overflowing across levels, not any single level's own
-// product. The checked accumulation runs unconditionally per level (before
-// any threshold-crossing check), so the threshold itself just needs to be
-// well-formed - it's never actually reached.
+// product.
 TEST(VolumeBands, CumulativeNotionalOverflowReportsOutOfRangeInsteadOfWrapping) {
     L2OrderBook book;
     book.asks[Price(1'000'000.0)] = Size(5'000.0);

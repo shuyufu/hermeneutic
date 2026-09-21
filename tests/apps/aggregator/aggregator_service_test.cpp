@@ -250,9 +250,7 @@ class AggregatorServiceTest : public ::testing::Test {
 
     // Ingestion for this fixture's tests goes through the symbol's own
     // SymbolBook directly, the same way a real ingestion dispatch layer
-    // would - the fixture used to expose apply_delta/apply_snapshot/
-    // invalidate_venue/send_heartbeat straight on AggregatorService, back
-    // when it wrapped exactly one symbol.
+    // would.
     SymbolBook& book() { return *service_.book(TestBook()); }
 
     std::unique_ptr<BboSubscription> subscribe_bbo() {
@@ -405,13 +403,9 @@ TEST_F(AggregatorServiceTest, ApplySnapshotBothSidesProducesOneSeqBump) {
     EXPECT_EQ(msg.diff().asks(0).size_raw(), Size(2.0).raw());
 }
 
-// The bug this guards against: apply_snapshot() used to take one side per
-// call, so a caller resyncing both sides made two independent book calls -
-// a bad level on one side could be rejected after the other side's
-// perfectly valid resync had already gone through and broadcast, with
-// nothing downstream able to tell (see venue_session.hpp's own historical
-// comment on this). One call validating both sides before touching either
-// closes that gap.
+// Guards against a bad level on one side going through while the other,
+// valid side is already applied and broadcast: apply_snapshot() must
+// validate both sides before touching either.
 TEST_F(AggregatorServiceTest, ApplySnapshotRejectsBadLevelOnEitherSideWithoutMutatingOrBroadcasting) {
     updates_.wait_for(0);  // initial snapshot
 
@@ -510,15 +504,13 @@ TEST_F(AggregatorServiceTest, HeartbeatIsDeliveredAndDoesNotAdvanceSeq) {
     EXPECT_EQ(diff_msg.diff().book_seq(), 1u);
 }
 
-// The core new signal this PR adds - live_venues content itself was
-// otherwise completely untested (HeartbeatIsDeliveredAndDoesNotAdvanceSeq
-// above only checks ts_ns()) - a /code-review pass caught this. Each of
-// the three data-changing calls below is chosen to also move the top of
-// book (a first bid, a first ask, then removing the only bid), so the L2
-// and Bbo streams stay in exact 1:1 lockstep - both get one message per
-// action, letting the same wait_for() indices check both streams without
-// separately tracking whether a given change happened to touch the top of
-// book.
+// Guards live_venues content itself, which HeartbeatIsDeliveredAndDoesNotAdvanceSeq
+// above doesn't check (only ts_ns()). Each of the three data-changing calls
+// below is chosen to also move the top of book (a first bid, a first ask,
+// then removing the only bid), so the L2 and Bbo streams stay in exact
+// 1:1 lockstep - both get one message per action, letting the same
+// wait_for() indices check both streams without separately tracking
+// whether a given change happened to touch the top of book.
 TEST_F(AggregatorServiceTest, HeartbeatLiveVenuesTracksContributingVenues) {
     auto bbo = subscribe_bbo();
     updates_.wait_for(0);      // initial L2 snapshot

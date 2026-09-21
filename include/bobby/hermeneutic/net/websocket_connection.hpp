@@ -53,40 +53,34 @@ class WebSocketConnection {
     // up, but the peer has silently stopped responding to anything, not
     // even our own outgoing pings - never throwing from read() below) is
     // handled via Boost.Beast's own websocket::stream_base::timeout +
-    // keep_alive_pings option, not a hand-rolled mechanism. An earlier
-    // attempt concluded (wrongly) that this option "doesn't fire": that
-    // test's fake server was itself a websocket::stream holding a pending
-    // read, which auto-answers an incoming ping as a side effect of
-    // Beast's own read machinery (impl/read.hpp) regardless of whether
-    // the "application" ever sends anything - so it never exercised the
-    // failure mode this option actually detects. Verified directly
-    // against a server that issues no read at all after the handshake (so
-    // nothing it receives, including our idle ping, is ever processed or
-    // answered): the pending read here correctly fails with
-    // beast::error::timeout. `idle_timeout` measures transport
-    // responsiveness, not application-data freshness - deliberately: no
-    // exchange guarantees it will push anything, not even a no-op
-    // heartbeat, during a genuinely quiet market, so a check tied to
-    // application content would misfire on an illiquid book with a
-    // perfectly healthy connection (live-verified on Binance Futures
-    // CTKUSDT perp: ~14s natural gaps between real updates, and climbing,
-    // well within reach of a 30s threshold).
+    // keep_alive_pings option, not a hand-rolled mechanism. A fake test
+    // server that is itself a websocket::stream with a pending read is
+    // not a valid way to test this: that pending read auto-answers an
+    // incoming ping as a side effect of Beast's own read machinery,
+    // regardless of whether the "application" ever sends anything, so it
+    // never exercises the failure mode this option actually detects - a
+    // valid black-hole test server must issue no read at all after the
+    // handshake.
+    // `idle_timeout` measures transport responsiveness, not
+    // application-data freshness - deliberately: no exchange guarantees
+    // it will push anything, not even a no-op heartbeat, during a
+    // genuinely quiet market, so a check tied to application content
+    // would misfire on an illiquid book with a perfectly healthy
+    // connection (live-verified on Binance Futures CTKUSDT perp: ~14s
+    // natural gaps between real updates, well within reach of a 30s
+    // threshold).
     //
     // What "responsiveness" actually proves is narrower than "the peer is
     // alive": it's "the first hop that terminates our WS connection
     // answers something" - which for a venue fronted by a load balancer or
     // reverse proxy may be that edge, not the real backend feeding market
     // data. An edge that answers WS-level pings independently of its own
-    // backend health (common - ping/pong is cheap to terminate without
-    // forwarding) would leave this mechanism reporting a healthy
+    // backend health would leave this mechanism reporting a healthy
     // connection indefinitely while no real data ever arrives again. This
-    // is a known, structural blind spot of any transport-level check
-    // (including a hand-rolled application-message one - see this
-    // function's own git history for the false-positive problem that
-    // approach had instead), not something idle_timeout can be tuned to
-    // close. Closing it needs a second, independent, much-longer-window
-    // check on genuine application data ever arriving at all - out of
-    // scope here; not yet built.
+    // is a known, structural blind spot of any transport-level check, not
+    // something idle_timeout can be tuned to close - closing it needs a
+    // second, independent, much-longer-window check on genuine
+    // application data ever arriving at all, not yet built.
     net::awaitable<void> connect(std::string_view host, std::string_view port, std::string_view target,
                                   std::chrono::seconds idle_timeout = kDefaultIdleTimeout) {
         // book_subscription.hpp's parse_idle_timeout_config() is the only

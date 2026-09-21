@@ -28,8 +28,7 @@ namespace beast = boost::beast;
 namespace http = beast::http;
 
 // One-shot HTTP(S) GET, not a persistent connection object -- a REST
-// snapshot fetch is an infrequent, ad hoc call (see docs/ingestion_design.md
-// for why this isn't a stateful "HttpConnection" type). Templated on the
+// snapshot fetch is an infrequent, ad hoc call. Templated on the
 // underlying stream the same way WebSocketConnection is: production uses an
 // SSL stream (real exchanges are HTTPS-only), tests use a plain TCP stream
 // against a local server, sharing the request/response mechanics through

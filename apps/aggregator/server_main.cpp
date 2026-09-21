@@ -61,11 +61,8 @@ struct VenueGroup {
 };
 
 // Keyed by VenueId (not a hand-rolled std::pair<Exchange, MarketType>,
-// which would be a second, independent spelling of the exact same
-// pairing VenueId already exists to own - see symbol.hpp's own comment
-// on why that duplication is the thing this type was introduced to
-// remove). unordered_map, not map: same "nothing needs to sort this"
-// rationale as AggregateOrderBook's venues_.
+// a second, independent spelling of the exact same pairing VenueId
+// already owns). unordered_map, not map: nothing needs to sort this.
 using VenueGroups = std::unordered_map<VenueId, VenueGroup>;
 
 VenueGroup* find_group(VenueGroups& groups, const VenueId& venue_id) {
@@ -76,14 +73,12 @@ VenueGroup* find_group(VenueGroups& groups, const VenueId& venue_id) {
 // Registers `venue_id`'s group with `runner`, if the config actually
 // asked for it - a no-op otherwise (e.g. a config with no OKX venues at
 // all never touches OkxFeed). One instantiation of this per (Feed, Policy)
-// pair replaces what used to be six near-identical inline blocks in
-// main(), so a fix here (or a future venue) only has to happen once.
+// pair means a fix here (or a future venue) only has to happen once.
 // `group->native_symbols`/`group->registry` are moved out, not copied -
 // `groups` isn't read again afterward - and `wired_venues`/`wired_venue_ids`
 // are grown here so the caller can both log what was actually wired
-// (wired_venues) and, below, fail startup if the config asked for a venue
-// none of these calls claimed (wired_venue_ids) - see that check's own
-// comment in main() for why the two can't be derived from each other.
+// and, below, fail startup if the config asked for a venue none of these
+// calls claimed.
 template <typename Feed, typename Policy>
 void wire_venue(bobby::hermeneutic::ingestion::IngestionRunner& runner, VenueGroups& groups,
                  const VenueId& venue_id, std::vector<std::string>& wired_venues,
@@ -114,24 +109,18 @@ int main(int argc, char** argv) {
     // example). Each book independently names exactly the venues that feed
     // it (SPOT-book venues serve that symbol's spot market, PERP-book
     // venues its perpetual/futures/swap market - book_subscription.hpp's
-    // native_symbol() enforces this by construction, there is no way to
-    // wire a venue's derivatives feed into a spot book or vice versa). No
-    // built-in default: unlike the CLI string this replaced, a config file
-    // is meant to be an explicit, operator-owned artifact, not a value baked
-    // into the binary that's easy to forget is even there.
+    // native_symbol() enforces this by construction). No built-in default:
+    // a config file is meant to be an explicit, operator-owned artifact,
+    // not a value baked into the binary that's easy to forget is even there.
     if (argc <= 2) {
         std::cerr << "usage: hermeneutic_aggregator_service [address] <subscription-config.json>\n";
         return 1;
     }
-    // Read once, shared by both parse_*() calls below - calling
-    // load_book_subscriptions()/load_idle_timeout_config() here instead
-    // would each open and fully simdjson-parse this same file
-    // independently for no reason (a real, if startup-only, duplication a
-    // /code-review pass caught). Safe to share: each parse_*() function
-    // makes its own private simdjson::padded_string copy of the text it's
-    // given rather than parsing config_json in place, so parsing it twice
-    // from the same std::string_view doesn't have the two parses
-    // interfere with each other.
+    // Read once, shared by both parse_*() calls below rather than each
+    // opening and fully simdjson-parsing this same file independently.
+    // Safe to share: each parse_*() function makes its own private
+    // simdjson::padded_string copy of the text it's given rather than
+    // parsing config_json in place, so the two parses don't interfere.
     simdjson::padded_string config_json;
     if (auto error = simdjson::padded_string::load(argv[2]).get(config_json)) {
         std::cerr << "failed to read subscription config \"" << argv[2]
@@ -193,18 +182,16 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // AggregatorService has no timer of its own (see send_heartbeat()'s doc
-    // comment); drive it here so a subscriber can tell "book genuinely
-    // unchanged" apart from "aggregator/feed stalled" during a quiet period,
-    // well inside the keepalive timeout above so it isn't the only sign of
-    // life on an idle connection.
+    // AggregatorService has no timer of its own; drive it here so a
+    // subscriber can tell "book genuinely unchanged" apart from
+    // "aggregator/feed stalled" during a quiet period, well inside the
+    // keepalive timeout above so it isn't the only sign of life on an
+    // idle connection.
     //
-    // Joined at the end of main(), not detached: a detached thread that's
-    // still alive (mid-sleep) when main() reaches the end of this
-    // function calls service.send_heartbeat() on an object that's about
-    // to be (or already is) destroyed - a real use-after-free, not
-    // hypothetical, now that the signal handler below actually makes
-    // server->Wait() return.
+    // Joined at the end of main(), not detached: a detached thread still
+    // alive (mid-sleep) when main() reaches the end of this function
+    // would call service.send_heartbeat() on an object that's about to be
+    // (or already is) destroyed.
     constexpr auto kHeartbeatInterval = std::chrono::seconds(1);
     std::atomic<bool> heartbeat_stop{false};
     std::thread heartbeat_thread([&service, &heartbeat_stop, kHeartbeatInterval] {
@@ -220,8 +207,7 @@ int main(int argc, char** argv) {
     // gRPC server above exposes. SymbolBook::apply_batch/invalidate_venue
     // are per-VenueId, so several venues safely aggregate into the same
     // book. A real TLS context, not the plain-TCP instantiation the tests
-    // use: this is the path that runs against real exchanges rather than a
-    // local test server.
+    // use: this is the path that runs against real exchanges.
     net::ssl::context ssl_ctx(net::ssl::context::tlsv12_client);
     ssl_ctx.set_default_verify_paths();
     ssl_ctx.set_verify_mode(net::ssl::verify_peer);
@@ -230,17 +216,15 @@ int main(int argc, char** argv) {
     // VenueSubscription list: IngestionRunner::add() wants one native-symbol
     // list and one SymbolRegistry per venue session, not one call per
     // symbol. Each subscription's own registry entry is keyed by its
-    // native_symbol (what the venue's Feed actually subscribes with and what
-    // dispatch_snapshot/dispatch_depth_update look it up by - see
-    // venue_session.hpp), pointing at the book its BookId resolves to.
+    // native_symbol (what the venue's Feed subscribes with and what
+    // dispatch_snapshot/dispatch_depth_update look it up by), pointing at
+    // the book its BookId resolves to.
     ::VenueGroups groups;
     for (const auto& sub : subscriptions) {
         auto& group = groups[sub.venue_id];
         group.native_symbols.push_back(sub.native_symbol);
-        // book_symbols above is derived from this same `subscriptions` list,
-        // so this can never miss - asserted, not runtime-checked, the same
-        // startup-invariant treatment AggregatorService's own constructor
-        // gives its unique-symbols precondition.
+        // book_symbols above is derived from this same `subscriptions`
+        // list, so this can never miss.
         auto* book = service.book(sub.book_id);
         assert(book);
         group.registry.add(sub.native_symbol, book);
@@ -276,13 +260,10 @@ int main(int argc, char** argv) {
         &ssl_ctx, *idle_timeout_config);
 
     // Shared tail for both "config names a venue that isn't actually
-    // wired" checks below - a future third such check (plausible: nothing
-    // currently validates book_symbols/subscriptions reference real
-    // books) gets the same shutdown sequence for free instead of a third
-    // copy-pasted block that could drift from the other two. Returns
-    // whether it fired, so each call site's own `return 1;` stays visible
-    // there rather than this helper silently ending main() from inside a
-    // lambda.
+    // wired" checks below, so a future third such check gets the same
+    // shutdown sequence for free. Returns whether it fired, so each call
+    // site's own `return 1;` stays visible there rather than this helper
+    // silently ending main() from inside a lambda.
     auto fail_on_bad_venues = [&](const std::vector<std::string>& bad_venues, std::string_view what,
                                     std::string_view consequence) {
         if (bad_venues.empty()) return false;
@@ -298,14 +279,11 @@ int main(int argc, char** argv) {
     // Fail startup, rather than run with silent zero-data ingestion for
     // some book, if the config named a (venue, market type) none of the
     // wire_venue<>() calls above claimed - e.g. a typo'd/future Exchange
-    // enumerator, or a market type this binary genuinely has no Feed for
-    // yet. Without this check, `groups` still holds that venue's entry
-    // (nothing above removes an unclaimed one), the process starts and
-    // listens normally, and the operator only discovers the gap when that
-    // venue's book quietly never receives an update - the exact same
-    // "config looks right but isn't actually wired" failure class as the
-    // once-empty Bybit SymbolSync buffer, just one layer further up the
-    // stack.
+    // enumerator, or a market type this binary has no Feed for yet.
+    // Without this check, `groups` still holds that venue's entry, the
+    // process starts and listens normally, and the operator only
+    // discovers the gap when that venue's book quietly never receives an
+    // update.
     std::vector<std::string> unwired_venues;
     for (const auto& [venue_id, group] : groups) {
         if (!wired_venue_ids.contains(venue_id)) {
@@ -318,14 +296,11 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Same "config looks right but isn't actually wired" failure class as
-    // the unwired-venue check above, for venue_idle_timeout_overrides
-    // instead of "books": an override naming a venue that isn't actually
-    // subscribed would otherwise parse successfully and silently do
-    // nothing (IdleTimeoutConfig::for_venue() is never asked for that
-    // VenueId), leaving an operator believing their tuning took effect
-    // when it didn't - inconsistent with this whole config's own "every
-    // mistake fails loud" policy (see book_subscription.hpp).
+    // Same failure class as the unwired-venue check above, for
+    // venue_idle_timeout_overrides: an override naming a venue that isn't
+    // actually subscribed would otherwise parse successfully and silently
+    // do nothing, leaving an operator believing their tuning took effect
+    // when it didn't.
     std::vector<std::string> unused_overrides;
     for (const auto& [venue_id, timeout] : idle_timeout_config->overrides) {
         if (!wired_venue_ids.contains(venue_id)) {
@@ -337,60 +312,44 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Lets a real SIGINT/SIGTERM (Ctrl-C, `docker stop`/`docker compose
-    // down`) make server->Wait() below return, instead of the OS just
-    // killing the process outright - its default disposition, since
-    // nothing else here installs a handler, which used to mean every one
-    // of those skipped runner.stop_all()'s clean drain entirely. Delivered
-    // through `io`'s own event loop (runs on io_thread) rather than a raw
-    // signal()/sigaction() handler, so the callback isn't restricted to
-    // async-signal-safe calls the way a real signal handler would be.
+    // Lets a real SIGINT/SIGTERM (Ctrl-C, `docker stop`) make
+    // server->Wait() below return, instead of the OS killing the process
+    // outright. Delivered through `io`'s own event loop (runs on
+    // io_thread) rather than a raw signal()/sigaction() handler, so the
+    // callback isn't restricted to async-signal-safe calls.
     //
     // grpc_shutdown_thread, not an inline server->Shutdown() call: the
-    // handler itself runs on io_thread, and Shutdown() blocks for up to
+    // handler runs on io_thread, and Shutdown() blocks for up to
     // kGrpcShutdownDeadline draining in-flight RPCs - doing that inline
     // would stall every VenueSession's read/write/reconnect-timer
-    // dispatch on `io` for that whole window, for no benefit (nothing
-    // here needs Shutdown() to finish before those keep running). Joined
-    // right after server->Wait() returns below - never detached, for the
-    // same use-after-free reason heartbeat_thread and shutdown_watchdog
-    // aren't either. Guarded with joinable(), not asserted: Server::Wait()
-    // is `while (started_ && !shutdown_notified_)`, so if `started_` were
-    // ever false it returns immediately without this thread ever having
-    // been started - joining a default-constructed std::thread is
-    // std::terminate, a crash, not merely a wrong value, so this is worth
-    // the runtime check even though today's code always starts it first.
+    // dispatch on `io` for that whole window. Joined right after
+    // server->Wait() returns below, never detached, for the same
+    // use-after-free reason as heartbeat_thread. Guarded with joinable(),
+    // not asserted: Server::Wait() returns immediately without this
+    // thread ever starting if `started_` is false, and joining a
+    // default-constructed std::thread is std::terminate, not merely a
+    // wrong value.
     //
     // A deadline, not a bare Shutdown(): AggregatorService's subscriber
-    // streams (SubscribeL2Diff/SubscribeBbo) are intentionally long-lived,
-    // so a subscriber that never disconnects would otherwise make
-    // Shutdown() wait for it forever. kGrpcShutdownDeadline only bounds
-    // grpc's own *first* internal phase, though, not the whole call: past
-    // this deadline, grpc force-cancels every in-flight RPC and then waits
-    // *again*, untimed, for that cancellation to actually be observed
-    // (Server::ShutdownInternal(), server_cc.cc) - so a genuinely wedged
-    // subscriber Write() (a black-holed socket cancellation can't unstick
-    // promptly, the same class of pathological network condition the
-    // DNS-resolution comment below already calls out for the ingestion
-    // side) can still leave server->Wait() blocked indefinitely. That's a
-    // known, accepted gap, not an oversight: the backstop for it is a
-    // second SIGINT/SIGTERM (forcing std::_Exit() below) or, failing
-    // that, the orchestrator's own SIGKILL - not one more layered
-    // in-process timeout on top of the two this file already has. This
-    // stacks with kShutdownTimeout below rather than overlapping it in
-    // the nominal case - Shutdown() must finish, and server->Wait()
-    // return, before runner.stop_all() even starts - so anything driving
-    // this process needs a shutdown budget of at least their sum; see
-    // docker-compose.yml's stop_grace_period for this project's own.
+    // streams are intentionally long-lived, so a subscriber that never
+    // disconnects would otherwise make Shutdown() wait forever.
+    // kGrpcShutdownDeadline only bounds grpc's own *first* internal phase,
+    // though: past this deadline grpc force-cancels every in-flight RPC
+    // and then waits again, untimed, for that cancellation to actually be
+    // observed - so a genuinely wedged subscriber Write() can still leave
+    // server->Wait() blocked indefinitely. That's a known, accepted gap:
+    // the backstop is a second SIGINT/SIGTERM (forcing std::_Exit() below)
+    // or the orchestrator's own SIGKILL. This stacks with kShutdownTimeout
+    // below rather than overlapping it - Shutdown() must finish before
+    // runner.stop_all() even starts - so anything driving this process
+    // needs a shutdown budget of at least their sum (see
+    // docker-compose.yml's stop_grace_period).
     //
-    // Re-armed, not truly one-shot: boost::asio::signal_set keeps the OS
-    // disposition pointed at this handler for `signals`' whole lifetime -
-    // it does not revert to the OS default just because async_wait()
-    // isn't re-armed, so a genuinely one-shot registration would silently
-    // swallow every signal after the first rather than let an operator
-    // force an immediate exit (via a second Ctrl-C/SIGTERM) if the drain
-    // below ever stalls. Re-arming lets a second signal reach this same
-    // handler, which calls std::_Exit() instead of asking nicely again.
+    // Re-armed, not one-shot: boost::asio::signal_set keeps the OS
+    // disposition pointed at this handler for `signals`' whole lifetime,
+    // so a truly one-shot registration would silently swallow every
+    // signal after the first. Re-arming lets a second signal reach this
+    // same handler, which calls std::_Exit() instead of asking nicely again.
     constexpr auto kGrpcShutdownDeadline = std::chrono::seconds(5);
     std::thread grpc_shutdown_thread;
     bool shutdown_requested = false;
@@ -426,23 +385,19 @@ int main(int argc, char** argv) {
     // No io.stop() as the primary shutdown mechanism: stop_all() aborts
     // every session's in-flight read/backoff wait and drains any in-flight
     // snapshot fetch (see VenueSession::stop()), so io.run() should return
-    // on its own - see docs/ingestion_design.md 第 10 節第 2 項's 驗收標準
-    // (verified live against wss://fstream.binance.com: join returned
-    // ~3ms after stop_all()). kShutdownTimeout is a backstop, not the
-    // expected path, and has to be comfortably longer than the longest
-    // timeout any single in-flight operation could legitimately still be
-    // running under when stop() lands - currently
-    // WebSocketConnection::connect()'s own 30s connect/TLS-handshake
-    // timeout (service/websocket_connection.hpp), the longest of the two
+    // on its own. kShutdownTimeout is a backstop, not the expected path,
+    // and has to be comfortably longer than the longest timeout any
+    // single in-flight operation could legitimately still be running
+    // under when stop() lands - currently WebSocketConnection::connect()'s
+    // own 30s connect/TLS-handshake timeout, the longer of the two
     // (http_get's is 10s). A shorter watchdog would routinely fire and
     // force the crude io.stop() fallback for a stop() that simply landed
     // during a slow-but-still-progressing connect, not a genuinely stuck
     // one. Even 35s doesn't cover every stage unconditionally: a snapshot
-    // fetch's DNS resolution (tcp::resolver, under the REST fetch's own
-    // cancellation) runs the underlying getaddrinfo() call on a
+    // fetch's DNS resolution runs the underlying getaddrinfo() call on a
     // background thread that keeps going until the OS call itself
-    // returns, regardless of the awaitable-level cancellation completing
-    // - a genuinely stuck/black-holed resolution can still delay process
+    // returns, regardless of the awaitable-level cancellation completing -
+    // a genuinely stuck/black-holed resolution can still delay process
     // teardown past this bound. That's a Boost.Asio/OS-level limitation,
     // not something this code can fix by waiting longer.
     constexpr auto kShutdownTimeout = std::chrono::seconds(35);
@@ -469,8 +424,8 @@ int main(int argc, char** argv) {
     shutdown_watchdog.join();
 
     // Stopped and joined here, before `service` goes out of scope below -
-    // see the comment on heartbeat_thread's construction for why this
-    // can't be a detach().
+    // see heartbeat_thread's own construction comment for why this can't
+    // be a detach().
     heartbeat_stop = true;
     heartbeat_thread.join();
     return 0;

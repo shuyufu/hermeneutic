@@ -24,12 +24,9 @@ constexpr VenueId kBinance{Exchange::Binance, MarketType::Spot};
 constexpr VenueId kOkx{Exchange::Okx, MarketType::Spot};
 
 // AggregateOrderBook has no single-level apply_delta() (see apply_batch()'s
-// own doc comment on why - it's unused on the real ingestion path and
-// apply_batch() is its exact functional superset, so keeping it around
-// meant one more near-identical name in this class's public surface for no
-// production caller). This recreates that old single-level convenience
-// purely for these tests, via apply_batch() with a one-element span on the
-// requested side and an empty span on the other.
+// own doc comment on why). This gives these tests that single-level
+// convenience via apply_batch() with a one-element span on the requested
+// side and an empty span on the other.
 std::expected<void, std::errc> apply_one(AggregateOrderBook& book, const VenueId& venue, Side side,
                                           Price price, Size size) {
     std::array<std::pair<Price, Size>, 1> level{{{price, size}}};
@@ -252,15 +249,12 @@ TEST(AggregateOrderBook, ApplySnapshotAppliesBothSidesInOneCall) {
     EXPECT_EQ(book.aggregate().asks.at(Price(101.0)), Size(3.0));
 }
 
-// The bug this guards against: apply_snapshot() used to take one side at a
-// time, so a caller resyncing both sides of a venue made two independent
-// calls - a bad level on one side could be rejected while the other side's
-// (perfectly valid) resync had already gone through, leaving the venue's
-// book genuinely half-resynced with nothing downstream able to tell (see
-// venue_session.hpp's own historical comment on this). Taking both sides
-// in one call and validating both before touching either - the same shape
-// apply_batch() already used - closes that gap: a bad level anywhere
-// rejects the whole snapshot, valid side included.
+// Regression test: apply_snapshot() must take both sides in one call and
+// validate both before touching either, the same shape apply_batch()
+// uses - a caller resyncing both sides of a venue via two independent
+// calls could have a bad level on one side rejected while the other
+// side's valid resync already went through, leaving the book genuinely
+// half-resynced with nothing downstream able to tell.
 TEST(AggregateOrderBook, ApplySnapshotRejectsBadLevelOnEitherSideWithoutTouchingTheOther) {
     AggregateOrderBook book;
     apply_one(book, kBinance, Side::Bid, Price(50.0), Size(1.0));
@@ -381,11 +375,10 @@ TEST(AggregateOrderBook, ApplyBatchRejectsNegativeSizeAtomically) {
     EXPECT_EQ(book.aggregate().bids.at(Price(100.0)), Size(1.0));
 }
 
-// A non-positive price used to pass through unchecked (only size was
-// validated). Both zero and negative are rejected the same way size's own
-// <0 check is: with std::errc::invalid_argument and no state mutated,
-// atomically across the whole batch (the good bid ahead of the bad ask
-// isn't applied either).
+// Regression test: a non-positive price must be rejected, not just size.
+// Both zero and negative are rejected the same way size's own <0 check
+// is: with std::errc::invalid_argument and no state mutated, atomically
+// across the whole batch.
 TEST(AggregateOrderBook, ApplyBatchRejectsNonPositivePriceAtomically) {
     AggregateOrderBook book;
     apply_one(book, kBinance, Side::Ask, Price(100.0), Size(1.0));
@@ -411,12 +404,10 @@ TEST(AggregateOrderBook, ApplyBatchRejectsNonPositivePriceAtomically) {
     EXPECT_EQ(book.aggregate().asks.at(Price(100.0)), Size(1.0));
 }
 
-// The `Sink` callbacks below are how aggregator::SymbolBook now observes
-// what changed, instead of re-deriving it itself (lookup_aggregate() +
-// before/after snapshots) - see aggregate_order_book.hpp's own class
-// comment. These cases exercise that contract directly, on the always-
-// built binary, since the SymbolBook-level tests that used to be the only
-// coverage of the underlying diff logic are gRPC-gated.
+// The `Sink` callbacks below are how aggregator::SymbolBook observes what
+// changed - see aggregate_order_book.hpp's own class comment. These cases
+// exercise that contract directly, on the always-built binary, since the
+// SymbolBook-level tests that also cover it are gRPC-gated.
 
 TEST(AggregateOrderBook, SinkInvokedWithResultingAggregateSize) {
     AggregateOrderBook book;

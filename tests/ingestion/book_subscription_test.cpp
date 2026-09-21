@@ -184,10 +184,9 @@ TEST(ParseIdleTimeoutConfig, RejectsZeroOrNegativeDefault) {
     }
 }
 
-// A wrong-typed (not INCORRECT_TYPE-absent, but present-and-wrong) value
-// must name "idle_timeout_seconds" specifically, not fall through to the
-// generic "malformed subscription config" message - a /code-review pass
-// caught this catch only recognizing NO_SUCH_FIELD.
+// A wrong-typed (not absent, but present-and-wrong) value must name
+// "idle_timeout_seconds" specifically, not fall through to the generic
+// "malformed subscription config" message.
 TEST(ParseIdleTimeoutConfig, RejectsWrongTypedDefault) {
     auto result = parse_idle_timeout_config(R"({"idle_timeout_seconds": "30"})");
     ASSERT_FALSE(result.has_value());

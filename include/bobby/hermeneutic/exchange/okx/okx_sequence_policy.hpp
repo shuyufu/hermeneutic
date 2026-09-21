@@ -6,9 +6,7 @@
 
 namespace bobby::hermeneutic {
 
-// OKX v5 public `books` channel, verified against the sequencing rules the
-// user quoted directly from OKX's own docs (not assumed from training
-// data), then traced against the worked example those docs give:
+// OKX v5 public `books` channel. Traced against OKX's own worked example:
 //   snapshot: prevSeqId=-1, seqId=10
 //   normal update:          prevSeqId=10, seqId=15
 //   idle heartbeat:         prevSeqId=15, seqId=15   (empty bids/asks)
@@ -33,9 +31,9 @@ namespace bobby::hermeneutic {
 //     find a bridge and safely retries (RequestSnapshot), it does not apply
 //     wrong data - resets are documented as maintenance-only and rare.
 //   - Checksum (CRC32 over the top book levels) is deliberately not
-//     implemented - the user confirmed relying on the seqId/prevSeqId chain
-//     alone, the same rigor Binance's policies already operate at with no
-//     extra integrity layer.
+//     implemented - this relies on the seqId/prevSeqId chain alone, the
+//     same rigor Binance's policies already operate at with no extra
+//     integrity layer.
 //   - kTrustsConnectionOrder = true: OKX pushes its own snapshot as the
 //     first message on a fresh (re)subscribe (kSnapshotViaRest == false),
 //     same reasoning as BybitSequencePolicy.

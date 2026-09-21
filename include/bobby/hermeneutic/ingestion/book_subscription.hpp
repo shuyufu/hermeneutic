@@ -186,9 +186,7 @@ inline std::expected<std::vector<VenueSubscription>, std::string> load_book_subs
 // a VenueSession should use, per VenueId. Configurable per venue rather
 // than a single fixed constant mainly as a safety knob: this measures how
 // long we tolerate a venue's WS gateway not answering our own idle ping,
-// which hasn't been live-verified per venue (a healthy gateway should
-// answer in well under a second, but nothing here has actually confirmed
-// that per-venue yet - see docs/ingestion_design.md 第10節第15項).
+// which hasn't been live-verified per venue.
 struct IdleTimeoutConfig {
     std::chrono::seconds default_timeout = kDefaultIdleTimeout;
     std::unordered_map<VenueId, std::chrono::seconds> overrides;
@@ -237,14 +235,9 @@ inline std::expected<IdleTimeoutConfig, std::string> parse_idle_timeout_config(s
             // INCORRECT_TYPE (present but not a number, e.g. a string)
             // gets the same targeted message as an out-of-range value
             // below, matching how the override-entry parser already
-            // handles this same class of mistake for its own fields - a
-            // /code-review pass caught this catch only ever recognizing
-            // NO_SUCH_FIELD, so a wrong-typed value fell through to the
-            // generic "malformed subscription config" message instead of
-            // naming the field. Anything else really is document
-            // corruption, rethrown to the outer catch below (the same
-            // reasoning ParseIdleTimeoutConfig.RejectsMalformedJson
-            // caught this function getting wrong the first time).
+            // handles this same class of mistake for its own fields.
+            // Anything else really is document corruption, rethrown to
+            // the outer catch below.
             if (e.error() == simdjson::INCORRECT_TYPE) return idle_timeout_seconds_range_error();
             if (e.error() != simdjson::NO_SUCH_FIELD) throw;
         }
@@ -277,9 +270,7 @@ inline std::expected<IdleTimeoutConfig, std::string> parse_idle_timeout_config(s
                     // here, and if that throw were outside this block it
                     // would escape to the outer "malformed subscription
                     // config" catch below instead of this entry's own
-                    // field-list error - a real bug this exact scenario
-                    // caught (empirically verified by compiling this
-                    // header standalone).
+                    // field-list error.
                     simdjson::ondemand::object entry = entry_value.get_object();
                     venue_token = entry["venue"].get_string();
                     type_field = entry["type"].get_string();

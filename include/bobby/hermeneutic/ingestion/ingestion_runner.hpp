@@ -16,7 +16,7 @@ namespace bobby::hermeneutic::ingestion {
 // signature, so nothing about SymbolSync/VenueFeed needs to become
 // virtual - the per-message hot path (parse_message -> SymbolSync ->
 // apply_batch) never crosses this interface, it stays fully monomorphized
-// inside VenueSession. See docs/ingestion_design.md 第 10 節第 2 項.
+// inside VenueSession.
 class IVenueSession {
   public:
     virtual ~IVenueSession() = default;
@@ -72,7 +72,6 @@ class VenueSessionAdapter : public IVenueSession {
 // own start()'s on_done has fired, nothing is left touching any of them,
 // so the caller can destroy this IngestionRunner (and, separately, stop
 // its io_context) without needing io_context::stop() as a blunt backstop.
-// See docs/ingestion_design.md 第 10 節第 2 項's 驗收標準.
 class IngestionRunner {
   public:
     template <typename Feed, typename Policy, typename NextLayer, typename Book, typename... Args>

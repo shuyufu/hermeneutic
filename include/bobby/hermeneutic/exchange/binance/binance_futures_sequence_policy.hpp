@@ -8,9 +8,7 @@ namespace bobby::hermeneutic {
 
 // Binance USDS-M Futures' documented local-order-book procedure
 // (developers.binance.com/docs/derivatives/usds-margined-futures/
-// websocket-market-streams/How-to-manage-a-local-order-book-correctly),
-// verified against the primary source rather than assumed from Spot's
-// (different) rules:
+// websocket-market-streams/How-to-manage-a-local-order-book-correctly):
 //   - drop buffered events with final_id < snapshot.last_update_id (strict <)
 //   - the bridging event needs first_id <= last_update_id && final_id >= last_update_id
 //     (no +1 offset, unlike Spot's U == lastUpdateId+1 model)

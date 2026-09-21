@@ -39,20 +39,13 @@ namespace detail {
 // below, not this function.
 //
 // Fails with std::errc::result_out_of_range if the resulting boundary
-// doesn't fit back into Price::raw_type - unlike notional.hpp's operators
-// (from_raw_checked()'s usual debug-only assert), this is a genuine
-// runtime possibility here, not just an internal invariant: bid_price_
-// band_depths()/ask_price_band_depths() cap the *bid* side's bps at under
-// 10000 (a domain requirement - a bid boundary at or past that would be
-// zero or negative), but the ask side has no such ceiling, and this
-// project validates no upper bound on price itself either (is_valid_level()
-// only checks price > 0) - so a sufficiently large ask bps threshold
-// against a sufficiently large price is a real, externally-reachable way
-// to overflow the __int128 intermediate's narrowing back to raw_type, not
-// a "no realistic input reaches this" case the way every other
-// from_raw_checked() call site in this codebase is. Price::from_raw_safe()
-// is the shared bounds check for exactly this situation - see its own
-// comment.
+// doesn't fit back into Price::raw_type - a genuine runtime possibility
+// here, not just an internal invariant: the ask side has no bps ceiling
+// (unlike the bid side, capped under 10000 since a boundary at or past
+// that would be zero or negative), and this project validates no upper
+// bound on price either, so a large ask bps threshold against a large
+// price can genuinely overflow. Price::from_raw_safe() is the shared
+// bounds check for exactly this.
 constexpr std::expected<Price, std::errc> offset_by_bps(Price price, int signed_bps,
                                                           bool round_down) noexcept {
     assert(price.raw() > 0);
@@ -90,12 +83,12 @@ constexpr bool within_bps(Price price, Price best_price, int signed_bps, bool ge
 // Ask/Bid: the two side-specific policies for how offset_by_bps/within_bps's
 // round_down/ge booleans are derived, so a caller states its side once
 // (Ask:: or Bid::) instead of re-deriving both booleans from a signed bps
-// value by hand and risking getting one of them backwards -- price_band_depth
-// below used to do exactly that derivation inline. "reference" here is
-// whatever Price the caller passes in -- this side's own best price in
-// price_band_depth's use below, never a midprice (this file doesn't compute
-// one). Each type takes an unsigned `bps` and applies its side's sign
-// internally, rather than making the caller pre-multiply by +1/-1.
+// value by hand and risking getting one of them backwards. "reference"
+// here is whatever Price the caller passes in - this side's own best
+// price in price_band_depth's use below, never a midprice (this file
+// doesn't compute one). Each type takes an unsigned `bps` and applies its
+// side's sign internally, rather than making the caller pre-multiply by
+// +1/-1.
 //
 // round_away (the boundary that overstates reach, rounding outward instead
 // of inward) has no caller today and is deliberately not implemented here --
@@ -133,42 +126,28 @@ struct Bid {
 // O(levels + bps_thresholds).
 //
 // Fails with std::errc::invalid_argument if `bps_thresholds` itself isn't
-// sorted/non-negative/(for bids) under 10000 - checked at runtime rather
-// than only asserted, since `bps_thresholds` comes from the caller (an API
-// request, ultimately), not from this module's own internal bookkeeping
-// the way `Side` does (a compile-time choice this module's only callers -
-// bid_price_band_depths()/ask_price_band_depths() - already make via the
-// static_assert below, not something a caller passes in at runtime). The
-// algorithm below walks bps_thresholds with a single monotonically-
-// increasing index (`next`), so an unsorted input would silently compute
-// wrong band boundaries in a release build rather than failing loudly -
-// the same reasoning is why offset_by_bps()/within_bps() below are still
-// assert()-only for their own price>0 precondition: this function
-// validates that before ever calling them, so it's never checked twice.
+// sorted/non-negative/(for bids) under 10000 - checked at runtime, since
+// `bps_thresholds` comes from the caller (an API request), unlike `Side`
+// (a compile-time choice). The algorithm walks bps_thresholds with a
+// single monotonically-increasing index (`next`), so an unsorted input
+// would silently compute wrong band boundaries rather than failing loudly.
 //
 // Also fails with std::errc::argument_out_of_domain if any level has a
-// non-positive price (or a negative size), checked as each level is
-// walked - same rationale as volume_band_prices()'s own per-level check:
-// `levels` is the caller's own already-mutated book, not something this
-// function controls, so a level that shouldn't exist (a malformed
-// upstream message that slipped past whatever inserted it) is a runtime
-// condition this must reject, not an assert()-only precondition that
-// silently no-ops in a release build. offset_by_bps()/within_bps() (reached
-// through Side::round_inner()/Side::within()) only assert() their own
-// price>0 precondition precisely because this function is what's
-// responsible for upholding it before ever calling them - never validated
-// twice.
+// non-positive price or negative size, checked as each level is walked:
+// `levels` is the caller's own book, not something this function
+// controls, so a malformed level is a runtime condition to reject, not an
+// assert()-only precondition. This is why offset_by_bps()/within_bps()
+// (reached through Side::round_inner()/Side::within()) can stay
+// assert()-only for their own price>0 precondition - this function
+// upholds it before ever calling them, so it's never checked twice.
 //
 // Also fails with std::errc::result_out_of_range if a boundary computed
-// from a (validated-in-range, but still arbitrarily large) bps threshold
-// against an (unbounded - this project validates no upper limit on price
-// anywhere) level price doesn't fit back into Price - see
-// offset_by_bps()'s own comment for why this is a real runtime
-// possibility here, not just an internal invariant - or if the running
-// cum_notional total itself overflows Notional while accumulating across
-// levels: each individual price*size can be in-range while the series
-// still isn't, which a plain per-call assert (BasicFixedPoint's own
-// operator+=) can't catch - see Notional::from_raw_safe()'s own comment.
+// from a validated-in-range bps threshold against an unbounded level
+// price doesn't fit back into Price (see offset_by_bps()'s own comment),
+// or if the running cum_notional total itself overflows while
+// accumulating across levels - each individual price*size can be
+// in-range while the series isn't, which a plain per-call assert can't
+// catch (see Notional::from_raw_safe()'s own comment).
 template <typename Side, typename Map>
 std::expected<std::vector<PriceBand>, std::errc> price_band_depth(
     const Map& levels, std::span<const int> bps_thresholds) {

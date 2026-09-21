@@ -38,14 +38,11 @@ TEST(PriceBands, OffsetByBpsRoundsInwardRatherThanToNearest) {
     EXPECT_EQ(bid->raw(), 6);
 }
 
-// code-review finding: the bid side already rejects any threshold at or
-// past 10000bps at price_band_depth()'s own runtime check (a domain
-// requirement - a bid boundary that far out would be zero or negative),
-// but the ask side has no such ceiling, and this project validates no
-// upper bound on price anywhere either (is_valid_level() only checks
-// price > 0) - so offset_by_bps() itself has to be the last line of
-// defense against a boundary that doesn't fit back into Price, not
-// something a caller-side threshold check can rule out up front.
+// The bid side already rejects any threshold at or past 10000bps at
+// price_band_depth()'s own runtime check, but the ask side has no such
+// ceiling and this project validates no upper bound on price either, so
+// offset_by_bps() itself has to be the last line of defense against a
+// boundary that doesn't fit back into Price.
 TEST(PriceBands, OffsetByBpsReportsOutOfRangeInsteadOfOverflowingOrAborting) {
     // Price::raw_type::max() ~ 9.2e18; a price near that combined with a
     // merely-large (not even adversarially extreme) bps threshold already
@@ -296,10 +293,8 @@ TEST(PriceBands, BidBps9999IsAcceptedAtTheEdgeOfTheValidRange) {
 
 TEST(PriceBands, BidBps10000IsRejected) {
     // One past BidBps9999IsAcceptedAtTheEdgeOfTheValidRange's edge: a
-    // 10000bps bid boundary would be priced at zero, meaningless. Unlike
-    // when this was assert()-only (see git history), this is now a real,
-    // directly testable runtime check rather than something only a
-    // throwaway program compiled without NDEBUG could confirm.
+    // 10000bps bid boundary would be priced at zero, meaningless, so this
+    // must be a real, directly testable runtime check.
     L2OrderBook book;
     book.bids[Price(100.0)] = Size(1.0);
 
@@ -382,8 +377,8 @@ TEST(PriceBands, RejectsNonPositivePriceLevelEvenWhenNotTheBest) {
     EXPECT_EQ(result.error(), std::errc::argument_out_of_domain);
 }
 
-// code-review finding: cum_notional accumulates via a checked add now (see
-// price_band_depth()'s own comment), not a plain operator+= - each level's
+// Regression test: cum_notional must accumulate via a checked add (see
+// price_band_depth()'s own comment), not a plain operator+=. Each level's
 // own price*size here is comfortably in range (~5e9, well under
 // Notional::raw_type's ~9.22e9 max), so this specifically exercises the
 // *running total* overflowing across levels, not any single level's own

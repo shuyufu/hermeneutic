@@ -221,29 +221,24 @@ net::awaitable<void> run_fake_ws_server(net::ip::tcp::acceptor acceptor, std::st
     co_await ws.async_write(net::buffer(depth_message), net::use_awaitable);
 
     // Keeps the connection open for the rest of the test instead of letting
-    // `ws` (and the underlying socket) get destroyed the instant this
-    // coroutine returns - an immediate close here would make VenueSession's
-    // very next read() see a disconnect and correctly invalidate/reset
-    // (see docs/ingestion_design.md's on_disconnected()), which isn't what
-    // this test is trying to exercise. Ends only when the test tears down
-    // `io` (or, more likely, io.run_for()'s deadline elapses first).
+    // `ws` get destroyed the instant this coroutine returns - an immediate
+    // close would make VenueSession's next read() see a disconnect and
+    // invalidate/reset, which isn't what this test exercises. Ends only
+    // when the test tears down `io` (or io.run_for()'s deadline elapses).
     beast::flat_buffer idle_buffer;
     boost::system::error_code ec;
     co_await ws.async_read(idle_buffer, net::redirect_error(net::use_awaitable, ec));
 }
 
-// Responds after a short artificial delay, so the depth event above (sent
-// immediately) has already arrived and been buffered by the time this
-// resolves - proving VenueSession keeps reading while the fetch is in
-// flight, not only after it returns. `delay` defaults to comfortably longer
-// than the depth event's arrival but short enough for a normal test
-// timeout; StopDrainsInFlightSnapshotFetch below passes a much longer one
-// to prove a cancelled fetch doesn't just sit there waiting it out.
 // Reads one HTTP request off an already-accepted `socket` and answers it
-// with `body` (optionally after an artificial `delay`) - the accept/read/
+// with `body`, optionally after an artificial `delay` - the accept/read/
 // (wait)/respond block every fake HTTP server below needs, factored out so
 // each one only has to say how many connections it accepts and in what
-// shape, not repeat this mechanics three times (a /code-review finding).
+// shape. `delay` defaults long enough that a depth event sent immediately
+// over WS has already arrived and been buffered by the time this resolves,
+// proving VenueSession keeps reading while the fetch is in flight;
+// StopDrainsInFlightSnapshotFetch below passes a much longer delay to prove
+// a cancelled fetch doesn't just sit there waiting it out.
 net::awaitable<void> respond_to_one_http_request(net::ip::tcp::socket& socket, std::string body,
                                                    std::chrono::milliseconds delay = std::chrono::milliseconds(0)) {
     beast::flat_buffer buffer;
@@ -269,11 +264,9 @@ net::awaitable<void> run_fake_http_server(net::ip::tcp::acceptor acceptor, std::
 }
 
 // Accepts a connection and closes it immediately - no request read, no
-// response written - simulating a REST fetch attempt that fails (refused,
-// reset, whatever the real cause), then accepts a second connection and
-// answers it normally. http_get()'s own catch-all (any exception from the
-// read/write chain becomes std::unexpected(std::errc::io_error)) turns the
-// abrupt close into exactly the same "fetch failed" outcome
+// response written - simulating a REST fetch attempt that fails, then
+// accepts a second connection and answers it normally. http_get()'s own
+// catch-all turns the abrupt close into the same "fetch failed" outcome
 // handle_request_snapshot() sees from a real network failure.
 net::awaitable<void> run_fake_http_server_fails_once_then_succeeds(net::ip::tcp::acceptor acceptor,
                                                                      std::string response_body) {
@@ -296,28 +289,22 @@ net::awaitable<void> run_fake_http_server_twice(net::ip::tcp::acceptor acceptor,
     }
 
     auto socket = co_await acceptor.async_accept(net::use_awaitable);
-    // Unlike the first response, an artificial delay here (rather than
-    // just relying on run_fake_ws_server_two_messages_gated's own gate) is
-    // sometimes needed: that gate only proves the *first* batch's own
-    // resync has already run by the time the gated WS message gets sent -
-    // it says nothing about how long that message then takes to actually
-    // reach and get buffered by SymbolSync (a WS write+read, on this same
-    // io_context) relative to how fast *this* HTTP round trip (no delay of
-    // its own, loopback) resolves. Without this, a fast enough second
-    // response can arrive before the gated message does, find an empty
-    // buffer, and retry immediately (SymbolSync's own no-bridge/no-op
-    // RequestSnapshot loop) instead of exercising the bridge this test is
-    // actually for.
+    // `second_delay` is sometimes needed beyond
+    // run_fake_ws_server_two_messages_gated's own gate: that gate only
+    // proves the first batch's resync has run before the gated WS message
+    // is sent, not that the message has been buffered by SymbolSync before
+    // this HTTP round trip resolves. Without a delay here, a fast enough
+    // response can arrive first, find an empty buffer, and retry
+    // immediately instead of exercising the bridge this test is for.
     co_await respond_to_one_http_request(socket, std::move(second_body), second_delay);
 }
 
 // Accepts connections forever, each time consuming the SUBSCRIBE message
-// and then immediately closing (ws/socket are loop-local, so they're
-// destroyed - and the connection with them - the moment control loops back
-// to accept the next one). Used to simulate a dropped connection without
-// caring what the client does next: StopAbortsBackoffWaitAndDoesNotReconnect
-// uses `connect_count` to prove a reconnect never happens once stop() has
-// been called.
+// and then immediately closing (ws/socket are loop-local, destroyed the
+// moment control loops back to accept the next one). Simulates a dropped
+// connection without caring what the client does next;
+// StopAbortsBackoffWaitAndDoesNotReconnect uses `connect_count` to prove a
+// reconnect never happens once stop() has been called.
 net::awaitable<void> run_flaky_ws_server(net::ip::tcp::acceptor acceptor, std::atomic<int>* connect_count) {
     while (true) {
         auto socket = co_await acceptor.async_accept(net::use_awaitable);
@@ -358,16 +345,13 @@ net::awaitable<void> run_fake_ws_server_two_messages(net::ip::tcp::acceptor acce
 }
 
 // Like run_fake_ws_server_two_messages, but blocks (polling `proceed`)
-// between the two writes instead of sending them back-to-back - so a test
+// between the two writes instead of sending them back-to-back, so a test
 // can pin down exactly which SymbolSync state `second_message` arrives in
-// (e.g. "only after the first message's own resync has already gone
-// Live"), rather than racing it against however long an intervening REST
-// round trip happens to take. Without this, a fast-enough loopback round
-// trip could let `second_message` land while still Buffering, buffered
-// alongside the first rather than exercising the Live-state code path the
-// test is named for - the SyncAction/L2Update sequence can end up
-// identical either way, so a flaky-looking pass wouldn't even reveal the
-// problem (a /code-review finding on this file's own tests).
+// rather than racing it against an intervening REST round trip. Without
+// this, a fast-enough loopback round trip could let `second_message` land
+// while still Buffering instead of exercising the Live-state code path the
+// test is named for - the resulting SyncAction/L2Update sequence can look
+// identical either way, so a flaky pass wouldn't reveal the problem.
 net::awaitable<void> run_fake_ws_server_two_messages_gated(net::ip::tcp::acceptor acceptor,
                                                               std::string first_message,
                                                               std::string second_message,
@@ -394,17 +378,13 @@ net::awaitable<void> run_fake_ws_server_two_messages_gated(net::ip::tcp::accepto
     co_await ws.async_read(idle_buffer, net::redirect_error(net::use_awaitable, ec));
 }
 
-// First connection: sends `first_snapshot`, then drops (the socket/ws go
-// out of scope at the end of the inner block, closing the connection
-// right after that write - before any diff could arrive). Second
-// connection (after VenueSession's own backoff+reconnect): sends
+// First connection: sends `first_snapshot`, then drops (socket/ws go out
+// of scope right after that write, before any diff could arrive). Second
+// connection (after VenueSession's backoff+reconnect): sends
 // `second_snapshot`, then holds the connection open. Proves VenueSession
-// redoes the whole connect->subscribe->on_connected->snapshot-pushed-
-// first flow correctly *again* after a reconnect, not just once.
-// run_flaky_ws_server (below) already drops connections mid-stream - see
-// StopAbortsBackoffWaitAndDoesNotReconnect, which relies on exactly that -
-// but no existing test checks *book state* after a reconnect, and none
-// does so for a kSnapshotViaRest=false feed at all.
+// redoes the whole connect->subscribe->on_connected->snapshot-pushed-first
+// flow correctly again after a reconnect, checking book state - which
+// run_flaky_ws_server's drop-based test does not.
 net::awaitable<void> run_fake_ws_server_drop_then_reconnect(net::ip::tcp::acceptor acceptor,
                                                               std::string first_snapshot,
                                                               std::string second_snapshot) {
@@ -473,19 +453,15 @@ net::awaitable<void> run_fake_ws_server_live_gap_then_reconnect(net::ip::tcp::ac
 // connection open" fake server in this file - issues no further read at
 // all, not even an idle one. That distinction matters: any pending read on
 // a websocket::stream auto-answers an incoming ping as a side effect of
-// Beast's own read machinery (impl/read.hpp), regardless of whether the
-// "application" ever asked it to - so an idle *read* would still make this
-// a responsive peer, not the true black hole this test needs to exercise
-// WebSocketConnection::connect()'s real idle_timeout (Boost.Beast's own
-// websocket::stream_base::timeout + keep_alive_pings). With no read
-// pending, nothing this socket receives - including the client's own idle
-// ping - is ever processed or answered, so the client's timeout is the only
+// Beast's own read machinery, regardless of whether the application asked
+// for it, so an idle *read* would still make this a responsive peer, not
+// the true black hole needed to exercise WebSocketConnection::connect()'s
+// real idle_timeout. With no read pending, nothing this socket receives is
+// ever processed or answered, so the client's own timeout is the only
 // thing that can end this connection. `hold` just bounds how long this
-// coroutine waits before moving on to accept the second connection - it
-// doesn't detect the client's timeout firing (this side has no way to,
-// short of reading), it just has to outlast it. Second connection: pushes a
-// fresh snapshot, proving the symbol actually resyncs once the client
-// reconnects.
+// coroutine waits before accepting the second connection - it can't detect
+// the client's timeout firing, only outlast it. Second connection: pushes
+// a fresh snapshot, proving the symbol resyncs once the client reconnects.
 net::awaitable<void> run_fake_ws_server_black_hole_then_reconnect(net::ip::tcp::acceptor acceptor,
                                                                      std::string snapshot,
                                                                      std::string second_snapshot,
@@ -519,12 +495,8 @@ net::awaitable<void> run_fake_ws_server_black_hole_then_reconnect(net::ip::tcp::
 // connection except the last (`gap_count` times in a row), recording the
 // wall-clock moment each connection is accepted into `connect_times` - what
 // BackoffEscalatesAcrossRepeatedForcedReconnects below needs to prove
-// run()'s backoff counter actually escalates across successive
-// forced-reconnect cycles rather than resetting to a fast retry every
-// single time (a code-review finding on the forced-reconnect fix this
-// file's other Live/BufferingState/RestSnapshot gap tests exercise -
-// execute_actions_and_maybe_force_reconnect()'s kTrustsConnectionOrder ==
-// true branch, in venue_session.hpp).
+// run()'s backoff counter escalates across successive forced-reconnect
+// cycles rather than resetting to a fast retry every time.
 net::awaitable<void> run_fake_ws_server_repeated_live_gaps(
     net::ip::tcp::acceptor acceptor, int gap_count, std::string snapshot, std::string gapped_depth,
     std::vector<std::chrono::steady_clock::time_point>* connect_times) {
@@ -540,9 +512,8 @@ net::awaitable<void> run_fake_ws_server_repeated_live_gaps(
 
         // The forced reconnect closes this connection by destroying
         // VenueSession's own `connection` local (stack unwinding out of
-        // run()'s try block via the thrown exception -
-        // execute_actions_and_maybe_force_reconnect()'s own comment), not
-        // by this server ending it - so this just waits for that instead.
+        // run()'s try block via the thrown exception), not by this server
+        // ending it - so this just waits for that instead.
         beast::flat_buffer idle_buffer;
         boost::system::error_code ec;
         co_await ws.async_read(idle_buffer, net::redirect_error(net::use_awaitable, ec));
@@ -570,13 +541,10 @@ net::awaitable<void> run_fake_ws_server_repeated_live_gaps(
 // answer with, the second is a gap relative to it - then holds the
 // connection open, never closing it itself. `connect_count` is the actual
 // proof this test needs: without VenueSession forcing a reconnect after
-// on_snapshot()'s own bridge-tail gap check (reached only via
-// handle_request_snapshot(), which runs net::co_spawn'ed rather than
-// co_await'ed by run() - see execute_actions_and_maybe_force_reconnect()'s
-// own comment on why that call site can't just reuse it), nothing about the
-// L2Update sequence a subscriber sees would look any different - the
-// forced-reconnect exception this bug swallows never touches the book, only
-// whether a second connection happens at all.
+// on_snapshot()'s own bridge-tail gap check, nothing about the L2Update
+// sequence a subscriber sees would look different - the forced-reconnect
+// exception this bug swallows never touches the book, only whether a
+// second connection happens at all.
 net::awaitable<void> run_fake_ws_server_rest_snapshot_gap_then_reconnect(net::ip::tcp::acceptor acceptor,
                                                                            std::string bridge_depth,
                                                                            std::string gapped_depth,
@@ -654,13 +622,11 @@ TEST(VenueSessionTest, SnapshotFetchOverlapsReadingSoBufferedLiveEventBridgesIt)
         }
     });
     // Guarantees reader_thread is cancelled+joined even if an ASSERT_*/
-    // EXPECT_* below fails or wait_for()'s .at() throws on a timeout -
-    // std::thread's destructor calls std::terminate() if it's still
-    // joinable, which would otherwise mask the real assertion failure
-    // behind a crash instead of a normal test-failure report. Destructed
-    // before `reader_thread` itself (reverse declaration order), and
-    // idempotent with the explicit cleanup at the end of this test (a
-    // second join attempt is skipped once joinable() is already false).
+    // EXPECT_* below fails or wait_for()'s .at() throws: std::thread's
+    // destructor calls std::terminate() if still joinable, which would
+    // mask the real assertion failure behind a crash. Destructed before
+    // `reader_thread` itself (reverse declaration order); idempotent with
+    // the explicit cleanup at the end of this test.
     struct ReaderThreadGuard {
         grpc::ClientContext& context;
         std::thread& thread;
@@ -721,13 +687,11 @@ TEST(VenueSessionTest, SnapshotFetchOverlapsReadingSoBufferedLiveEventBridgesIt)
     server->Shutdown();
 }
 
-// docs/ingestion_design.md 第 10 節第 2 項's stop() design: cancellation is
-// not retroactive, so stop() must be checked (stopping_) right after the
-// disconnect/backoff handling, not just emitted and assumed to take effect
-// immediately. This test is exactly the failure mode that omission would
-// produce: without it, a stop() that lands mid-backoff gets silently
-// ignored and the session reconnects one more time after being told to
-// stop.
+// Guards against a stop() that lands mid-backoff being silently ignored:
+// cancellation isn't retroactive, so run() must check stopping_ right
+// after the backoff wait, not just emit and assume it took effect. Without
+// that check the session would reconnect one more time after being told
+// to stop.
 TEST(VenueSessionTest, StopAbortsBackoffWaitAndDoesNotReconnect) {
     std::vector<std::string> symbols{"BTCUSDT"};
     AggregatorService service(std::vector<BookId>{TestBookId()});
@@ -789,13 +753,13 @@ TEST(VenueSessionTest, StopAbortsBackoffWaitAndDoesNotReconnect) {
     io_thread.join();
 }
 
-// docs/ingestion_design.md 第 10 節第 2 項's 孤兒 snapshot 問題: a
+// Guards against an orphaned in-flight snapshot fetch: a
 // handle_request_snapshot() spawned before stop() is called must actually
 // finish (cancelled, here) before run() returns, or whatever destroys this
-// session next would race an in-flight coroutine still holding a `this`
-// pointing at it. Proven indirectly: a cancelled fetch makes on_done fire
-// almost immediately; one that was merely left to finish on its own would
-// take the full artificial HTTP delay below.
+// session next would race a coroutine still holding a `this` pointing at
+// it. Proven indirectly: a cancelled fetch makes on_done fire almost
+// immediately; one merely left to finish on its own would take the full
+// artificial HTTP delay below.
 TEST(VenueSessionTest, StopDrainsInFlightSnapshotFetch) {
     std::vector<std::string> symbols{"BTCUSDT"};
     AggregatorService service(std::vector<BookId>{TestBookId()});
@@ -848,27 +812,20 @@ TEST(VenueSessionTest, StopDrainsInFlightSnapshotFetch) {
                "artificial HTTP delay";
     }
     // A non-null exception_ptr here means run() escaped via an uncaught
-    // exception (see docs/ingestion_design.md 第 10 節第 2 項) instead of
-    // actually invalidating and draining - this check is what would have
-    // caught that the first time around; discarding `e` (as this test
-    // originally did) let it ship silently.
+    // exception instead of actually invalidating and draining.
     EXPECT_FALSE(captured) << "on_done should fire cleanly (nullptr), not via an uncaught exception";
 
     io.stop();
     io_thread.join();
 }
 
-// docs/ingestion_design.md 第 10 節第 2 項's code review addendum: stop()
-// landing while the connection is alive and idle-blocked in
-// connection.read() - not just mid-backoff, which is the *common* shutdown
-// case (e.g. runner.stop_all() while genuinely connected to a live
-// exchange) - is a distinct scenario from StopAbortsBackoffWaitAndDoesNot-
-// Reconnect above. It used to escape run() via an uncaught exception:
-// stop() cancels the read, disconnected=true, and the very next co_await
-// (on_disconnected()'s invalidate) inherited the same latched cancellation
-// state read() itself had just been aborted by - throwing immediately and
-// skipping stopping_'s check entirely. Isolated here (no snapshot fetch in
-// flight) so a regression points straight at this code path.
+// Guards against stop() landing while idle-blocked in connection.read()
+// (not mid-backoff, the common shutdown case) escaping run() via an
+// uncaught exception: the read's cancellation throws, and the very next
+// co_await (on_disconnected()'s invalidate) inherits that same latched
+// cancellation state and throws too, skipping stopping_'s check entirely.
+// Isolated here (no snapshot fetch in flight) so a regression points
+// straight at this code path.
 TEST(VenueSessionTest, StopWhileConnectedAndReadingReturnsCleanly) {
     std::vector<std::string> symbols{"BTCUSDT"};
     AggregatorService service(std::vector<BookId>{TestBookId()});
@@ -881,8 +838,8 @@ TEST(VenueSessionTest, StopWhileConnectedAndReadingReturnsCleanly) {
     // the far end - when stop() is called below.
     net::co_spawn(io, run_fake_ws_server(std::move(ws_acceptor), ""), fail_test_on_exception("ws server"));
 
-    // No HTTP server: same reasoning as StopAbortsBackoffWaitAndDoesNotReconnect
-    // above - this test is about the read/invalidate path, not snapshots.
+    // No HTTP server: this test is about the read/invalidate path, not
+    // snapshots (see StopAbortsBackoffWaitAndDoesNotReconnect above).
     FakeFeed feed(std::to_string(ws_port), "1");
     SymbolRegistry<SymbolBook> registry;
     registry.add("BTCUSDT", service.book(TestBookId()));
@@ -913,23 +870,20 @@ TEST(VenueSessionTest, StopWhileConnectedAndReadingReturnsCleanly) {
         ASSERT_TRUE(cv.wait_for(lock, std::chrono::milliseconds(500), [&] { return done; }))
             << "stop() should abort the in-flight read and return, not hang";
     }
-    EXPECT_FALSE(captured) << "on_done should fire cleanly (nullptr) - a non-null exception_ptr here "
-                              "means run() escaped via an uncaught exception instead of invalidating "
-                              "and draining normally";
+    EXPECT_FALSE(captured) << "on_done should fire cleanly (nullptr), not via an uncaught exception";
 
     io.stop();
     io_thread.join();
 }
 
-// code review addendum: stop() before start() has ever run must not be a
-// silent no-op. stop()'s net::post only needs strand_ (built at
-// construction, before start() is ever called), so it succeeds and sets
-// stopping_ - but run_sig_.emit(terminal) is a harmless no-op at that
-// point (nothing bound to its slot yet). Without a stopping_ check at the
-// very top of run()'s loop, run() would go ahead and connect/read from a
-// live exchange regardless, only noticing the pending stop at the next
-// disconnect/backoff cycle - or never, on a healthy connection. This test
-// proves the opposite: run() must never even attempt to connect.
+// Guards against stop() before start() has ever run being a silent no-op:
+// stop()'s net::post only needs strand_ (built at construction), so it
+// succeeds and sets stopping_ - but run_sig_.emit(terminal) is a harmless
+// no-op at that point (nothing bound to its slot yet). Without a
+// stopping_ check at the very top of run()'s loop, run() would go ahead
+// and connect/read from a live exchange regardless, only noticing the
+// pending stop at the next disconnect/backoff cycle - or never, on a
+// healthy connection.
 TEST(VenueSessionTest, StopBeforeStartPreventsConnecting) {
     std::vector<std::string> symbols{"BTCUSDT"};
     AggregatorService service(std::vector<BookId>{TestBookId()});
@@ -976,14 +930,10 @@ TEST(VenueSessionTest, StopBeforeStartPreventsConnecting) {
 }
 
 // Everything above drives FakeFeed (kSnapshotViaRest = true), Binance's
-// REST-race shape: SymbolSync starts Buffering, RequestSnapshot fires a
-// REST fetch, and on_snapshot() bridges whatever depth events arrived
-// while that fetch was in flight. None of it exercises the other real
-// shape - Bybit/OKX, kSnapshotViaRest = false - where the exchange pushes
-// its own snapshot as the first message on the same ordered WS
-// connection and RequestSnapshot is a no-op. on_snapshot()'s
-// empty-buffer branch (see BybitSequencePolicy's own comment for the
-// live bug this caused before it was fixed) is only reachable that way,
+// REST-race shape. This exercises the other real shape - Bybit/OKX,
+// kSnapshotViaRest = false - where the exchange pushes its own snapshot as
+// the first message on the ordered WS connection and RequestSnapshot is a
+// no-op. on_snapshot()'s empty-buffer branch is only reachable that way,
 // and only a real VenueSession/AggregatorService/SymbolBook wiring - not
 // SymbolSyncTest's unit tests - proves this project drives it correctly
 // end to end.
@@ -1177,22 +1127,18 @@ TEST(VenueSessionTest, ReconnectRepeatsSnapshotPushedAsFirstMessageFlow) {
     server->Shutdown();
 }
 
-// websocket_connection.hpp's connect(): a venue whose TCP connection stays
-// up but silently stops responding to anything at all (no close, no error,
-// not even a pong to our own idle ping - unlike every other reconnect
-// scenario this file covers, which all eventually produce either a real
-// close or a SymbolSync-detected gap) used to be undetectable - the read()
-// loop in run() would simply block forever. This proves Boost.Beast's own
+// Guards against a venue whose TCP connection stays up but silently stops
+// responding to anything at all (no close, no error, not even a pong to
+// our own idle ping) being undetectable - without a timeout, run()'s
+// read() loop would simply block forever. Proves Boost.Beast's own
 // websocket::stream_base::timeout/keep_alive_pings (idle_timeout passed to
-// VenueSession's constructor here, threaded through to
-// WebSocketConnection::connect()) actually fires against a true black hole,
-// and that firing forces the same disconnect/backoff/reconnect path a real
-// drop takes - not a new, separate mechanism.
-// run_fake_ws_server_black_hole_then_reconnect's first connection
-// deliberately issues no read at all after its own snapshot (see its own
-// comment for why even an *idle* read would be a responsive peer, not a
-// black hole, from Beast's perspective) - a second connection only ever
-// arrives if the client's own idle timeout tore the first one down.
+// VenueSession's constructor, threaded through to
+// WebSocketConnection::connect()) actually fires against a true black
+// hole, and that firing forces the same disconnect/backoff/reconnect path
+// a real drop takes. run_fake_ws_server_black_hole_then_reconnect's first
+// connection deliberately issues no read at all after its own snapshot -
+// a second connection only ever arrives if the client's own idle timeout
+// tore the first one down.
 TEST(VenueSessionTest, IdleTimeoutForcesReconnectOnSilentConnection) {
     std::vector<std::string> symbols{"BTCUSDT"};
     AggregatorService service(std::vector<BookId>{TestBookId()});
@@ -1263,14 +1209,10 @@ TEST(VenueSessionTest, IdleTimeoutForcesReconnectOnSilentConnection) {
     // Beast's idle_timeout is the total detection window (an idle ping at
     // idle_timeout/2, then beast::error::timeout if nothing - not even a
     // pong - arrives within the next idle_timeout/2), so ~1s here, plus
-    // >=1s reconnect backoff (see StopAbortsBackoffWaitAndDoesNotReconnect's
-    // own comment) plus both connections' round trips - comfortably under
-    // the server's own 6s `hold` above, but this budget still needs
-    // headroom *after* that 6s for the second connection's handshake/
-    // read/write to complete too, not just up to it; a /code-review pass
-    // flagged the previous 8s value as leaving only ~2s for that, tight
-    // enough to flake on a loaded CI runner even though the mechanism
-    // under test would still be working correctly.
+    // >=1s reconnect backoff plus both connections' round trips. Needs
+    // headroom after the server's own 6s `hold` above for the second
+    // connection's handshake/read/write to complete too, not just up to
+    // it, or this flakes on a loaded CI runner.
     io.run_for(std::chrono::seconds(12));
 
     // seq 1: ApplySnapshot from the first connection's snapshot (bid 5.0).
@@ -1300,15 +1242,13 @@ TEST(VenueSessionTest, IdleTimeoutForcesReconnectOnSilentConnection) {
     server->Shutdown();
 }
 
-// docs/ingestion_design.md 第 10 節第 8 項: a Live-state gap for a
-// kTrustsConnectionOrder venue (Bybit/OKX) used to leave the symbol stuck
-// in Buffering forever, because RequestSnapshot is a no-op for a Feed with
-// kSnapshotViaRest == false and nothing else ever re-requested one short of
-// an actual reconnect. This proves VenueSession itself now forces that
-// reconnect: the fake server below never closes the first connection on its
-// own (see its own comment) - a second connection only ever arrives if
-// VenueSession's execute_actions_and_maybe_force_reconnect() tears the first
-// one down.
+// Guards against a Live-state gap for a kTrustsConnectionOrder venue
+// (Bybit/OKX) leaving the symbol stuck in Buffering forever: RequestSnapshot
+// is a no-op for a Feed with kSnapshotViaRest == false, so nothing but an
+// actual reconnect ever re-requests one. Proves VenueSession forces that
+// reconnect itself - the fake server below never closes the first
+// connection on its own, so a second connection only arrives if
+// execute_actions_and_maybe_force_reconnect() tears the first one down.
 TEST(VenueSessionTest, LiveGapForcesFullReconnectForTrustConnectionOrderVenue) {
     std::vector<std::string> symbols{"BTCUSDT"};
     AggregatorService service(std::vector<BookId>{TestBookId()});
@@ -1408,17 +1348,15 @@ TEST(VenueSessionTest, LiveGapForcesFullReconnectForTrustConnectionOrderVenue) {
     server->Shutdown();
 }
 
-// A second /code-review pass on the two fixes above found that the forced
-// reconnect only actually worked for 3 of its 4 call sites -
-// handle_request_snapshot() itself (RequestSnapshot's own fulfillment,
-// reached only for a Feed with kSnapshotViaRest == true) threw the same
-// exception the other 3 do, but that coroutine runs net::co_spawn'ed
-// detached rather than co_await'ed by run() - the exception only ever
-// reached its own completion handler (which logs and discards it), never
-// run()'s try/catch. This manufactures the one Feed/Policy combination
-// that exercises that call site - no shipped venue pairs kSnapshotViaRest
-// with kTrustsConnectionOrder today, but VenueSession's own driver logic
-// has to behave correctly if one ever does, and this proves it now does.
+// Guards against the forced reconnect only actually working for 3 of its 4
+// call sites: handle_request_snapshot() (RequestSnapshot's own fulfillment,
+// reached only for kSnapshotViaRest == true) throws the same exception the
+// other 3 call sites do, but that coroutine runs net::co_spawn'ed detached
+// rather than co_await'ed by run(), so the exception could only ever reach
+// its own completion handler (which logs and discards it), never run()'s
+// try/catch. No shipped venue pairs kSnapshotViaRest with
+// kTrustsConnectionOrder today, but VenueSession's driver logic must behave
+// correctly if one ever does; this manufactures that combination.
 TEST(VenueSessionTest, RestSnapshotBridgeTailGapForcesFullReconnectEvenThoughItsCoroutineIsDetached) {
     std::vector<std::string> symbols{"BTCUSDT"};
     AggregatorService service(std::vector<BookId>{TestBookId()});
@@ -1461,13 +1399,12 @@ TEST(VenueSessionTest, RestSnapshotBridgeTailGapForcesFullReconnectEvenThoughIts
     // Two DEPTH events buffered while the REST snapshot fetch below is in
     // flight: the first (final_id=101) bridges the snapshot's
     // last_update_id=100 (101 == 100+1, BybitSequencePolicy's exact-+1
-    // bridge condition); the second (final_id=105) is a gap relative to it
-    // (105 != 101+1) - discovered only once on_snapshot() replays the
-    // buffered tail past the bridge event, exactly like
+    // bridge condition); the second (final_id=105) is a gap relative to it,
+    // discovered only once on_snapshot() replays the buffered tail past
+    // the bridge event (same scenario as
     // BridgingSnapshotDetectsAGapBetweenTwoBufferedTailEvents in
-    // tests/book/symbol_sync_test.cpp, but reached here through
-    // VenueSession's real REST-fetch path instead of calling SymbolSync
-    // directly.
+    // symbol_sync_test.cpp, reached here through VenueSession's real
+    // REST-fetch path instead of calling SymbolSync directly).
     net::io_context io;
     net::ip::tcp::acceptor ws_acceptor(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
     unsigned short ws_port = ws_acceptor.local_endpoint().port();
@@ -1498,13 +1435,11 @@ TEST(VenueSessionTest, RestSnapshotBridgeTailGapForcesFullReconnectEvenThoughIts
     // above).
     io.run_for(std::chrono::seconds(4));
 
-    // The actual proof: without the fix, the forced-reconnect exception
-    // handle_request_snapshot() throws is silently swallowed by its own
-    // completion handler - the book-level effects (ApplySnapshot/ApplyDelta/
-    // InvalidateVenue all still execute, since they run *before* that
-    // exception is thrown) would look identical either way, so only the
-    // WS layer actually reconnecting - a second real TCP connection -
-    // distinguishes "fixed" from "silently broken."
+    // The book-level effects (ApplySnapshot/ApplyDelta/InvalidateVenue) all
+    // run before the forced-reconnect exception is thrown, so they'd look
+    // identical whether or not that exception actually reaches run() - only
+    // a second real TCP connection distinguishes "fixed" from "silently
+    // swallowed by handle_request_snapshot()'s own completion handler."
     EXPECT_EQ(connect_count.load(), 2);
 
     context.TryCancel();
@@ -1512,25 +1447,20 @@ TEST(VenueSessionTest, RestSnapshotBridgeTailGapForcesFullReconnectEvenThoughIts
     server->Shutdown();
 }
 
-// A third /code-review pass found on_snapshot()'s *other* no-bridge branch
-// (buffer non-empty at entry, but nothing in it bridges the snapshot - the
-// "some event arrived before the snapshot despite this venue's ordering
-// guarantee" case) still only ever returned RequestSnapshot, never
-// InvalidateVenue - for a kTrustsConnectionOrder venue that's the exact
-// same dead end the other two fixes in this commit exist to close
-// (RequestSnapshot is a no-op for these venues), just reached through
-// on_snapshot()'s no-bridge path instead of on_depth_update()'s live-gap
-// path or on_snapshot()'s bridge-tail path. Fixed in symbol_sync.hpp by
-// routing this branch through handle_gap() too. This test proves the
-// existing VenueSession-level plumbing (dispatch_snapshot()'s
-// execute_actions_and_maybe_force_reconnect(), unchanged by that fix) picks
-// up the new InvalidateVenue and forces a reconnect through it, the same
-// way it already does for the other two SymbolSync-level fixes - reusing
+// Guards against on_snapshot()'s no-bridge branch (buffer non-empty at
+// entry, but nothing in it bridges the snapshot - "some event arrived
+// before the snapshot despite this venue's ordering guarantee") returning
+// RequestSnapshot instead of InvalidateVenue: for a kTrustsConnectionOrder
+// venue, RequestSnapshot is a no-op, so this is the same dead end as the
+// live-gap and bridge-tail cases, just reached through a different path
+// (symbol_sync.hpp routes it through handle_gap() too). This proves the
+// VenueSession-level plumbing (dispatch_snapshot()'s
+// execute_actions_and_maybe_force_reconnect()) picks up the resulting
+// InvalidateVenue and forces a reconnect, reusing
 // run_fake_ws_server_live_gap_then_reconnect with its two messages
-// reinterpreted: here the first message is a DEPTH event arriving *before*
-// any snapshot (violating BybitSequencePolicy's trust assumption on
-// purpose) and the second is a SNAPSHOT that doesn't bridge it, rather than
-// a snapshot followed by a live-state gap.
+// reinterpreted: the first is a DEPTH event arriving before any snapshot
+// (violating BybitSequencePolicy's trust assumption on purpose), the
+// second a SNAPSHOT that doesn't bridge it.
 TEST(VenueSessionTest, BufferingStateGapForcesFullReconnectForTrustConnectionOrderVenue) {
     std::vector<std::string> symbols{"BTCUSDT"};
     AggregatorService service(std::vector<BookId>{TestBookId()});
@@ -1581,13 +1511,11 @@ TEST(VenueSessionTest, BufferingStateGapForcesFullReconnectForTrustConnectionOrd
     // snapshot - buffered while still Buffering. Then a SNAPSHOT
     // (last_update_id=100) that this event doesn't bridge (bridges_snapshot
     // needs final_id == 101; should_drop_buffered needs final_id <= 100 -
-    // neither holds for 105) - InvalidateVenue, per the fix under test.
-    // Because this venue never contributed anything before this point,
-    // that InvalidateVenue itself produces no observable book change
-    // (AggregateOrderBook::invalidate_venue() is a no-op for a venue with
-    // no existing entry) - the only way to observe whether the fix worked
-    // is whether a real reconnect (and the second connection's own fresh
-    // snapshot) ever happens at all.
+    // neither holds for 105) - InvalidateVenue. Because this venue never
+    // contributed anything before this point, that InvalidateVenue itself
+    // produces no observable book change, so the only way to observe
+    // whether a reconnect actually happened is the second connection's own
+    // fresh snapshot arriving.
     net::io_context io;
     net::ip::tcp::acceptor ws_acceptor(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
     unsigned short ws_port = ws_acceptor.local_endpoint().port();
@@ -1622,16 +1550,16 @@ TEST(VenueSessionTest, BufferingStateGapForcesFullReconnectForTrustConnectionOrd
     server->Shutdown();
 }
 
-// A book-level rejection (apply_failed) partway through a multi-action
-// batch used to abort the rest of that same batch for a
-// kTrustsConnectionOrder venue - execute_action()'s apply_failed branch
-// routed its own nested resync through the throwing
-// execute_actions_and_maybe_force_reconnect(), and that throw unwound
-// execute_actions()'s for-loop over the *outer* batch, skipping whatever
-// was still queued after the rejected action even though SymbolSync had
-// already computed it as valid, contiguous data. This constructs exactly
-// that batch shape: a rejected ApplySnapshot (index 0) followed by a valid
-// ApplyDelta (index 1) from a buffered event that bridges it.
+// Guards against a book-level rejection (apply_failed) partway through a
+// multi-action batch aborting the rest of that same batch for a
+// kTrustsConnectionOrder venue: execute_action()'s apply_failed branch must
+// route its nested resync through the plain execute_actions(), not the
+// throwing execute_actions_and_maybe_force_reconnect() - a throw there
+// would unwind the *outer* batch's for-loop, skipping whatever was still
+// queued after the rejected action even though SymbolSync had already
+// computed it as valid, contiguous data. Constructs exactly that batch
+// shape: a rejected ApplySnapshot (index 0) followed by a valid ApplyDelta
+// (index 1) from a buffered event that bridges it.
 TEST(VenueSessionTest, RejectedActionMidBatchStillLetsLaterActionsInTheSameBatchApply) {
     std::vector<std::string> symbols{"BTCUSDT"};
     AggregatorService service(std::vector<BookId>{TestBookId()});
@@ -1724,17 +1652,14 @@ TEST(VenueSessionTest, RejectedActionMidBatchStillLetsLaterActionsInTheSameBatch
     server->Shutdown();
 }
 
-// docs/ingestion_design.md's own comment on handle_request_snapshot() used
-// to claim a failed REST fetch would recover via "next reconnect or
-// steady-state gap retries" - false for a kTrustsConnectionOrder == false
-// venue (Binance): the symbol never reaches Live if its very first fetch
-// fails (on_depth_update() while Buffering just buffers, with no gap check
-// at all - that only exists in the Live branch), so neither a gap-driven
-// retry nor an unrelated reconnect would ever re-trigger a request. Caught
-// by another session working on a related connection-event/book-validity
-// design question, not by any test in this file. Fixed by retrying the
-// fetch itself in place - same connection, no WS teardown at all - with the
-// same backoff() helper run()'s own reconnect loop already uses.
+// Guards against a failed REST fetch never recovering for a
+// kTrustsConnectionOrder == false venue (Binance): the symbol never reaches
+// Live if its very first fetch fails (on_depth_update() while Buffering
+// just buffers, with no gap check at all - that only exists in the Live
+// branch), so neither a gap-driven retry nor an unrelated reconnect would
+// ever re-trigger a request. handle_request_snapshot() must retry the
+// fetch itself in place instead, using the same backoff() helper run()'s
+// own reconnect loop already uses.
 TEST(VenueSessionTest, FailedSnapshotFetchRetriesInPlaceWithoutTouchingTheConnection) {
     std::vector<std::string> symbols{"BTCUSDT"};
     AggregatorService service(std::vector<BookId>{TestBookId()});
@@ -1833,17 +1758,16 @@ TEST(VenueSessionTest, FailedSnapshotFetchRetriesInPlaceWithoutTouchingTheConnec
     server->Shutdown();
 }
 
-// code-review finding on the forced-reconnect fix: run()'s reconnect loop
-// used to reset `attempt` back to 0 unconditionally the instant
-// connect+subscribe succeeded - before the connection had actually proven
-// itself healthy. Harmless for a genuine, infrequent disconnect, but for a
-// kTrustsConnectionOrder venue whose SymbolSync keeps reporting
-// InvalidateVenue right after each forced reconnect, this gave backoff()'s
-// *fastest* retry (attempt=1, ~1-1.2s) every single cycle instead of the
-// escalating series backoff() is meant to provide, risking a reconnect
-// storm against the real exchange. No grpc server/reader needed here
-// (unlike the tests above) - this is purely about run()'s own reconnect
-// timing, not book content.
+// Guards against run()'s reconnect loop resetting `attempt` back to 0
+// unconditionally the instant connect+subscribe succeeds, before the
+// connection has actually proven itself healthy. Harmless for a genuine,
+// infrequent disconnect, but for a kTrustsConnectionOrder venue whose
+// SymbolSync keeps reporting InvalidateVenue right after each forced
+// reconnect, that would give backoff()'s fastest retry every single cycle
+// instead of the escalating series backoff() is meant to provide, risking
+// a reconnect storm against the real exchange. No grpc server/reader
+// needed here - this is purely about run()'s own reconnect timing, not
+// book content.
 TEST(VenueSessionTest, BackoffEscalatesAcrossRepeatedForcedReconnects) {
     std::vector<std::string> symbols{"BTCUSDT"};
     AggregatorService service(std::vector<BookId>{TestBookId()});
@@ -1878,16 +1802,13 @@ TEST(VenueSessionTest, BackoffEscalatesAcrossRepeatedForcedReconnects) {
     auto interval_1_to_2 = connect_times[1] - connect_times[0];
     auto interval_2_to_3 = connect_times[2] - connect_times[1];
 
-    // Ratio-based, not tight absolute millisecond windows pinned to
-    // backoff()'s exact jittered ranges (a code-review finding: every other
-    // test in this file uses only generous, one-sided timeouts - 500ms to
-    // 10s - never a tight two-sided window like the ones this replaced).
-    // Connect/handshake/read overhead is roughly constant per reconnect
-    // cycle, so it shifts both intervals by about the same amount and
-    // mostly cancels out in their ratio, while the ratio itself still
-    // cleanly separates "escalated" (backoff()'s ~2x-per-attempt growth,
-    // still comfortably >1.4x after jitter) from "reset back to the fast
-    // retry every time" (~1x - the bug this fix addresses) under far more
+    // Ratio-based, not a tight absolute millisecond window pinned to
+    // backoff()'s exact jittered ranges: connect/handshake/read overhead is
+    // roughly constant per reconnect cycle, so it shifts both intervals by
+    // about the same amount and mostly cancels out in their ratio, while
+    // the ratio itself still cleanly separates "escalated" (backoff()'s
+    // ~2x-per-attempt growth, still comfortably >1.4x after jitter) from
+    // "reset back to the fast retry every time" (~1x) under far more
     // scheduling noise than a fixed millisecond threshold would tolerate.
     EXPECT_GT(interval_2_to_3, interval_1_to_2 * 7 / 5)
         << "backoff between successive forced reconnects should escalate roughly geometrically, not "
@@ -1902,22 +1823,17 @@ TEST(VenueSessionTest, BackoffEscalatesAcrossRepeatedForcedReconnects) {
         << "second forced reconnect took far longer than any expected backoff attempt";
 }
 
-// Another session's line-by-line review of the merged fix above found one
-// more instance of the same "stuck forever" bug class this whole file is
-// about, this time for a kTrustsConnectionOrder == false venue (Binance):
-// a Live-state gap reset the symbol to Buffering (handle_gap()) but never
-// re-requested a snapshot - VenueSession never forces a reconnect for this
-// venue shape (by design, tearing down the connection over one gap would
-// be the wrong fix for a REST venue), so nothing else would ever
-// re-trigger one either. This proves the fix
-// (execute_actions_and_maybe_force_reconnect()'s kTrustsConnectionOrder ==
-// false branch calls resync_rest_venue_after_gap() to request a fresh
-// snapshot directly for this venue shape): the WS side sends a bridging
-// DEPTH event, then a live-state gap, and never closes the connection
-// itself - a second REST fetch (proving handle_request_snapshot()'s
-// in-place retry path fired) is the
-// only way this test's own wait_for() calls below don't time out, and
-// nothing here ever exercises a second WS connection.
+// Guards against the same "stuck forever" bug class for a
+// kTrustsConnectionOrder == false venue (Binance): a Live-state gap resets
+// the symbol to Buffering (handle_gap()) but VenueSession never forces a
+// reconnect for this venue shape (tearing down the connection over one gap
+// would be the wrong fix for a REST venue), so nothing else would ever
+// re-request a snapshot. Proves execute_actions_and_maybe_force_reconnect()'s
+// kTrustsConnectionOrder == false branch calls resync_rest_venue_after_gap()
+// directly: the WS side sends a bridging DEPTH event, then a live-state
+// gap, and never closes the connection itself - a second REST fetch is the
+// only way this test's wait_for() calls below don't time out, and nothing
+// here ever exercises a second WS connection.
 TEST(VenueSessionTest, LiveStateGapForARestVenueRetriesTheSnapshotFetchWithoutTouchingTheConnection) {
     std::vector<std::string> symbols{"BTCUSDT"};
     AggregatorService service(std::vector<BookId>{TestBookId()});
@@ -1942,13 +1858,11 @@ TEST(VenueSessionTest, LiveStateGapForARestVenueRetriesTheSnapshotFetchWithoutTo
     std::deque<L2Update> updates;
     // Set once DEPTH1's own bridge (ApplyDelta, index 2 below) has been
     // observed - the signal run_fake_ws_server_two_messages_gated waits on
-    // before sending DEPTH2, so DEPTH2 deterministically arrives only
-    // after the symbol has actually gone Live (see that helper's own
-    // comment on why racing it otherwise wouldn't reliably exercise
-    // on_depth_update()'s Live-state gap branch specifically). Set from
-    // this reader thread, not the main thread: io.run_for() below blocks
-    // the main thread for its whole duration, but this thread keeps
-    // receiving gRPC updates concurrently with it.
+    // before sending DEPTH2, so DEPTH2 deterministically arrives only after
+    // the symbol has actually gone Live. Set from this reader thread, not
+    // the main thread: io.run_for() below blocks the main thread for its
+    // whole duration, but this thread keeps receiving gRPC updates
+    // concurrently with it.
     std::atomic<bool> depth1_bridged{false};
     std::thread reader_thread([&] {
         L2Update update;
@@ -1983,12 +1897,9 @@ TEST(VenueSessionTest, LiveStateGapForARestVenueRetriesTheSnapshotFetchWithoutTo
     // branch rather than possibly racing into on_snapshot()'s bridge-tail
     // one instead (already covered by
     // BridgingSnapshotDetectsAGapBetweenTwoBufferedTailEvents in
-    // tests/book/symbol_sync_test.cpp - not what this test is for). The
-    // connection is never closed by this server - see
-    // run_fake_ws_server_two_messages_gated's own comment. REST side:
-    // first response (last_update_id=105) bridges DEPTH1; second
-    // (last_update_id=155, only requested because of the fix under test)
-    // bridges DEPTH2.
+    // symbol_sync_test.cpp). The connection is never closed by this
+    // server. REST side: first response (last_update_id=105) bridges
+    // DEPTH1; second (last_update_id=155) bridges DEPTH2.
     net::io_context io;
     net::ip::tcp::acceptor ws_acceptor(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
     unsigned short ws_port = ws_acceptor.local_endpoint().port();
@@ -2044,20 +1955,17 @@ TEST(VenueSessionTest, LiveStateGapForARestVenueRetriesTheSnapshotFetchWithoutTo
     server->Shutdown();
 }
 
-// The same review pass that found the Live-state gap bug above found a
-// fourth instance of the same "stuck forever" bug class: a book-level
-// rejection (apply_failed) resyncs a symbol through
+// Guards against the same "stuck forever" bug class for a book-level
+// rejection (apply_failed): it resyncs a symbol through
 // SymbolSync::on_disconnected(), which deliberately never re-requests a
-// snapshot itself (correct for a real drop, see its own comment) -
-// what a kTrustsConnectionOrder == false venue does about *any*
-// InvalidateVenue, including this one, is decided once, centrally, by
-// VenueSession::resync_rest_venue_after_gap() at the outermost caller
-// (see its own comment for why that decision isn't duplicated into
-// SymbolSync). This proves it end to end: a malformed first REST
-// snapshot (rejected by AggregateOrderBook, so no broadcast for it)
-// still lets the batch's other, valid action (DEPTH1's own bridge)
-// apply, and the resync it triggers succeeds via a second REST fetch
-// with the WS connection never touched throughout.
+// snapshot itself, so what a kTrustsConnectionOrder == false venue does
+// about any InvalidateVenue is decided once, centrally, by
+// VenueSession::resync_rest_venue_after_gap() at the outermost caller.
+// Proves it end to end: a malformed first REST snapshot (rejected by
+// AggregateOrderBook, so no broadcast for it) still lets the batch's
+// other, valid action (DEPTH1's own bridge) apply, and the resync it
+// triggers succeeds via a second REST fetch with the WS connection never
+// touched throughout.
 TEST(VenueSessionTest, BookRejectionRetriesTheSnapshotFetchForARestVenueWithoutTouchingTheConnection) {
     std::vector<std::string> symbols{"BTCUSDT"};
     AggregatorService service(std::vector<BookId>{TestBookId()});
@@ -2126,8 +2034,7 @@ TEST(VenueSessionTest, BookRejectionRetriesTheSnapshotFetchForARestVenueWithoutT
     // First response (last_update_id=105, bridging DEPTH1): bid size is
     // -1.0 - AggregateOrderBook::apply_snapshot() rejects the whole batch
     // for a malformed level, so this produces no broadcast at all. Second
-    // (last_update_id=155, only requested because of the fix under test):
-    // well-formed, bridges DEPTH2.
+    // (last_update_id=155): well-formed, bridges DEPTH2.
     net::ip::tcp::acceptor http_acceptor(io.get_executor(),
                                          net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
     unsigned short http_port = http_acceptor.local_endpoint().port();

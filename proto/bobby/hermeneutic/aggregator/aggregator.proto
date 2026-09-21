@@ -40,9 +40,8 @@ enum MarketType {
 // "which currency is which" is never something a server or client has to
 // parse back out of a concatenated symbol - see
 // bobby::hermeneutic::symbol::BookId (symbol.hpp) for the equivalent C++
-// type and docs/ingestion_design.md's 第10節第10項 for why this replaced a
-// single string field. base/quote are this project's own asset codes
-// (e.g. "BTC"/"USDT"), not a venue-native spelling.
+// type. base/quote are this project's own asset codes (e.g. "BTC"/"USDT"),
+// not a venue-native spelling.
 message BookId {
   string base = 1;
   string quote = 2;
@@ -195,12 +194,12 @@ message Heartbeat {
   // a client has that this book is not trustworthy right now, whether the
   // cause is a disconnect, a resync gap, a failed initial snapshot fetch,
   // or the book never having been seeded yet; this field is intentionally
-  // cause-agnostic (see docs/ingestion_design.md 第10節第15項 for why: the
-  // corrective action - distrust this book - is the same regardless of
-  // cause). A shrinking-but-non-empty set means the book is thinner, not
-  // invalid; clients already see exactly how much thinner via the ordinary
-  // L2Diff/Bbo updates invalidate_venue() itself produces, so this field
-  // only has to answer "is this still backed at all", not "by how much".
+  // cause-agnostic, since the corrective action - distrust this book - is
+  // the same regardless of cause. A shrinking-but-non-empty set means the
+  // book is thinner, not invalid; clients already see exactly how much
+  // thinner via the ordinary L2Diff/Bbo updates invalidate_venue() itself
+  // produces, so this field only has to answer "is this still backed at
+  // all", not "by how much".
   //
   // Element order is unspecified and may change between heartbeats even
   // when the live venue set itself hasn't (the server populates this by

@@ -7,9 +7,7 @@
 namespace bobby::hermeneutic {
 
 // Binance Spot's documented local-order-book procedure
-// (developers.binance.com/en/docs/products/spot/web-socket-streams#how-to-manage-a-local-order-book-correctly),
-// verified against the primary source directly (2026-09-18), not assumed
-// from Futures' (different) rules:
+// (developers.binance.com/en/docs/products/spot/web-socket-streams#how-to-manage-a-local-order-book-correctly):
 //   - drop buffered events with final_id <= snapshot.last_update_id (the
 //     doc's step 5, non-strict <=, unlike Futures' strict <)
 //   - the bridging event needs first_id <= last_update_id+1 && final_id >=
