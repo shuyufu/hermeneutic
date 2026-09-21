@@ -44,9 +44,9 @@ enum class Side { Bid, Ask };
 // throw-averse - see its own comment) and only ever catches that one
 // exception type, exactly as it already trusted its own internal
 // std::map operations to never throw anything else. A Sink that violates
-// this terminates the program via a noexcept violation on apply_delta()/
-// apply_snapshot()/apply_batch(); see invalidate_venue()'s own comment for
-// what it does instead.
+// this terminates the program via a noexcept violation on apply_snapshot()/
+// apply_batch(); see invalidate_venue()'s own comment for what it does
+// instead.
 class AggregateOrderBook {
   private:
     // Default Sink for every method below: does nothing, so a caller that
@@ -63,28 +63,6 @@ class AggregateOrderBook {
     };
 
   public:
-    // A `size` of zero removes that venue's level (Binance L2 diff semantics).
-    // Returns std::errc::invalid_argument if `price` is not positive or
-    // `size` is negative, or std::errc::not_enough_memory if a new venue's
-    // book could not be allocated.
-    template <typename Sink = NoopSink>
-    std::expected<void, std::errc> apply_delta(const VenueId& venue, Side side, Price price,
-                                                Size size, Sink&& on_change = {}) noexcept {
-        if (!is_valid_level(price, size)) return std::unexpected(std::errc::invalid_argument);
-
-        try {
-            auto& venue_book = venues_[venue];
-            if (side == Side::Bid) {
-                apply_level(venue_book.bids, aggregate_.bids, price, size, on_change);
-            } else {
-                apply_level(venue_book.asks, aggregate_.asks, price, size, on_change);
-            }
-        } catch (const std::bad_alloc&) {
-            return std::unexpected(std::errc::not_enough_memory);
-        }
-        return {};
-    }
-
     // Removes every level `venue` contributed and drops its book entirely.
     // Call this as soon as its feed is known to be untrustworthy (websocket
     // disconnect, or a sequence-number gap) so the aggregate does not keep

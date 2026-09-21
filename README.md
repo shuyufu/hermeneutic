@@ -105,7 +105,7 @@ its `"symbol"` field is the same `"BASE_QUOTE"` spelling (`"BTC_USDT"`) as the
 第10項 for why the wire format moved from a concatenated string key to a
 structured message, and its OKX section for why perp and spot aren't merged
 into one book. It only wraps the book(s) and broadcasts to subscribers —
-feeding real market data (`SymbolBook::apply_delta`/`apply_snapshot`/
+feeding real market data (`SymbolBook::apply_batch`/`apply_snapshot`/
 `invalidate_venue`, reached via `AggregatorService::book(BookId)`) is up to
 the caller.
 

@@ -183,7 +183,7 @@ std::string format_price_bands(const std::vector<PriceBand>& bands) {
 // RepeatedPtrField type) purely to avoid an extra include here.
 //
 // Deliberately does not validate price_raw/size_raw itself (unlike
-// AggregateOrderBook::apply_delta()'s require_valid_level() on the
+// AggregateOrderBook::apply_batch()'s is_valid_level() check on the
 // server side, which rejects a non-positive price or negative size
 // before it ever reaches a book): a wire-level malformed value here would
 // still get caught downstream, by price_band_depth()/volume_band_prices()

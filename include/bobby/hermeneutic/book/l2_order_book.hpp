@@ -24,7 +24,7 @@ struct L2OrderBook {
 // be non-negative (a negative size has no removal/no-op meaning the way
 // zero does).
 //
-// Shared by AggregateOrderBook::apply_delta/apply_snapshot/apply_batch,
+// Shared by AggregateOrderBook::apply_snapshot/apply_batch,
 // price_band_depth(), volume_band_prices(), and
 // aggregator::SymbolBook::apply_batch's own pre-check, all of which used
 // to hand-roll this identical `price.raw() <= 0 || size.raw() < 0`

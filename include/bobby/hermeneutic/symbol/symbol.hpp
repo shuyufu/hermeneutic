@@ -196,7 +196,7 @@ inline std::optional<BookId> parse_book_id(std::string_view token) {
 
 // A venue's identity as a structured value - which VenueSession/
 // AggregateOrderBook actually key their per-venue bookkeeping by (see
-// aggregate_order_book.hpp's apply_delta()/apply_snapshot()/apply_batch()/
+// aggregate_order_book.hpp's apply_snapshot()/apply_batch()/
 // invalidate_venue()). This is the real "venue" concept this project
 // means everywhere else it says "venue": an Exchange scoped to a market
 // (e.g. "binance_spot" and "binance_futures" are two different venues

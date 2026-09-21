@@ -451,11 +451,11 @@ class VenueSession {
                         apply_failed = !book->apply_snapshot(venue_, a.bids, a.asks);
                     }
                 } else if constexpr (std::is_same_v<T, ApplyDelta>) {
-                    // One call, not one apply_delta() per level: a.bids/
-                    // a.asks together are everything one upstream exchange
-                    // message carried, and apply_batch() is what keeps that
-                    // one atomic update from becoming several separate seq
-                    // bumps/broadcasts on our own wire protocol.
+                    // One call, not one per level: a.bids/a.asks together
+                    // are everything one upstream exchange message carried,
+                    // and apply_batch() is what keeps that one atomic
+                    // update from becoming several separate seq bumps/
+                    // broadcasts on our own wire protocol.
                     if (auto* book = registry_.book(symbol)) {
                         apply_failed = !book->apply_batch(venue_, a.bids, a.asks);
                     }

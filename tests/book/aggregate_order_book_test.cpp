@@ -23,24 +23,49 @@ using bobby::hermeneutic::symbol::MarketType;
 constexpr VenueId kBinance{Exchange::Binance, MarketType::Spot};
 constexpr VenueId kOkx{Exchange::Okx, MarketType::Spot};
 
+// AggregateOrderBook has no single-level apply_delta() (see apply_batch()'s
+// own doc comment on why - it's unused on the real ingestion path and
+// apply_batch() is its exact functional superset, so keeping it around
+// meant one more near-identical name in this class's public surface for no
+// production caller). This recreates that old single-level convenience
+// purely for these tests, via apply_batch() with a one-element span on the
+// requested side and an empty span on the other.
+std::expected<void, std::errc> apply_one(AggregateOrderBook& book, const VenueId& venue, Side side,
+                                          Price price, Size size) {
+    std::array<std::pair<Price, Size>, 1> level{{{price, size}}};
+    if (side == Side::Bid) return book.apply_batch(venue, level, {});
+    return book.apply_batch(venue, {}, level);
+}
+
+// Same as above, but forwarding a Sink to the requested side (and a no-op
+// to the other) - for the tests that exercise apply_batch()'s Sink contract
+// through a single level.
+template <typename Sink>
+std::expected<void, std::errc> apply_one(AggregateOrderBook& book, const VenueId& venue, Side side,
+                                          Price price, Size size, Sink&& on_change) {
+    std::array<std::pair<Price, Size>, 1> level{{{price, size}}};
+    if (side == Side::Bid) return book.apply_batch(venue, level, {}, on_change, [](Price, Size) {});
+    return book.apply_batch(venue, {}, level, [](Price, Size) {}, on_change);
+}
+
 TEST(AggregateOrderBook, SingleVenueAddUpdateRemove) {
     AggregateOrderBook book;
 
-    book.apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0));
+    apply_one(book, kBinance, Side::Bid, Price(100.0), Size(1.0));
     EXPECT_EQ(book.aggregate().bids.at(Price(100.0)), Size(1.0));
 
-    book.apply_delta(kBinance, Side::Bid, Price(100.0), Size(2.5));
+    apply_one(book, kBinance, Side::Bid, Price(100.0), Size(2.5));
     EXPECT_EQ(book.aggregate().bids.at(Price(100.0)), Size(2.5));
 
-    book.apply_delta(kBinance, Side::Bid, Price(100.0), Size(0.0));
+    apply_one(book, kBinance, Side::Bid, Price(100.0), Size(0.0));
     EXPECT_EQ(book.aggregate().bids.count(Price(100.0)), 0u);
 }
 
 TEST(AggregateOrderBook, MultipleVenuesAtSamePriceSum) {
     AggregateOrderBook book;
 
-    book.apply_delta(kBinance, Side::Ask, Price(101.0), Size(1.0));
-    book.apply_delta(kOkx, Side::Ask, Price(101.0), Size(2.0));
+    apply_one(book, kBinance, Side::Ask, Price(101.0), Size(1.0));
+    apply_one(book, kOkx, Side::Ask, Price(101.0), Size(2.0));
 
     EXPECT_EQ(book.aggregate().asks.at(Price(101.0)), Size(3.0));
 }
@@ -48,22 +73,22 @@ TEST(AggregateOrderBook, MultipleVenuesAtSamePriceSum) {
 TEST(AggregateOrderBook, RemovingOneVenueKeepsOthersContribution) {
     AggregateOrderBook book;
 
-    book.apply_delta(kBinance, Side::Ask, Price(101.0), Size(1.0));
-    book.apply_delta(kOkx, Side::Ask, Price(101.0), Size(2.0));
+    apply_one(book, kBinance, Side::Ask, Price(101.0), Size(1.0));
+    apply_one(book, kOkx, Side::Ask, Price(101.0), Size(2.0));
 
-    book.apply_delta(kBinance, Side::Ask, Price(101.0), Size(0.0));
+    apply_one(book, kBinance, Side::Ask, Price(101.0), Size(0.0));
 
     EXPECT_EQ(book.aggregate().asks.at(Price(101.0)), Size(2.0));
 
-    book.apply_delta(kOkx, Side::Ask, Price(101.0), Size(0.0));
+    apply_one(book, kOkx, Side::Ask, Price(101.0), Size(0.0));
     EXPECT_EQ(book.aggregate().asks.count(Price(101.0)), 0u);
 }
 
 TEST(AggregateOrderBook, PerVenueBookIsIndependentlyQueryable) {
     AggregateOrderBook book;
 
-    book.apply_delta(kBinance, Side::Bid, Price(99.0), Size(1.0));
-    book.apply_delta(kOkx, Side::Bid, Price(99.5), Size(2.0));
+    apply_one(book, kBinance, Side::Bid, Price(99.0), Size(1.0));
+    apply_one(book, kOkx, Side::Bid, Price(99.5), Size(2.0));
 
     ASSERT_EQ(book.venues().count(kBinance), 1u);
     ASSERT_EQ(book.venues().count(kOkx), 1u);
@@ -77,13 +102,13 @@ TEST(AggregateOrderBook, PerVenueBookIsIndependentlyQueryable) {
 TEST(AggregateOrderBook, AggregateAsksAscendingBidsDescendingAcrossVenues) {
     AggregateOrderBook book;
 
-    book.apply_delta(kBinance, Side::Ask, Price(101.0), Size(1.0));
-    book.apply_delta(kOkx, Side::Ask, Price(100.5), Size(1.0));
-    book.apply_delta(kBinance, Side::Ask, Price(102.0), Size(1.0));
+    apply_one(book, kBinance, Side::Ask, Price(101.0), Size(1.0));
+    apply_one(book, kOkx, Side::Ask, Price(100.5), Size(1.0));
+    apply_one(book, kBinance, Side::Ask, Price(102.0), Size(1.0));
 
-    book.apply_delta(kBinance, Side::Bid, Price(99.0), Size(1.0));
-    book.apply_delta(kOkx, Side::Bid, Price(99.5), Size(1.0));
-    book.apply_delta(kBinance, Side::Bid, Price(98.0), Size(1.0));
+    apply_one(book, kBinance, Side::Bid, Price(99.0), Size(1.0));
+    apply_one(book, kOkx, Side::Bid, Price(99.5), Size(1.0));
+    apply_one(book, kBinance, Side::Bid, Price(98.0), Size(1.0));
 
     auto ask_it = book.aggregate().asks.begin();
     EXPECT_EQ(ask_it->first, Price(100.5));
@@ -103,8 +128,8 @@ TEST(AggregateOrderBook, AggregateAsksAscendingBidsDescendingAcrossVenues) {
 TEST(AggregateOrderBook, InvalidateSoleVenueClearsAggregateLevels) {
     AggregateOrderBook book;
 
-    book.apply_delta(kBinance, Side::Bid, Price(99.0), Size(1.0));
-    book.apply_delta(kBinance, Side::Ask, Price(101.0), Size(2.0));
+    apply_one(book, kBinance, Side::Bid, Price(99.0), Size(1.0));
+    apply_one(book, kBinance, Side::Ask, Price(101.0), Size(2.0));
 
     book.invalidate_venue(kBinance);
 
@@ -116,9 +141,9 @@ TEST(AggregateOrderBook, InvalidateSoleVenueClearsAggregateLevels) {
 TEST(AggregateOrderBook, InvalidateVenueKeepsOtherVenuesContribution) {
     AggregateOrderBook book;
 
-    book.apply_delta(kBinance, Side::Ask, Price(101.0), Size(1.0));
-    book.apply_delta(kOkx, Side::Ask, Price(101.0), Size(2.0));
-    book.apply_delta(kOkx, Side::Ask, Price(102.0), Size(5.0));
+    apply_one(book, kBinance, Side::Ask, Price(101.0), Size(1.0));
+    apply_one(book, kOkx, Side::Ask, Price(101.0), Size(2.0));
+    apply_one(book, kOkx, Side::Ask, Price(102.0), Size(5.0));
 
     book.invalidate_venue(kBinance);
 
@@ -130,7 +155,7 @@ TEST(AggregateOrderBook, InvalidateVenueKeepsOtherVenuesContribution) {
 
 TEST(AggregateOrderBook, InvalidateUnknownVenueIsNoOp) {
     AggregateOrderBook book;
-    book.apply_delta(kOkx, Side::Bid, Price(99.0), Size(1.0));
+    apply_one(book, kOkx, Side::Bid, Price(99.0), Size(1.0));
 
     book.invalidate_venue(kBinance);
 
@@ -141,9 +166,9 @@ TEST(AggregateOrderBook, ApplySnapshotReplacesVenueSideWholesale) {
     AggregateOrderBook book;
 
     // Stale state before resync: 100.0 and 101.0 from a diff stream.
-    book.apply_delta(kBinance, Side::Ask, Price(100.0), Size(1.0));
-    book.apply_delta(kBinance, Side::Ask, Price(101.0), Size(2.0));
-    book.apply_delta(kOkx, Side::Ask, Price(100.0), Size(4.0));
+    apply_one(book, kBinance, Side::Ask, Price(100.0), Size(1.0));
+    apply_one(book, kBinance, Side::Ask, Price(101.0), Size(2.0));
+    apply_one(book, kOkx, Side::Ask, Price(100.0), Size(4.0));
 
     // REST snapshot: 100.0 unchanged, 101.0 gone, 102.0 new. binance has no
     // bids anywhere in this test, so an empty bids span here is a genuine
@@ -164,8 +189,8 @@ TEST(AggregateOrderBook, ApplySnapshotReplacesVenueSideWholesale) {
 TEST(AggregateOrderBook, InvalidateThenApplySnapshotResyncsCleanly) {
     AggregateOrderBook book;
 
-    book.apply_delta(kBinance, Side::Bid, Price(99.0), Size(1.0));
-    book.apply_delta(kBinance, Side::Bid, Price(98.5), Size(2.0));
+    apply_one(book, kBinance, Side::Bid, Price(99.0), Size(1.0));
+    apply_one(book, kBinance, Side::Bid, Price(98.5), Size(2.0));
 
     // Disconnect: drop everything binance had contributed.
     book.invalidate_venue(kBinance);
@@ -181,22 +206,9 @@ TEST(AggregateOrderBook, InvalidateThenApplySnapshotResyncsCleanly) {
     EXPECT_EQ(book.aggregate().bids.count(Price(98.5)), 0u);
 }
 
-TEST(AggregateOrderBook, ApplyDeltaRejectsNegativeSize) {
-    AggregateOrderBook book;
-    book.apply_delta(kBinance, Side::Bid, Price(99.0), Size(1.0));
-
-    auto result = book.apply_delta(kBinance, Side::Bid, Price(98.0), Size(-1.0));
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), std::errc::invalid_argument);
-
-    // The rejected call must not have mutated any state.
-    EXPECT_EQ(book.aggregate().bids.count(Price(98.0)), 0u);
-    EXPECT_EQ(book.aggregate().bids.at(Price(99.0)), Size(1.0));
-}
-
 TEST(AggregateOrderBook, ApplySnapshotRejectsNegativeSizeAtomically) {
     AggregateOrderBook book;
-    book.apply_delta(kBinance, Side::Ask, Price(100.0), Size(1.0));
+    apply_one(book, kBinance, Side::Ask, Price(100.0), Size(1.0));
 
     const std::array snapshot = {std::pair{Price(100.0), Size(2.0)},
                                   std::pair{Price(101.0), Size(-1.0)}};
@@ -210,31 +222,9 @@ TEST(AggregateOrderBook, ApplySnapshotRejectsNegativeSizeAtomically) {
     EXPECT_EQ(book.venues().at(kBinance).asks.count(Price(101.0)), 0u);
 }
 
-// A non-positive price used to pass through unchecked (only size was
-// validated) - see require_valid_level()'s own comment. Both zero and
-// negative are rejected the same way size's own <0 check is: with
-// std::errc::invalid_argument and no state mutated.
-TEST(AggregateOrderBook, ApplyDeltaRejectsNonPositivePrice) {
-    AggregateOrderBook book;
-    book.apply_delta(kBinance, Side::Bid, Price(99.0), Size(1.0));
-
-    auto zero_result = book.apply_delta(kBinance, Side::Bid, Price::from_raw(0), Size(1.0));
-    ASSERT_FALSE(zero_result.has_value());
-    EXPECT_EQ(zero_result.error(), std::errc::invalid_argument);
-
-    auto negative_result = book.apply_delta(kBinance, Side::Bid, Price::from_raw(-1), Size(1.0));
-    ASSERT_FALSE(negative_result.has_value());
-    EXPECT_EQ(negative_result.error(), std::errc::invalid_argument);
-
-    // Neither rejected call mutated any state.
-    EXPECT_EQ(book.aggregate().bids.count(Price::from_raw(0)), 0u);
-    EXPECT_EQ(book.aggregate().bids.count(Price::from_raw(-1)), 0u);
-    EXPECT_EQ(book.aggregate().bids.at(Price(99.0)), Size(1.0));
-}
-
 TEST(AggregateOrderBook, ApplySnapshotRejectsNonPositivePriceAtomically) {
     AggregateOrderBook book;
-    book.apply_delta(kBinance, Side::Ask, Price(100.0), Size(1.0));
+    apply_one(book, kBinance, Side::Ask, Price(100.0), Size(1.0));
 
     const std::array snapshot = {std::pair{Price(100.0), Size(2.0)},
                                   std::pair{Price::from_raw(0), Size(1.0)}};
@@ -273,8 +263,8 @@ TEST(AggregateOrderBook, ApplySnapshotAppliesBothSidesInOneCall) {
 // rejects the whole snapshot, valid side included.
 TEST(AggregateOrderBook, ApplySnapshotRejectsBadLevelOnEitherSideWithoutTouchingTheOther) {
     AggregateOrderBook book;
-    book.apply_delta(kBinance, Side::Bid, Price(50.0), Size(1.0));
-    book.apply_delta(kBinance, Side::Ask, Price(100.0), Size(1.0));
+    apply_one(book, kBinance, Side::Bid, Price(50.0), Size(1.0));
+    apply_one(book, kBinance, Side::Ask, Price(100.0), Size(1.0));
 
     // A perfectly good bids resync, paired with an asks resync containing
     // one bad level.
@@ -301,8 +291,8 @@ TEST(AggregateOrderBook, ApplySnapshotRejectsBadLevelOnEitherSideWithoutTouching
 // sides' complete current state at once.
 TEST(AggregateOrderBook, ApplySnapshotWithEmptySpanClearsThatSide) {
     AggregateOrderBook book;
-    book.apply_delta(kBinance, Side::Bid, Price(99.0), Size(1.0));
-    book.apply_delta(kBinance, Side::Ask, Price(101.0), Size(1.0));
+    apply_one(book, kBinance, Side::Bid, Price(99.0), Size(1.0));
+    apply_one(book, kBinance, Side::Ask, Price(101.0), Size(1.0));
 
     const std::array new_bids = {std::pair{Price(98.0), Size(1.0)}};
     ASSERT_TRUE(book.apply_snapshot(kBinance, new_bids, {}).has_value());
@@ -342,9 +332,9 @@ TEST(AggregateOrderBook, ApplyBatchAppliesBidsAndAsksInOneCall) {
     EXPECT_EQ(book.venues().at(kBinance).asks.at(Price(101.0)), Size(3.0));
 }
 
-TEST(AggregateOrderBook, ApplyBatchAggregatesAcrossVenuesLikeApplyDelta) {
+TEST(AggregateOrderBook, ApplyBatchAggregatesAcrossVenues) {
     AggregateOrderBook book;
-    book.apply_delta(kOkx, Side::Bid, Price(100.0), Size(5.0));
+    apply_one(book, kOkx, Side::Bid, Price(100.0), Size(5.0));
 
     std::array<std::pair<Price, Size>, 2> bids{{
         {Price(100.0), Size(3.0)},
@@ -358,7 +348,7 @@ TEST(AggregateOrderBook, ApplyBatchAggregatesAcrossVenuesLikeApplyDelta) {
 
 TEST(AggregateOrderBook, ApplyBatchWithOneSideEmptyOnlyTouchesTheOtherSide) {
     AggregateOrderBook book;
-    book.apply_delta(kBinance, Side::Ask, Price(101.0), Size(1.0));
+    apply_one(book, kBinance, Side::Ask, Price(101.0), Size(1.0));
 
     std::array<std::pair<Price, Size>, 1> bids{{
         {Price(100.0), Size(2.0)},
@@ -371,7 +361,7 @@ TEST(AggregateOrderBook, ApplyBatchWithOneSideEmptyOnlyTouchesTheOtherSide) {
 
 TEST(AggregateOrderBook, ApplyBatchRejectsNegativeSizeAtomically) {
     AggregateOrderBook book;
-    book.apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0));
+    apply_one(book, kBinance, Side::Bid, Price(100.0), Size(1.0));
 
     std::array<std::pair<Price, Size>, 2> bad_bids{{
         {Price(99.0), Size(1.0)},
@@ -391,19 +381,31 @@ TEST(AggregateOrderBook, ApplyBatchRejectsNegativeSizeAtomically) {
     EXPECT_EQ(book.aggregate().bids.at(Price(100.0)), Size(1.0));
 }
 
+// A non-positive price used to pass through unchecked (only size was
+// validated). Both zero and negative are rejected the same way size's own
+// <0 check is: with std::errc::invalid_argument and no state mutated,
+// atomically across the whole batch (the good bid ahead of the bad ask
+// isn't applied either).
 TEST(AggregateOrderBook, ApplyBatchRejectsNonPositivePriceAtomically) {
     AggregateOrderBook book;
-    book.apply_delta(kBinance, Side::Ask, Price(100.0), Size(1.0));
+    apply_one(book, kBinance, Side::Ask, Price(100.0), Size(1.0));
 
     std::array<std::pair<Price, Size>, 1> bids{{
         {Price(99.0), Size(1.0)},
     }};
-    std::array<std::pair<Price, Size>, 1> bad_asks{{
+    std::array<std::pair<Price, Size>, 1> zero_asks{{
         {Price::from_raw(0), Size(1.0)},
     }};
-    auto result = book.apply_batch(kBinance, bids, bad_asks);
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), std::errc::invalid_argument);
+    auto zero_result = book.apply_batch(kBinance, bids, zero_asks);
+    ASSERT_FALSE(zero_result.has_value());
+    EXPECT_EQ(zero_result.error(), std::errc::invalid_argument);
+
+    std::array<std::pair<Price, Size>, 1> negative_asks{{
+        {Price::from_raw(-1), Size(1.0)},
+    }};
+    auto negative_result = book.apply_batch(kBinance, bids, negative_asks);
+    ASSERT_FALSE(negative_result.has_value());
+    EXPECT_EQ(negative_result.error(), std::errc::invalid_argument);
 
     EXPECT_EQ(book.aggregate().bids.count(Price(99.0)), 0u);
     EXPECT_EQ(book.aggregate().asks.at(Price(100.0)), Size(1.0));
@@ -416,26 +418,26 @@ TEST(AggregateOrderBook, ApplyBatchRejectsNonPositivePriceAtomically) {
 // built binary, since the SymbolBook-level tests that used to be the only
 // coverage of the underlying diff logic are gRPC-gated.
 
-TEST(AggregateOrderBook, ApplyDeltaInvokesSinkWithResultingAggregateSize) {
+TEST(AggregateOrderBook, SinkInvokedWithResultingAggregateSize) {
     AggregateOrderBook book;
-    book.apply_delta(kOkx, Side::Bid, Price(100.0), Size(2.0));
+    apply_one(book, kOkx, Side::Bid, Price(100.0), Size(2.0));
 
     std::vector<std::pair<Price, Size>> changes;
-    book.apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0),
-                      [&](Price price, Size new_size) { changes.emplace_back(price, new_size); });
+    apply_one(book, kBinance, Side::Bid, Price(100.0), Size(1.0),
+              [&](Price price, Size new_size) { changes.emplace_back(price, new_size); });
 
     ASSERT_EQ(changes.size(), 1u);
     EXPECT_EQ(changes[0].first, Price(100.0));
     EXPECT_EQ(changes[0].second, Size(3.0));  // okx's 2 + binance's new 1
 }
 
-TEST(AggregateOrderBook, ApplyDeltaSinkReportsRemovalAsZeroNotNegative) {
+TEST(AggregateOrderBook, SinkReportsRemovalAsZeroNotNegative) {
     AggregateOrderBook book;
-    book.apply_delta(kBinance, Side::Ask, Price(100.0), Size(1.0));
+    apply_one(book, kBinance, Side::Ask, Price(100.0), Size(1.0));
 
     std::vector<std::pair<Price, Size>> changes;
-    book.apply_delta(kBinance, Side::Ask, Price(100.0), Size(0.0),
-                      [&](Price price, Size new_size) { changes.emplace_back(price, new_size); });
+    apply_one(book, kBinance, Side::Ask, Price(100.0), Size(0.0),
+              [&](Price price, Size new_size) { changes.emplace_back(price, new_size); });
 
     ASSERT_EQ(changes.size(), 1u);
     EXPECT_EQ(changes[0].first, Price(100.0));
@@ -443,23 +445,23 @@ TEST(AggregateOrderBook, ApplyDeltaSinkReportsRemovalAsZeroNotNegative) {
     EXPECT_EQ(book.aggregate().asks.count(Price(100.0)), 0u);
 }
 
-TEST(AggregateOrderBook, ApplyDeltaSinkDoesNotFireForANoOp) {
+TEST(AggregateOrderBook, SinkDoesNotFireForANoOp) {
     AggregateOrderBook book;
-    book.apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0));
+    apply_one(book, kBinance, Side::Bid, Price(100.0), Size(1.0));
 
     std::vector<std::pair<Price, Size>> changes;
     // Re-applying the exact same size changes nothing in the aggregate.
-    book.apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0),
-                      [&](Price price, Size new_size) { changes.emplace_back(price, new_size); });
+    apply_one(book, kBinance, Side::Bid, Price(100.0), Size(1.0),
+              [&](Price price, Size new_size) { changes.emplace_back(price, new_size); });
 
     EXPECT_TRUE(changes.empty());
 }
 
 TEST(AggregateOrderBook, InvalidateVenueInvokesSinkOncePerPriceItDrops) {
     AggregateOrderBook book;
-    book.apply_delta(kBinance, Side::Bid, Price(99.0), Size(1.0));
-    book.apply_delta(kBinance, Side::Ask, Price(101.0), Size(2.0));
-    book.apply_delta(kOkx, Side::Ask, Price(101.0), Size(5.0));  // survives binance's invalidation
+    apply_one(book, kBinance, Side::Bid, Price(99.0), Size(1.0));
+    apply_one(book, kBinance, Side::Ask, Price(101.0), Size(2.0));
+    apply_one(book, kOkx, Side::Ask, Price(101.0), Size(5.0));  // survives binance's invalidation
 
     std::vector<std::pair<Price, Size>> bid_changes, ask_changes;
     book.invalidate_venue(
@@ -477,8 +479,8 @@ TEST(AggregateOrderBook, InvalidateVenueInvokesSinkOncePerPriceItDrops) {
 
 TEST(AggregateOrderBook, ApplySnapshotSinkFiresForRemovalsAndAdditions) {
     AggregateOrderBook book;
-    book.apply_delta(kBinance, Side::Bid, Price(100.0), Size(1.0));
-    book.apply_delta(kBinance, Side::Bid, Price(99.0), Size(2.0));
+    apply_one(book, kBinance, Side::Bid, Price(100.0), Size(1.0));
+    apply_one(book, kBinance, Side::Bid, Price(99.0), Size(2.0));
 
     // 100 is dropped (absent from the new snapshot), 99 is untouched (same
     // size), 98 is a brand new price.

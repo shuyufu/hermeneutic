@@ -34,8 +34,8 @@ namespace bobby::hermeneutic::aggregator {
 static_assert(Price::decimals == 9);
 static_assert(Size::decimals == 6);
 
-// One bounded mailbox per subscriber. Publishers (SymbolBook::apply_delta/
-// apply_snapshot/invalidate_venue/send_heartbeat, via Fanout::broadcast())
+// One bounded mailbox per subscriber. Publishers (SymbolBook::apply_snapshot/
+// apply_batch/invalidate_venue/send_heartbeat, via Fanout::broadcast())
 // only ever push; the SubscribeL2Diff()/SubscribeBbo() handler thread that
 // owns this subscriber's ServerWriter is the only one that drains it and
 // calls Write(). Never shared across subscribers, so one slow drainer
@@ -216,7 +216,7 @@ class Fanout {
 // Per-symbol aggregated book plus its gRPC fan-out state. Not a gRPC type
 // itself: AggregatorService (the sole grpc::Service in this file) owns one
 // SymbolBook per symbol and routes every SubscribeL2Diff()/SubscribeBbo()
-// call, and every ingestion call (apply_delta et al.), to the right one by
+// call, and every ingestion call (apply_batch et al.), to the right one by
 // symbol. This is what keeps a multi-symbol deployment to one gRPC service
 // on one port instead of one process/port per symbol -- two grpc::Service
 // instances of the same generated type can't be registered on one
@@ -248,17 +248,6 @@ class Fanout {
 // do.
 class SymbolBook {
   public:
-    std::expected<void, std::errc> apply_delta(const VenueId& venue, Side side, Price price,
-                                                 Size size) {
-        std::lock_guard lock(mutex_);
-        std::vector<Change> changed;
-        auto result = book_.apply_delta(venue, side, price, size, [&](Price p, Size new_size) {
-            changed.push_back(Change{side, p, new_size});
-        });
-        if (result) publish(changed);
-        return result;
-    }
-
     // Resyncs both sides of `venue`'s book from a REST snapshot as a
     // single book revision: one seq bump, one broadcast - mirrors
     // apply_batch() below in both shape and reasoning. book_.apply_snapshot()
@@ -283,10 +272,10 @@ class SymbolBook {
 
     // Applies one batch of delta changes (e.g. everything one upstream
     // exchange message carried) as a single book revision: one seq bump,
-    // one broadcast - unlike calling apply_delta() once per level, which
-    // would seq-bump and broadcast once per level even though the exchange
-    // meant it as one atomic update. Same per-level price/size rejection
-    // as apply_delta (a non-positive price or a negative size), checked
+    // one broadcast - unlike bumping and broadcasting once per level, which
+    // would fragment what the exchange meant as one atomic update into
+    // several separate revisions on our own wire protocol. Every level's
+    // price/size is checked (a non-positive price or a negative size)
     // for every level before any of them is applied, so a bad level
     // anywhere in the batch leaves the book untouched rather than
     // partially updated for that reason specifically (an allocation
@@ -428,7 +417,7 @@ class SymbolBook {
     // `writer->Write()` is a blocking network call (gRPC flow control/TCP
     // backpressure) - it must never run while mutex_ is held, or one new
     // subscriber's slow/high-latency connection stalls ingestion
-    // (apply_delta/apply_batch/apply_snapshot) and every *other*
+    // (apply_batch/apply_snapshot/invalidate_venue) and every *other*
     // subscriber's broadcast for as long as this one Write() takes. So
     // this registers into `fanout` *before* calling Write() (both under
     // one lock, atomically with the snapshot/BBO capture via
@@ -491,7 +480,7 @@ class SymbolBook {
     };
 
     // One side's collector for the `Sink` parameters book_'s own
-    // apply_delta()/apply_snapshot()/apply_batch()/invalidate_venue() take
+    // apply_snapshot()/apply_batch()/invalidate_venue() take
     // (see aggregate_order_book.hpp's class comment) - AggregateOrderBook
     // calls operator() with a price and its resulting aggregate size for
     // every price that actually changed, already netted and already
