@@ -12,6 +12,7 @@
 #include <boost/beast/websocket.hpp>
 #include <boost/beast/websocket/ssl.hpp>  // async_teardown/teardown for net::ssl::stream<T>
 
+#include <cassert>
 #include <chrono>
 #include <string>
 #include <string_view>
@@ -19,6 +20,7 @@
 
 #include <openssl/ssl.h>
 
+#include "bobby/hermeneutic/ingestion/idle_timeout.hpp"
 #include "bobby/hermeneutic/net/net_traits.hpp"
 
 namespace bobby::hermeneutic::ingestion {
@@ -46,7 +48,58 @@ class WebSocketConnection {
     // NextLayer is an SSL stream - a plain TCP stream skips straight to the
     // WebSocket upgrade), then performs the WebSocket upgrade handshake to
     // `target`.
-    net::awaitable<void> connect(std::string_view host, std::string_view port, std::string_view target) {
+    //
+    // Idle-read detection (a half-open/black-holed connection - TCP still
+    // up, but the peer has silently stopped responding to anything, not
+    // even our own outgoing pings - never throwing from read() below) is
+    // handled via Boost.Beast's own websocket::stream_base::timeout +
+    // keep_alive_pings option, not a hand-rolled mechanism. An earlier
+    // attempt concluded (wrongly) that this option "doesn't fire": that
+    // test's fake server was itself a websocket::stream holding a pending
+    // read, which auto-answers an incoming ping as a side effect of
+    // Beast's own read machinery (impl/read.hpp) regardless of whether
+    // the "application" ever sends anything - so it never exercised the
+    // failure mode this option actually detects. Verified directly
+    // against a server that issues no read at all after the handshake (so
+    // nothing it receives, including our idle ping, is ever processed or
+    // answered): the pending read here correctly fails with
+    // beast::error::timeout. `idle_timeout` measures transport
+    // responsiveness, not application-data freshness - deliberately: no
+    // exchange guarantees it will push anything, not even a no-op
+    // heartbeat, during a genuinely quiet market, so a check tied to
+    // application content would misfire on an illiquid book with a
+    // perfectly healthy connection (live-verified on Binance Futures
+    // CTKUSDT perp: ~14s natural gaps between real updates, and climbing,
+    // well within reach of a 30s threshold).
+    //
+    // What "responsiveness" actually proves is narrower than "the peer is
+    // alive": it's "the first hop that terminates our WS connection
+    // answers something" - which for a venue fronted by a load balancer or
+    // reverse proxy may be that edge, not the real backend feeding market
+    // data. An edge that answers WS-level pings independently of its own
+    // backend health (common - ping/pong is cheap to terminate without
+    // forwarding) would leave this mechanism reporting a healthy
+    // connection indefinitely while no real data ever arrives again. This
+    // is a known, structural blind spot of any transport-level check
+    // (including a hand-rolled application-message one - see this
+    // function's own git history for the false-positive problem that
+    // approach had instead), not something idle_timeout can be tuned to
+    // close. Closing it needs a second, independent, much-longer-window
+    // check on genuine application data ever arriving at all - out of
+    // scope here; not yet built.
+    net::awaitable<void> connect(std::string_view host, std::string_view port, std::string_view target,
+                                  std::chrono::seconds idle_timeout = kDefaultIdleTimeout) {
+        // book_subscription.hpp's parse_idle_timeout_config() is the only
+        // path production code takes to get here, and it already rejects
+        // a non-positive or over-kMaxIdleTimeout value - this is a debug-
+        // only backstop against a caller that reaches this constructor
+        // some other way (a test, a future direct construction) and
+        // passes something that would silently misbehave: zero/negative
+        // as a near-immediate timeout, or large enough to overflow
+        // websocket::stream_base::timeout::duration (see idle_timeout.hpp's
+        // own comment on kMaxIdleTimeout for why that's a real bug, not
+        // just an unreasonable value) on conversion below.
+        assert(idle_timeout.count() > 0 && idle_timeout <= kMaxIdleTimeout);
         auto executor = co_await net::this_coro::executor;
         net::ip::tcp::resolver resolver(executor);
         auto results = co_await resolver.async_resolve(host, port, net::use_awaitable);
@@ -68,7 +121,19 @@ class WebSocketConnection {
         // applies once we're past it - the WebSocket-level timeout option
         // below takes over for the lifetime of the connection.
         beast::get_lowest_layer(ws_).expires_never();
-        ws_.set_option(websocket::stream_base::timeout::suggested(beast::role_type::client));
+        // Starts from Beast's own suggested(client) value (handshake_
+        // timeout=30s as of boost-beast 1.92.0) rather than hardcoding
+        // 30s a second time here, so a future Beast upgrade changing that
+        // default is picked up automatically instead of silently going
+        // stale against an independently-duplicated constant. Only
+        // idle_timeout/keep_alive_pings are actually overridden -
+        // suggested(client) sets idle_timeout=none()/keep_alive_pings=
+        // false, no idle detection at all (see this function's own
+        // comment above for why that's not what this needs).
+        auto timeout_opt = websocket::stream_base::timeout::suggested(beast::role_type::client);
+        timeout_opt.idle_timeout = idle_timeout;
+        timeout_opt.keep_alive_pings = true;
+        ws_.set_option(timeout_opt);
 
         co_await ws_.async_handshake(std::string(host), std::string(target), net::use_awaitable);
     }
@@ -77,6 +142,12 @@ class WebSocketConnection {
         co_await ws_.async_write(net::buffer(message), net::use_awaitable);
     }
 
+    // Cancellable by stop() (via run_sig_) through the *ambient*
+    // cancellation state that propagates automatically through nested
+    // co_await calls in an awaitable coroutine - see run()'s own comments
+    // in venue_session.hpp for how that's wired up. A timeout fires here
+    // as beast::error::timeout, not a cancellation - see connect()'s own
+    // comment above for what idle_timeout actually measures.
     net::awaitable<std::string> read() {
         beast::flat_buffer buffer;
         co_await ws_.async_read(buffer, net::use_awaitable);

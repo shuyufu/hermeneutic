@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <fstream>
 
 namespace bobby::hermeneutic::ingestion {
@@ -157,6 +158,151 @@ TEST(LoadBookSubscriptions, ReadsAndParsesARealFile) {
 
 TEST(LoadBookSubscriptions, RejectsAMissingFile) {
     auto result = load_book_subscriptions(testing::TempDir() + "book_subscription_test_does_not_exist.json");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().find("failed to read subscription config"), std::string::npos);
+}
+
+TEST(ParseIdleTimeoutConfig, DefaultsWhenFieldsAreAbsent) {
+    auto result = parse_idle_timeout_config(R"({"books": []})");
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_EQ(result->default_timeout, kDefaultIdleTimeout);
+    EXPECT_TRUE(result->overrides.empty());
+    EXPECT_EQ(result->for_venue(VenueId{Exchange::Okx, MarketType::Spot}), kDefaultIdleTimeout);
+}
+
+TEST(ParseIdleTimeoutConfig, ParsesCustomDefault) {
+    auto result = parse_idle_timeout_config(R"({"idle_timeout_seconds": 45})");
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_EQ(result->default_timeout, std::chrono::seconds(45));
+}
+
+TEST(ParseIdleTimeoutConfig, RejectsZeroOrNegativeDefault) {
+    for (auto* json : {R"({"idle_timeout_seconds": 0})", R"({"idle_timeout_seconds": -5})"}) {
+        auto result = parse_idle_timeout_config(json);
+        ASSERT_FALSE(result.has_value()) << json;
+        EXPECT_NE(result.error().find("positive"), std::string::npos) << json;
+    }
+}
+
+// A wrong-typed (not INCORRECT_TYPE-absent, but present-and-wrong) value
+// must name "idle_timeout_seconds" specifically, not fall through to the
+// generic "malformed subscription config" message - a /code-review pass
+// caught this catch only recognizing NO_SUCH_FIELD.
+TEST(ParseIdleTimeoutConfig, RejectsWrongTypedDefault) {
+    auto result = parse_idle_timeout_config(R"({"idle_timeout_seconds": "30"})");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().find("\"idle_timeout_seconds\""), std::string::npos);
+}
+
+// Guards against silently overflowing when this value is later converted
+// to websocket::stream_base::timeout::duration (a nanosecond-resolution,
+// int64 std::chrono::steady_clock::duration) - see idle_timeout.hpp's own
+// comment on kMaxIdleTimeout for why an unbounded value here would be a
+// real bug, not just an unreasonable one.
+TEST(ParseIdleTimeoutConfig, RejectsDefaultAboveMax) {
+    auto result = parse_idle_timeout_config(R"({"idle_timeout_seconds": 999999999999})");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().find("no more than"), std::string::npos);
+}
+
+TEST(ParseIdleTimeoutConfig, AcceptsDefaultExactlyAtMax) {
+    auto result = parse_idle_timeout_config(R"({"idle_timeout_seconds": 86400})");
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_EQ(result->default_timeout, kMaxIdleTimeout);
+}
+
+TEST(ParseIdleTimeoutConfig, ParsesOverridesAndFeedsForVenue) {
+    auto result = parse_idle_timeout_config(R"({
+        "idle_timeout_seconds": 30,
+        "venue_idle_timeout_overrides": [
+            {"venue": "OKX", "type": "SPOT", "seconds": 120},
+            {"venue": "OKX", "type": "PERP", "seconds": 90}
+        ]
+    })");
+    ASSERT_TRUE(result.has_value()) << result.error();
+    ASSERT_EQ(result->overrides.size(), 2u);
+    EXPECT_EQ(result->for_venue(VenueId{Exchange::Okx, MarketType::Spot}), std::chrono::seconds(120));
+    EXPECT_EQ(result->for_venue(VenueId{Exchange::Okx, MarketType::Perp}), std::chrono::seconds(90));
+    // A venue with no override still falls back to the configured default.
+    EXPECT_EQ(result->for_venue(VenueId{Exchange::Binance, MarketType::Spot}), std::chrono::seconds(30));
+}
+
+TEST(ParseIdleTimeoutConfig, RejectsMalformedOverrideEntry) {
+    auto result = parse_idle_timeout_config(R"({"venue_idle_timeout_overrides": [{"venue": "OKX"}]})");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().find("each entry in \"venue_idle_timeout_overrides\""), std::string::npos);
+}
+
+// A non-object entry (get_object() itself throws INCORRECT_TYPE) must be
+// reported the same way as any other malformed entry, not escape to the
+// generic "malformed subscription config" message - see
+// parse_idle_timeout_config()'s own comment on why get_object() has to be
+// inside this entry's try/catch, not before it.
+TEST(ParseIdleTimeoutConfig, RejectsNonObjectOverrideEntry) {
+    auto result = parse_idle_timeout_config(R"({"venue_idle_timeout_overrides": ["OKX"]})");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().find("each entry in \"venue_idle_timeout_overrides\""), std::string::npos);
+}
+
+TEST(ParseIdleTimeoutConfig, RejectsZeroOrNegativeOverrideSeconds) {
+    auto result = parse_idle_timeout_config(
+        R"({"venue_idle_timeout_overrides": [{"venue": "OKX", "type": "SPOT", "seconds": 0}]})");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().find("positive"), std::string::npos);
+}
+
+TEST(ParseIdleTimeoutConfig, RejectsOverrideSecondsAboveMax) {
+    auto result = parse_idle_timeout_config(
+        R"({"venue_idle_timeout_overrides": [{"venue": "OKX", "type": "SPOT", "seconds": 999999999999}]})");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().find("no more than"), std::string::npos);
+}
+
+TEST(ParseIdleTimeoutConfig, RejectsUnknownVenueInOverride) {
+    auto result = parse_idle_timeout_config(
+        R"({"venue_idle_timeout_overrides": [{"venue": "DERIBIT", "type": "SPOT", "seconds": 60}]})");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().find("unknown venue \"DERIBIT\""), std::string::npos);
+}
+
+TEST(ParseIdleTimeoutConfig, RejectsUnknownTypeInOverride) {
+    auto result = parse_idle_timeout_config(
+        R"({"venue_idle_timeout_overrides": [{"venue": "OKX", "type": "FUTURES", "seconds": 60}]})");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().find("unknown type \"FUTURES\""), std::string::npos);
+}
+
+TEST(ParseIdleTimeoutConfig, RejectsDuplicateOverrideForTheSameVenue) {
+    auto result = parse_idle_timeout_config(R"({
+        "venue_idle_timeout_overrides": [
+            {"venue": "OKX", "type": "SPOT", "seconds": 60},
+            {"venue": "OKX", "type": "SPOT", "seconds": 90}
+        ]
+    })");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().find("more than once"), std::string::npos);
+}
+
+TEST(ParseIdleTimeoutConfig, RejectsMalformedJson) {
+    auto result = parse_idle_timeout_config("{not json");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().find("malformed subscription config"), std::string::npos);
+}
+
+TEST(LoadIdleTimeoutConfig, ReadsAndParsesARealFile) {
+    std::string path = testing::TempDir() + "idle_timeout_config_test_valid.json";
+    {
+        std::ofstream file(path);
+        file << R"({"idle_timeout_seconds": 45})";
+    }
+
+    auto result = load_idle_timeout_config(path);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_EQ(result->default_timeout, std::chrono::seconds(45));
+}
+
+TEST(LoadIdleTimeoutConfig, RejectsAMissingFile) {
+    auto result = load_idle_timeout_config(testing::TempDir() + "idle_timeout_config_test_does_not_exist.json");
     ASSERT_FALSE(result.has_value());
     EXPECT_NE(result.error().find("failed to read subscription config"), std::string::npos);
 }

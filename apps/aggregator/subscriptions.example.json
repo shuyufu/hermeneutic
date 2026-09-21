@@ -2,5 +2,10 @@
     "books": [
         {"symbol": "BTC_USDT", "type": "SPOT", "venues": ["BINANCE", "BYBIT", "OKX"]},
         {"symbol": "BTC_USDT", "type": "PERP", "venues": ["BINANCE", "BYBIT", "OKX"]}
+    ],
+    "idle_timeout_seconds": 30,
+    "venue_idle_timeout_overrides": [
+        {"venue": "OKX", "type": "SPOT", "seconds": 120},
+        {"venue": "OKX", "type": "PERP", "seconds": 120}
     ]
 }

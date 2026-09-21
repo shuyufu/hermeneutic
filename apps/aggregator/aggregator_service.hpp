@@ -353,16 +353,38 @@ class SymbolBook {
     // revision). Callers (e.g. AggregatorService::send_heartbeat(), driven
     // by server_main.cpp) are expected to invoke this on a fixed
     // interval; this class has no internal timer of its own.
+    //
+    // live_venues is read from book_.venues() here, inside this same
+    // mutex_ critical section, rather than captured separately - reading
+    // it outside the lock (even "just before" this call) would race
+    // against a concurrent apply_batch()/invalidate_venue() and could
+    // report a venue as live that was invalidated a moment earlier, or
+    // vice versa. This is what keeps the heartbeat's validity snapshot
+    // consistent with whatever L2Diff/Bbo updates this same call to
+    // mutex_ might otherwise be interleaved with on the wire.
     void send_heartbeat() {
         std::lock_guard lock(mutex_);
         auto ts_ns = now_ns();
 
         L2Update l2_update;
-        l2_update.mutable_heartbeat()->set_ts_ns(ts_ns);
+        auto* l2_heartbeat = l2_update.mutable_heartbeat();
+        l2_heartbeat->set_ts_ns(ts_ns);
+        // book_.venues() is walked (and symbol::to_string()'d) a single
+        // time under this lock, straight into l2_heartbeat's own field;
+        // bbo_heartbeat below then copies that already-built
+        // RepeatedPtrField wholesale (one copy) instead of re-deriving
+        // the identical list a second time or round-tripping through an
+        // intermediate std::vector<std::string> (two copies) for what's
+        // otherwise a very short critical section.
+        for (const auto& [venue, venue_book] : book_.venues()) {
+            l2_heartbeat->add_live_venues(symbol::to_string(venue));
+        }
         l2_fanout_.broadcast(l2_update);
 
         BboUpdate bbo_update;
-        bbo_update.mutable_heartbeat()->set_ts_ns(ts_ns);
+        auto* bbo_heartbeat = bbo_update.mutable_heartbeat();
+        bbo_heartbeat->set_ts_ns(ts_ns);
+        *bbo_heartbeat->mutable_live_venues() = l2_heartbeat->live_venues();
         bbo_fanout_.broadcast(bbo_update);
     }
 

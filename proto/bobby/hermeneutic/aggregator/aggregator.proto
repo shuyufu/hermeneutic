@@ -187,6 +187,46 @@ message Bbo {
 // carried on its own independent gRPC/HTTP2 stream.
 message Heartbeat {
   fixed64 ts_ns = 1;
+  // Which venues are currently contributing to this book, as venue-native
+  // display strings (see bobby::hermeneutic::symbol::to_string(VenueId),
+  // e.g. "binance_spot", "okx_swap") - not a structured VenueId, since
+  // nothing parses this back (same reasoning as BookId's own to_string()).
+  // Empty means no venue currently backs this book - the strongest signal
+  // a client has that this book is not trustworthy right now, whether the
+  // cause is a disconnect, a resync gap, a failed initial snapshot fetch,
+  // or the book never having been seeded yet; this field is intentionally
+  // cause-agnostic (see docs/ingestion_design.md 第10節第15項 for why: the
+  // corrective action - distrust this book - is the same regardless of
+  // cause). A shrinking-but-non-empty set means the book is thinner, not
+  // invalid; clients already see exactly how much thinner via the ordinary
+  // L2Diff/Bbo updates invalidate_venue() itself produces, so this field
+  // only has to answer "is this still backed at all", not "by how much".
+  //
+  // Element order is unspecified and may change between heartbeats even
+  // when the live venue set itself hasn't (the server populates this by
+  // iterating an unordered_map) - a client comparing successive heartbeats
+  // should treat this as a set, not a sequence.
+  //
+  // proto3 gives repeated fields no wire-level presence distinction
+  // between "never set" and "explicitly empty" - both look identical to a
+  // client. Practically: an AggregatorService build predating this field
+  // (or one rolled back mid-incident) simply never populates it, which a
+  // client relying on the "empty = untrustworthy" contract above cannot
+  // tell apart from a genuinely live book with zero contributing venues.
+  // Not fixed here - would need either a sentinel field marking this
+  // server build as live_venues-aware, or accepting that mixed-version
+  // rolling deploys are out of scope for this signal for now.
+  //
+  // Known blind spot a client should be aware of: a venue listed here as
+  // live only means the WebSocket idle-ping mechanism that keeps it
+  // connected got *some* response - if that venue sits behind a load
+  // balancer/reverse proxy that answers protocol-level pings independently
+  // of its own backend's health (a common, cheap-to-terminate-at-the-edge
+  // setup), this field can report a venue as live indefinitely with no
+  // real market data ever arriving again. Not detectable from this field
+  // alone - see include/bobby/hermeneutic/net/websocket_connection.hpp's
+  // connect() for the full reasoning.
+  repeated string live_venues = 2;
 }
 
 message L2Update {

@@ -33,6 +33,7 @@
 
 #include "bobby/hermeneutic/book/aggregate_order_book.hpp"
 #include "bobby/hermeneutic/book/symbol_sync.hpp"
+#include "bobby/hermeneutic/ingestion/idle_timeout.hpp"
 #include "bobby/hermeneutic/net/http_client.hpp"
 #include "bobby/hermeneutic/net/net_traits.hpp"
 #include "bobby/hermeneutic/net/websocket_connection.hpp"
@@ -105,13 +106,22 @@ class SymbolRegistry {
 template <typename Feed, typename Policy, typename NextLayer, typename Book>
 class VenueSession {
   public:
+    // Not tuned to any particular venue - see WebSocketConnection::
+    // connect()'s own comment for what this guards against (passed
+    // straight through to it below). A caller (e.g. server_main.cpp, from
+    // book_subscription.hpp's IdleTimeoutConfig) can pass a longer
+    // per-venue value via the constructor's own parameter. Shared with
+    // IdleTimeoutConfig's own default - see idle_timeout.hpp for why
+    // that's a single definition, not two.
     VenueSession(Feed feed, VenueId venue, std::vector<NativeSymbol> symbols, SymbolRegistry<Book> registry,
-                 net::any_io_executor executor, net::ssl::context* ssl_ctx = nullptr)
+                 net::any_io_executor executor, net::ssl::context* ssl_ctx = nullptr,
+                 std::chrono::seconds idle_timeout = kDefaultIdleTimeout)
         : feed_(std::move(feed)),
           venue_(std::move(venue)),
           symbols_(std::move(symbols)),
           registry_(std::move(registry)),
           ssl_ctx_(ssl_ctx),
+          idle_timeout_(idle_timeout),
           strand_(net::make_strand(executor)) {
         for (const auto& symbol : symbols_) symbol_syncs_.try_emplace(symbol);
     }
@@ -228,7 +238,7 @@ class VenueSession {
             try {
                 auto executor = co_await net::this_coro::executor;
                 auto connection = make_connection(executor);
-                co_await connection.connect(feed_.ws_host(), feed_.ws_port(), feed_.ws_target());
+                co_await connection.connect(feed_.ws_host(), feed_.ws_port(), feed_.ws_target(), idle_timeout_);
                 co_await connection.send(feed_.subscribe_message(symbols_));
                 connected_at = std::chrono::steady_clock::now();
 
@@ -808,6 +818,11 @@ class VenueSession {
     std::vector<NativeSymbol> symbols_;
     SymbolRegistry<Book> registry_;
     net::ssl::context* ssl_ctx_;
+    // Passed to WebSocketConnection::connect() on every (re)connect - see
+    // its own doc comment for why this exists (WS idle-read detection) and
+    // idle_timeout.hpp's kDefaultIdleTimeout for the default this
+    // constructor falls back to when a caller doesn't override it.
+    std::chrono::seconds idle_timeout_;
     std::unordered_map<NativeSymbol, SymbolSync<Policy>> symbol_syncs_;
 
     // Everything below is only ever touched while running on strand_ (run()

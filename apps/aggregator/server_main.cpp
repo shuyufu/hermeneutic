@@ -1,5 +1,6 @@
 #include <grpc/grpc.h>
 #include <grpcpp/grpcpp.h>
+#include <simdjson.h>
 
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/io_context.hpp>
@@ -87,7 +88,8 @@ template <typename Feed, typename Policy>
 void wire_venue(bobby::hermeneutic::ingestion::IngestionRunner& runner, VenueGroups& groups,
                  const VenueId& venue_id, std::vector<std::string>& wired_venues,
                  std::unordered_set<VenueId>& wired_venue_ids, net::any_io_executor executor,
-                 net::ssl::context* ssl_ctx) {
+                 net::ssl::context* ssl_ctx,
+                 const bobby::hermeneutic::ingestion::IdleTimeoutConfig& idle_timeout_config) {
     auto* group = find_group(groups, venue_id);
     if (!group) return;
     // to_string() is only for wired_venues, this function's own
@@ -97,7 +99,8 @@ void wire_venue(bobby::hermeneutic::ingestion::IngestionRunner& runner, VenueGro
     wired_venues.push_back(bobby::hermeneutic::symbol::to_string(venue_id));
     wired_venue_ids.insert(venue_id);
     runner.add<Feed, Policy, net::ssl::stream<boost::beast::tcp_stream>, SymbolBook>(
-        Feed{}, venue_id, std::move(group->native_symbols), std::move(group->registry), executor, ssl_ctx);
+        Feed{}, venue_id, std::move(group->native_symbols), std::move(group->registry), executor, ssl_ctx,
+        idle_timeout_config.for_venue(venue_id));
 }
 
 }  // namespace
@@ -120,12 +123,39 @@ int main(int argc, char** argv) {
         std::cerr << "usage: hermeneutic_aggregator_service [address] <subscription-config.json>\n";
         return 1;
     }
-    auto parsed = bobby::hermeneutic::ingestion::load_book_subscriptions(argv[2]);
+    // Read once, shared by both parse_*() calls below - calling
+    // load_book_subscriptions()/load_idle_timeout_config() here instead
+    // would each open and fully simdjson-parse this same file
+    // independently for no reason (a real, if startup-only, duplication a
+    // /code-review pass caught). Safe to share: each parse_*() function
+    // makes its own private simdjson::padded_string copy of the text it's
+    // given rather than parsing config_json in place, so parsing it twice
+    // from the same std::string_view doesn't have the two parses
+    // interfere with each other.
+    simdjson::padded_string config_json;
+    if (auto error = simdjson::padded_string::load(argv[2]).get(config_json)) {
+        std::cerr << "failed to read subscription config \"" << argv[2]
+                   << "\": " << simdjson::error_message(error) << '\n';
+        return 1;
+    }
+
+    auto parsed = bobby::hermeneutic::ingestion::parse_book_subscriptions(std::string_view(config_json));
     if (!parsed) {
         std::cerr << "invalid subscription config: " << parsed.error() << '\n';
         return 1;
     }
     const std::vector<VenueSubscription>& subscriptions = *parsed;
+
+    // Same config file, a separate (optional) section - see
+    // book_subscription.hpp's IdleTimeoutConfig/parse_idle_timeout_config()
+    // for the document shape and why this is parsed independently of
+    // parse_book_subscriptions() above.
+    auto idle_timeout_config =
+        bobby::hermeneutic::ingestion::parse_idle_timeout_config(std::string_view(config_json));
+    if (!idle_timeout_config) {
+        std::cerr << "invalid subscription config: " << idle_timeout_config.error() << '\n';
+        return 1;
+    }
 
     // AggregatorService's book set is keyed by symbol::BookId - deduplicated
     // here, in first-seen order, since several subscriptions (one per venue)
@@ -223,16 +253,16 @@ int main(int argc, char** argv) {
 
     wire_venue<bobby::hermeneutic::ingestion::BinanceSpotFeed, bobby::hermeneutic::BinanceSpotSequencePolicy>(
         runner, groups, VenueId{Exchange::Binance, MarketType::Spot}, wired_venues, wired_venue_ids,
-        io.get_executor(), &ssl_ctx);
+        io.get_executor(), &ssl_ctx, *idle_timeout_config);
     wire_venue<bobby::hermeneutic::ingestion::BinanceFuturesFeed, bobby::hermeneutic::BinanceFuturesSequencePolicy>(
         runner, groups, VenueId{Exchange::Binance, MarketType::Perp}, wired_venues, wired_venue_ids,
-        io.get_executor(), &ssl_ctx);
+        io.get_executor(), &ssl_ctx, *idle_timeout_config);
     wire_venue<bobby::hermeneutic::ingestion::BybitSpotFeed, bobby::hermeneutic::BybitSequencePolicy>(
         runner, groups, VenueId{Exchange::Bybit, MarketType::Spot}, wired_venues, wired_venue_ids,
-        io.get_executor(), &ssl_ctx);
+        io.get_executor(), &ssl_ctx, *idle_timeout_config);
     wire_venue<bobby::hermeneutic::ingestion::BybitLinearFeed, bobby::hermeneutic::BybitSequencePolicy>(
         runner, groups, VenueId{Exchange::Bybit, MarketType::Perp}, wired_venues, wired_venue_ids,
-        io.get_executor(), &ssl_ctx);
+        io.get_executor(), &ssl_ctx, *idle_timeout_config);
     // OKX is a single Feed/Policy pair covering both spot and perpetual
     // swap instIds (the `books` channel is protocol-identical for both -
     // see okx_feed.hpp); "okx_spot"/"okx_swap" are two independent
@@ -240,10 +270,30 @@ int main(int argc, char** argv) {
     // every other venue's shape here.
     wire_venue<bobby::hermeneutic::ingestion::OkxFeed, bobby::hermeneutic::OkxSequencePolicy>(
         runner, groups, VenueId{Exchange::Okx, MarketType::Spot}, wired_venues, wired_venue_ids, io.get_executor(),
-        &ssl_ctx);
+        &ssl_ctx, *idle_timeout_config);
     wire_venue<bobby::hermeneutic::ingestion::OkxFeed, bobby::hermeneutic::OkxSequencePolicy>(
         runner, groups, VenueId{Exchange::Okx, MarketType::Perp}, wired_venues, wired_venue_ids, io.get_executor(),
-        &ssl_ctx);
+        &ssl_ctx, *idle_timeout_config);
+
+    // Shared tail for both "config names a venue that isn't actually
+    // wired" checks below - a future third such check (plausible: nothing
+    // currently validates book_symbols/subscriptions reference real
+    // books) gets the same shutdown sequence for free instead of a third
+    // copy-pasted block that could drift from the other two. Returns
+    // whether it fired, so each call site's own `return 1;` stays visible
+    // there rather than this helper silently ending main() from inside a
+    // lambda.
+    auto fail_on_bad_venues = [&](const std::vector<std::string>& bad_venues, std::string_view what,
+                                    std::string_view consequence) {
+        if (bad_venues.empty()) return false;
+        std::cerr << "fatal: " << what << " names " << bad_venues.size() << " venue(s) " << consequence << ":";
+        for (const auto& venue : bad_venues) std::cerr << ' ' << venue;
+        std::cerr << std::endl;
+        heartbeat_stop = true;
+        heartbeat_thread.join();
+        server->Shutdown();
+        return true;
+    };
 
     // Fail startup, rather than run with silent zero-data ingestion for
     // some book, if the config named a (venue, market type) none of the
@@ -262,15 +312,28 @@ int main(int argc, char** argv) {
             unwired_venues.push_back(bobby::hermeneutic::symbol::to_string(venue_id));
         }
     }
-    if (!unwired_venues.empty()) {
-        std::cerr << "fatal: subscription config names " << unwired_venues.size()
-                  << " venue(s) this binary has no wire_venue<>() call for (they would silently "
-                     "receive zero ingestion):";
-        for (const auto& venue : unwired_venues) std::cerr << ' ' << venue;
-        std::cerr << std::endl;
-        heartbeat_stop = true;
-        heartbeat_thread.join();
-        server->Shutdown();
+    if (fail_on_bad_venues(unwired_venues, "subscription config",
+                            "this binary has no wire_venue<>() call for (they would silently receive zero "
+                            "ingestion)")) {
+        return 1;
+    }
+
+    // Same "config looks right but isn't actually wired" failure class as
+    // the unwired-venue check above, for venue_idle_timeout_overrides
+    // instead of "books": an override naming a venue that isn't actually
+    // subscribed would otherwise parse successfully and silently do
+    // nothing (IdleTimeoutConfig::for_venue() is never asked for that
+    // VenueId), leaving an operator believing their tuning took effect
+    // when it didn't - inconsistent with this whole config's own "every
+    // mistake fails loud" policy (see book_subscription.hpp).
+    std::vector<std::string> unused_overrides;
+    for (const auto& [venue_id, timeout] : idle_timeout_config->overrides) {
+        if (!wired_venue_ids.contains(venue_id)) {
+            unused_overrides.push_back(bobby::hermeneutic::symbol::to_string(venue_id));
+        }
+    }
+    if (fail_on_bad_venues(unused_overrides, "venue_idle_timeout_overrides",
+                            "not present in \"books\" (the override would silently do nothing)")) {
         return 1;
     }
 

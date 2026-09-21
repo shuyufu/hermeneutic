@@ -510,6 +510,87 @@ TEST_F(AggregatorServiceTest, HeartbeatIsDeliveredAndDoesNotAdvanceSeq) {
     EXPECT_EQ(diff_msg.diff().book_seq(), 1u);
 }
 
+// The core new signal this PR adds - live_venues content itself was
+// otherwise completely untested (HeartbeatIsDeliveredAndDoesNotAdvanceSeq
+// above only checks ts_ns()) - a /code-review pass caught this. Each of
+// the three data-changing calls below is chosen to also move the top of
+// book (a first bid, a first ask, then removing the only bid), so the L2
+// and Bbo streams stay in exact 1:1 lockstep - both get one message per
+// action, letting the same wait_for() indices check both streams without
+// separately tracking whether a given change happened to touch the top of
+// book.
+TEST_F(AggregatorServiceTest, HeartbeatLiveVenuesTracksContributingVenues) {
+    auto bbo = subscribe_bbo();
+    updates_.wait_for(0);      // initial L2 snapshot
+    bbo->updates.wait_for(0);  // initial Bbo
+
+    // Nothing has contributed yet - both streams' heartbeats should agree
+    // on an empty live_venues.
+    book().send_heartbeat();
+    L2Update hb1 = updates_.wait_for(1);
+    ASSERT_TRUE(hb1.has_heartbeat());
+    EXPECT_EQ(hb1.heartbeat().live_venues_size(), 0);
+    BboUpdate bbo_hb1 = bbo->updates.wait_for(1);
+    ASSERT_TRUE(bbo_hb1.has_heartbeat());
+    EXPECT_EQ(bbo_hb1.heartbeat().live_venues_size(), 0);
+
+    // kBinance contributes the book's first-ever bid.
+    ASSERT_TRUE(apply_one(book(), kBinance, Side::Bid, Price(100.0), Size(1.0)).has_value());
+    updates_.wait_for(2);
+    bbo->updates.wait_for(2);
+
+    book().send_heartbeat();
+    L2Update hb2 = updates_.wait_for(3);
+    ASSERT_TRUE(hb2.has_heartbeat());
+    ASSERT_EQ(hb2.heartbeat().live_venues_size(), 1);
+    EXPECT_EQ(hb2.heartbeat().live_venues(0), bobby::hermeneutic::symbol::to_string(kBinance));
+    BboUpdate bbo_hb2 = bbo->updates.wait_for(3);
+    ASSERT_TRUE(bbo_hb2.has_heartbeat());
+    ASSERT_EQ(bbo_hb2.heartbeat().live_venues_size(), 1);
+    EXPECT_EQ(bbo_hb2.heartbeat().live_venues(0), bobby::hermeneutic::symbol::to_string(kBinance));
+
+    // kOkx contributes the book's first-ever ask - both venues now live.
+    ASSERT_TRUE(apply_one(book(), kOkx, Side::Ask, Price(101.0), Size(2.0)).has_value());
+    updates_.wait_for(4);
+    bbo->updates.wait_for(4);
+
+    book().send_heartbeat();
+    L2Update hb3 = updates_.wait_for(5);
+    ASSERT_TRUE(hb3.has_heartbeat());
+    std::vector<std::string> venues3(hb3.heartbeat().live_venues().begin(), hb3.heartbeat().live_venues().end());
+    std::sort(venues3.begin(), venues3.end());
+    std::vector<std::string> expected3{bobby::hermeneutic::symbol::to_string(kBinance),
+                                        bobby::hermeneutic::symbol::to_string(kOkx)};
+    std::sort(expected3.begin(), expected3.end());
+    EXPECT_EQ(venues3, expected3);
+    // Bbo's own heartbeat must report the exact same set as L2's - proves
+    // send_heartbeat() copying l2_heartbeat's already-built field into
+    // bbo_heartbeat actually keeps both streams in sync, not just
+    // coincidentally similar.
+    BboUpdate bbo_hb3 = bbo->updates.wait_for(5);
+    ASSERT_TRUE(bbo_hb3.has_heartbeat());
+    std::vector<std::string> bbo_venues3(bbo_hb3.heartbeat().live_venues().begin(),
+                                          bbo_hb3.heartbeat().live_venues().end());
+    std::sort(bbo_venues3.begin(), bbo_venues3.end());
+    EXPECT_EQ(bbo_venues3, expected3);
+
+    // Invalidating kBinance removes the book's only bid - live_venues
+    // shrinks back down to just kOkx, on both streams.
+    book().invalidate_venue(kBinance);
+    updates_.wait_for(6);
+    bbo->updates.wait_for(6);
+
+    book().send_heartbeat();
+    L2Update hb4 = updates_.wait_for(7);
+    ASSERT_TRUE(hb4.has_heartbeat());
+    ASSERT_EQ(hb4.heartbeat().live_venues_size(), 1);
+    EXPECT_EQ(hb4.heartbeat().live_venues(0), bobby::hermeneutic::symbol::to_string(kOkx));
+    BboUpdate bbo_hb4 = bbo->updates.wait_for(7);
+    ASSERT_TRUE(bbo_hb4.has_heartbeat());
+    ASSERT_EQ(bbo_hb4.heartbeat().live_venues_size(), 1);
+    EXPECT_EQ(bbo_hb4.heartbeat().live_venues(0), bobby::hermeneutic::symbol::to_string(kOkx));
+}
+
 // The AggregateOrderBook.ApplyBatch* cases in aggregate_order_book_test.cpp
 // cover apply_batch()'s own aggregation/atomicity behavior directly and
 // cheaply, in the always-built hermeneutic_tests binary. The three cases

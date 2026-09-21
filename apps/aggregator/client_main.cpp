@@ -64,6 +64,7 @@ using bobby::hermeneutic::aggregator::Aggregator;
 using bobby::hermeneutic::aggregator::apply_levels;
 using bobby::hermeneutic::aggregator::BboUpdate;
 using bobby::hermeneutic::aggregator::fill_wire_book_id;
+using bobby::hermeneutic::aggregator::Heartbeat;
 using bobby::hermeneutic::aggregator::is_book_seq_gap;
 using bobby::hermeneutic::aggregator::L2Update;
 using bobby::hermeneutic::aggregator::ListBooksRequest;
@@ -130,6 +131,28 @@ std::string format_fixed(FixedPoint value) {
 std::string format_level(const PriceLevel& level) {
     std::ostringstream out;
     out << format_fixed(Price::from_raw(level.price_raw())) << "@" << format_fixed(Size::from_raw(level.size_raw()));
+    return out.str();
+}
+
+// Formats Heartbeat.live_venues as "[venue venue ...]" - shared by both
+// publisher modes below (bbo and volume-bands/price-bands) so this per-
+// symbol validity signal (aggregator.proto's own doc comment: empty means
+// "no venue currently backs this book") is actually visible somewhere in
+// this repo's one first-party gRPC consumer, not just present on the wire.
+//
+// Sorted, not printed in wire order: live_venues.proto's own comment says
+// element order is unspecified (the server builds it from an
+// unordered_map) and may change between heartbeats even when the live set
+// itself hasn't. Both publisher modes below print this only when it
+// changes from the last one printed - without sorting first, a pure
+// reorder with no actual liveness change would look like one.
+std::string format_live_venues(const Heartbeat& heartbeat) {
+    std::vector<std::string> venues(heartbeat.live_venues().begin(), heartbeat.live_venues().end());
+    std::sort(venues.begin(), venues.end());
+    std::ostringstream out;
+    out << "live_venues=[";
+    for (const auto& venue : venues) out << venue << ' ';
+    out << ']';
     return out.str();
 }
 
@@ -323,6 +346,9 @@ void publish_bbo(const std::string& address, const BookId& book_id, std::atomic<
     BboUpdate update;
     long bbo_count = 0, heartbeat_count = 0;
     std::string last_line;
+    // Printed only when it changes, not on every heartbeat (every second) -
+    // see format_live_venues()'s own comment for why this is here at all.
+    std::optional<std::string> last_live_venues;
     {
         StreamCanceller canceller(context, stop);
         while (reader->Read(&update)) {
@@ -337,6 +363,11 @@ void publish_bbo(const std::string& address, const BookId& book_id, std::atomic<
                 print_line("[" + label + " BBO] " + last_line);
             } else if (update.has_heartbeat()) {
                 ++heartbeat_count;
+                std::string live_venues = format_live_venues(update.heartbeat());
+                if (live_venues != last_live_venues) {
+                    print_line("[" + label + " BBO] " + live_venues);
+                    last_live_venues = live_venues;
+                }
             }
         }
     }  // canceller destroyed here: joins its thread before Finish() below.
@@ -441,6 +472,9 @@ void publish_l2_bands(Mode mode, const std::string& address, const BookId& book_
     long snapshot_count = 0, diff_count = 0, heartbeat_count = 0, gap_count = 0;
     std::optional<std::uint64_t> last_seq;
     std::string last_line;
+    // Printed only when it changes, not on every heartbeat (every second) -
+    // see format_live_venues()'s own comment for why this is here at all.
+    std::optional<std::string> last_live_venues;
     {
         StreamCanceller canceller(context, stop);
         while (reader->Read(&update)) {
@@ -480,6 +514,11 @@ void publish_l2_bands(Mode mode, const std::string& address, const BookId& book_
                 last_line = print_bands(diff.book_seq());
             } else if (update.has_heartbeat()) {
                 ++heartbeat_count;
+                std::string live_venues = format_live_venues(update.heartbeat());
+                if (live_venues != last_live_venues) {
+                    print_line("[" + label + " " + mode_tag + "] " + live_venues);
+                    last_live_venues = live_venues;
+                }
             }
         }
     }  // canceller destroyed here: joins its thread before Finish() below.

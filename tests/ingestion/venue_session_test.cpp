@@ -469,6 +469,52 @@ net::awaitable<void> run_fake_ws_server_live_gap_then_reconnect(net::ip::tcp::ac
     co_await ws.async_read(idle_buffer, net::redirect_error(net::use_awaitable, ec));
 }
 
+// First connection: pushes a snapshot, then - unlike every other "holds the
+// connection open" fake server in this file - issues no further read at
+// all, not even an idle one. That distinction matters: any pending read on
+// a websocket::stream auto-answers an incoming ping as a side effect of
+// Beast's own read machinery (impl/read.hpp), regardless of whether the
+// "application" ever asked it to - so an idle *read* would still make this
+// a responsive peer, not the true black hole this test needs to exercise
+// WebSocketConnection::connect()'s real idle_timeout (Boost.Beast's own
+// websocket::stream_base::timeout + keep_alive_pings). With no read
+// pending, nothing this socket receives - including the client's own idle
+// ping - is ever processed or answered, so the client's timeout is the only
+// thing that can end this connection. `hold` just bounds how long this
+// coroutine waits before moving on to accept the second connection - it
+// doesn't detect the client's timeout firing (this side has no way to,
+// short of reading), it just has to outlast it. Second connection: pushes a
+// fresh snapshot, proving the symbol actually resyncs once the client
+// reconnects.
+net::awaitable<void> run_fake_ws_server_black_hole_then_reconnect(net::ip::tcp::acceptor acceptor,
+                                                                     std::string snapshot,
+                                                                     std::string second_snapshot,
+                                                                     std::chrono::seconds hold) {
+    {
+        auto socket = co_await acceptor.async_accept(net::use_awaitable);
+        websocket::stream<net::ip::tcp::socket> ws(std::move(socket));
+        co_await ws.async_accept(net::use_awaitable);
+        beast::flat_buffer buffer;
+        co_await ws.async_read(buffer, net::use_awaitable);
+        co_await ws.async_write(net::buffer(snapshot), net::use_awaitable);
+
+        auto executor = co_await net::this_coro::executor;
+        net::steady_timer hold_timer(executor, hold);
+        co_await hold_timer.async_wait(net::use_awaitable);
+    }  // ws/socket destroyed here - closes this end too, harmless either way.
+
+    auto socket = co_await acceptor.async_accept(net::use_awaitable);
+    websocket::stream<net::ip::tcp::socket> ws(std::move(socket));
+    co_await ws.async_accept(net::use_awaitable);
+    beast::flat_buffer buffer;
+    co_await ws.async_read(buffer, net::use_awaitable);
+    co_await ws.async_write(net::buffer(second_snapshot), net::use_awaitable);
+
+    beast::flat_buffer idle_buffer;
+    boost::system::error_code ec;
+    co_await ws.async_read(idle_buffer, net::redirect_error(net::use_awaitable, ec));
+}
+
 // Like run_fake_ws_server_live_gap_then_reconnect above, but gaps on every
 // connection except the last (`gap_count` times in a row), recording the
 // wall-clock moment each connection is accepted into `connect_times` - what
@@ -1121,6 +1167,129 @@ TEST(VenueSessionTest, ReconnectRepeatsSnapshotPushedAsFirstMessageFlow) {
     // seq 3: ApplySnapshot from the reconnect's pushed snapshot (bid
     // 9.0) - proves connect->subscribe->on_connected->snapshot-pushed-
     // first runs correctly a second time, not just once.
+    L2Update second_snapshot = wait_for(3);
+    ASSERT_TRUE(second_snapshot.has_diff());
+    ASSERT_EQ(second_snapshot.diff().bids_size(), 1);
+    EXPECT_EQ(second_snapshot.diff().bids(0).size_raw(), Size(9.0).raw());
+
+    context.TryCancel();
+    if (reader_thread.joinable()) reader_thread.join();
+    server->Shutdown();
+}
+
+// websocket_connection.hpp's connect(): a venue whose TCP connection stays
+// up but silently stops responding to anything at all (no close, no error,
+// not even a pong to our own idle ping - unlike every other reconnect
+// scenario this file covers, which all eventually produce either a real
+// close or a SymbolSync-detected gap) used to be undetectable - the read()
+// loop in run() would simply block forever. This proves Boost.Beast's own
+// websocket::stream_base::timeout/keep_alive_pings (idle_timeout passed to
+// VenueSession's constructor here, threaded through to
+// WebSocketConnection::connect()) actually fires against a true black hole,
+// and that firing forces the same disconnect/backoff/reconnect path a real
+// drop takes - not a new, separate mechanism.
+// run_fake_ws_server_black_hole_then_reconnect's first connection
+// deliberately issues no read at all after its own snapshot (see its own
+// comment for why even an *idle* read would be a responsive peer, not a
+// black hole, from Beast's perspective) - a second connection only ever
+// arrives if the client's own idle timeout tore the first one down.
+TEST(VenueSessionTest, IdleTimeoutForcesReconnectOnSilentConnection) {
+    std::vector<std::string> symbols{"BTCUSDT"};
+    AggregatorService service(std::vector<BookId>{TestBookId()});
+
+    grpc::ServerBuilder builder;
+    int grpc_port = 0;
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &grpc_port);
+    builder.RegisterService(&service);
+    auto server = builder.BuildAndStart();
+    ASSERT_NE(server, nullptr);
+
+    auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(grpc_port),
+                                        grpc::InsecureChannelCredentials());
+    auto stub = bobby::hermeneutic::aggregator::Aggregator::NewStub(channel);
+    grpc::ClientContext context;
+    bobby::hermeneutic::aggregator::SubscribeL2DiffRequest request;
+    fill_wire_book_id(request.mutable_book(), TestBookId());
+    auto reader = stub->SubscribeL2Diff(&context, request);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<L2Update> updates;
+    std::thread reader_thread([&] {
+        L2Update update;
+        while (reader->Read(&update)) {
+            std::lock_guard lock(mutex);
+            updates.push_back(update);
+            cv.notify_all();
+        }
+    });
+    struct ReaderThreadGuard {
+        grpc::ClientContext& context;
+        std::thread& thread;
+        ~ReaderThreadGuard() {
+            context.TryCancel();
+            if (thread.joinable()) thread.join();
+        }
+    } reader_guard{context, reader_thread};
+
+    auto wait_for = [&](std::size_t index) -> L2Update {
+        std::unique_lock lock(mutex);
+        cv.wait_for(lock, std::chrono::seconds(10), [&] { return updates.size() > index; });
+        return updates.at(index);
+    };
+    wait_for(0);  // initial (empty) snapshot
+
+    net::io_context io;
+    net::ip::tcp::acceptor ws_acceptor(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    unsigned short ws_port = ws_acceptor.local_endpoint().port();
+    net::co_spawn(io,
+                  run_fake_ws_server_black_hole_then_reconnect(std::move(ws_acceptor),
+                                                                "SNAPSHOT:BTCUSDT:100:100.0:5.0",
+                                                                "SNAPSHOT:BTCUSDT:200:100.0:9.0",
+                                                                /*hold=*/std::chrono::seconds(6)),
+                  fail_test_on_exception("ws server"));
+
+    FakeFeedNoRest feed(std::to_string(ws_port));
+    SymbolRegistry<SymbolBook> registry;
+    registry.add("BTCUSDT", service.book(TestBookId()));
+    // A short idle_timeout (well below idle_timeout.hpp's kDefaultIdleTimeout)
+    // so this test doesn't have to wait out a production-sized window -
+    // the mechanism being proven doesn't depend on the specific value.
+    VenueSession<FakeFeedNoRest, BybitSequencePolicy, beast::tcp_stream, SymbolBook> session(
+        std::move(feed), kFakeVenue, symbols, std::move(registry), io.get_executor(),
+        /*ssl_ctx=*/nullptr, /*idle_timeout=*/std::chrono::seconds(1));
+    session.start(fail_test_on_exception("session"));
+
+    // Beast's idle_timeout is the total detection window (an idle ping at
+    // idle_timeout/2, then beast::error::timeout if nothing - not even a
+    // pong - arrives within the next idle_timeout/2), so ~1s here, plus
+    // >=1s reconnect backoff (see StopAbortsBackoffWaitAndDoesNotReconnect's
+    // own comment) plus both connections' round trips - comfortably under
+    // the server's own 6s `hold` above, but this budget still needs
+    // headroom *after* that 6s for the second connection's handshake/
+    // read/write to complete too, not just up to it; a /code-review pass
+    // flagged the previous 8s value as leaving only ~2s for that, tight
+    // enough to flake on a loaded CI runner even though the mechanism
+    // under test would still be working correctly.
+    io.run_for(std::chrono::seconds(12));
+
+    // seq 1: ApplySnapshot from the first connection's snapshot (bid 5.0).
+    L2Update first_snapshot = wait_for(1);
+    ASSERT_TRUE(first_snapshot.has_diff());
+    ASSERT_EQ(first_snapshot.diff().bids_size(), 1);
+    EXPECT_EQ(first_snapshot.diff().bids(0).size_raw(), Size(5.0).raw());
+
+    // seq 2: InvalidateVenue from the idle-timeout-forced disconnect - this
+    // venue's only contribution (bid @100.0) is reported removed.
+    L2Update invalidated = wait_for(2);
+    ASSERT_TRUE(invalidated.has_diff());
+    ASSERT_EQ(invalidated.diff().bids_size(), 1);
+    EXPECT_EQ(invalidated.diff().bids(0).price_raw(), Price(100.0).raw());
+    EXPECT_EQ(invalidated.diff().bids(0).size_raw(), 0);
+
+    // seq 3: ApplySnapshot from the reconnect's snapshot (bid 9.0) - proves
+    // a second connection actually arrived, i.e. the idle timeout really
+    // did force VenueSession to tear down and reconnect, not just stall.
     L2Update second_snapshot = wait_for(3);
     ASSERT_TRUE(second_snapshot.has_diff());
     ASSERT_EQ(second_snapshot.diff().bids_size(), 1);
