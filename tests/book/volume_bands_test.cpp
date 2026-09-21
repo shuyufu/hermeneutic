@@ -240,6 +240,43 @@ TEST(VolumeBands, RejectsNegativePriceLevel) {
     EXPECT_EQ(result.error(), std::errc::argument_out_of_domain);
 }
 
+TEST(VolumeBands, UnsortedThresholdsAreRejected) {
+    // volume_band_prices() walks thresholds with a single
+    // monotonically-increasing index - an unsorted list would silently
+    // compute wrong VWAPs in a release build (where the old assert()-only
+    // check compiled out) instead of failing loudly.
+    L2OrderBook book;
+    book.asks[Price(100.0)] = Size(10.0);
+
+    std::vector<Notional> thresholds = {Notional(500.0), Notional(100.0)};
+    auto result = ask_volume_band_prices(book, thresholds);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), std::errc::invalid_argument);
+}
+
+TEST(VolumeBands, ZeroThresholdIsRejected) {
+    L2OrderBook book;
+    book.asks[Price(100.0)] = Size(10.0);
+
+    std::vector<Notional> thresholds = {Notional(0.0)};
+    auto result = ask_volume_band_prices(book, thresholds);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), std::errc::invalid_argument);
+}
+
+TEST(VolumeBands, NegativeThresholdIsRejected) {
+    L2OrderBook book;
+    book.asks[Price(100.0)] = Size(10.0);
+
+    std::vector<Notional> thresholds = {Notional(-1.0)};
+    auto result = ask_volume_band_prices(book, thresholds);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), std::errc::invalid_argument);
+}
+
 // Basic sanity check: a partial fill entirely within the first (and only)
 // level, well short of its full depth.
 TEST(VolumeBands, BasicPartialFillWithinFirstLevel) {

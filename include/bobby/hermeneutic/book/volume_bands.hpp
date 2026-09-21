@@ -121,13 +121,22 @@ constexpr std::expected<Price, std::errc> vwap_at_partial_fill(Notional cum_noti
 // Walks `levels` (best price first) accumulating notional = price * size at
 // each level, and for each threshold in `thresholds` (must be sorted
 // ascending and strictly positive -- a 0 or negative threshold has no
-// meaningful VWAP and is a caller precondition violation, not a runtime
-// condition) reports the volume-weighted-average price needed to reach it.
-// Single pass over `levels`: O(levels + thresholds). Fails with
-// std::errc::argument_out_of_domain if any level has a non-positive price
-// or a negative size, checked as each level is walked -- not only when a
-// threshold happens to cross inside it. A non-positive-price level
-// contributes zero (or negative) notional, so it may never trigger a
+// meaningful VWAP) reports the volume-weighted-average price needed to
+// reach it. Single pass over `levels`: O(levels + thresholds).
+//
+// Fails with std::errc::invalid_argument if `thresholds` itself isn't
+// sorted/strictly positive - checked at runtime rather than only asserted,
+// since `thresholds` comes from the caller (an API request, ultimately),
+// not from this module's own bookkeeping. The algorithm below walks
+// `thresholds` with a single monotonically-increasing index (`next`), so an
+// unsorted input would silently compute wrong VWAPs in a release build
+// rather than failing loudly - see price_bands.hpp's price_band_depth()
+// for the same reasoning applied to its own thresholds parameter.
+//
+// Also fails with std::errc::argument_out_of_domain if any level has a
+// non-positive price or a negative size, checked as each level is walked --
+// not only when a threshold happens to cross inside it. A non-positive-price
+// level contributes zero (or negative) notional, so it may never trigger a
 // crossing on its own; walked over unchecked, its size would still fold
 // into cum_size with no corresponding notional, diluting the VWAP of any
 // later, legitimate crossing. Checking eagerly aborts on the first bad
@@ -135,8 +144,10 @@ constexpr std::expected<Price, std::errc> vwap_at_partial_fill(Notional cum_noti
 template <typename Map>
 std::expected<std::vector<VolumeBand>, std::errc> volume_band_prices(
     const Map& levels, std::span<const Notional> thresholds) {
-    assert(std::ranges::is_sorted(thresholds));
-    assert(std::ranges::all_of(thresholds, [](Notional t) { return t.raw() > 0; }));
+    if (!std::ranges::is_sorted(thresholds) ||
+        !std::ranges::all_of(thresholds, [](Notional t) { return t.raw() > 0; })) {
+        return std::unexpected(std::errc::invalid_argument);
+    }
 
     std::vector<VolumeBand> result;
     result.reserve(thresholds.size());

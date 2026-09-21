@@ -117,7 +117,21 @@ struct Bid {
 // those two. A level exactly at a boundary counts as within it.
 // O(levels + bps_thresholds).
 //
-// Fails with std::errc::argument_out_of_domain if any level has a
+// Fails with std::errc::invalid_argument if `bps_thresholds` itself isn't
+// sorted/non-negative/(for bids) under 10000 - checked at runtime rather
+// than only asserted, since `bps_thresholds` comes from the caller (an API
+// request, ultimately), not from this module's own internal bookkeeping
+// the way `Side` does (a compile-time choice this module's only callers -
+// bid_price_band_depths()/ask_price_band_depths() - already make via the
+// static_assert below, not something a caller passes in at runtime). The
+// algorithm below walks bps_thresholds with a single monotonically-
+// increasing index (`next`), so an unsorted input would silently compute
+// wrong band boundaries in a release build rather than failing loudly -
+// the same reasoning is why offset_by_bps()/within_bps() below are still
+// assert()-only for their own price>0 precondition: this function
+// validates that before ever calling them, so it's never checked twice.
+//
+// Also fails with std::errc::argument_out_of_domain if any level has a
 // non-positive price (or a negative size), checked as each level is
 // walked - same rationale as volume_band_prices()'s own per-level check:
 // `levels` is the caller's own already-mutated book, not something this
@@ -134,10 +148,12 @@ std::expected<std::vector<PriceBand>, std::errc> price_band_depth(
     const Map& levels, std::span<const int> bps_thresholds) {
     static_assert(std::is_same_v<Side, detail::Ask> || std::is_same_v<Side, detail::Bid>,
                   "Side must be detail::Ask or detail::Bid");
-    assert(std::ranges::is_sorted(bps_thresholds));
-    assert(std::ranges::all_of(bps_thresholds, [](int bps) { return bps >= 0; }));
-    if constexpr (std::is_same_v<Side, detail::Bid>) {
-        assert(std::ranges::all_of(bps_thresholds, [](int bps) { return bps < 10'000; }));
+    constexpr bool kBidUpperBoundApplies = std::is_same_v<Side, detail::Bid>;
+    if (!std::ranges::is_sorted(bps_thresholds) ||
+        !std::ranges::all_of(bps_thresholds, [](int bps) { return bps >= 0; }) ||
+        (kBidUpperBoundApplies &&
+         !std::ranges::all_of(bps_thresholds, [](int bps) { return bps < 10'000; }))) {
+        return std::unexpected(std::errc::invalid_argument);
     }
 
     std::vector<PriceBand> result;

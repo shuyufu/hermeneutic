@@ -238,10 +238,8 @@ TEST(PriceBands, DuplicateThresholdsProduceOneBandEachNotDeduplicated) {
 
 TEST(PriceBands, BidBps9999IsAcceptedAtTheEdgeOfTheValidRange) {
     // bps must stay strictly under 10000 on the bid side (see
-    // price_band_depth()'s asserts); 9999 is the largest valid value and
-    // must not trip that precondition. (bps == 10000 tripping it was
-    // confirmed separately via a throwaway program, not a gtest death
-    // test -- this codebase's convention for assert-based preconditions.)
+    // price_band_depth()'s runtime check below); 9999 is the largest valid
+    // value and must not trip it.
     L2OrderBook book;
     book.bids[Price(100.0)] = Size(1.0);
 
@@ -251,6 +249,54 @@ TEST(PriceBands, BidBps9999IsAcceptedAtTheEdgeOfTheValidRange) {
 
     ASSERT_EQ(bands.size(), 1u);
     EXPECT_EQ(bands[0].cumulative_size, Size(1.0));
+}
+
+TEST(PriceBands, BidBps10000IsRejected) {
+    // One past BidBps9999IsAcceptedAtTheEdgeOfTheValidRange's edge: a
+    // 10000bps bid boundary would be priced at zero, meaningless. Unlike
+    // when this was assert()-only (see git history), this is now a real,
+    // directly testable runtime check rather than something only a
+    // throwaway program compiled without NDEBUG could confirm.
+    L2OrderBook book;
+    book.bids[Price(100.0)] = Size(1.0);
+
+    auto result = bid_price_band_depths(book, std::array{10'000});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), std::errc::invalid_argument);
+}
+
+TEST(PriceBands, AskBps10000IsAcceptedSinceTheUpperBoundOnlyAppliesToBids) {
+    // The strictly-under-10000 rule is bid-only (a bid boundary at or past
+    // 10000bps would be priced at or below zero) - an ask has no such
+    // ceiling, so this must still succeed.
+    L2OrderBook book;
+    book.asks[Price(100.0)] = Size(1.0);
+
+    auto result = ask_price_band_depths(book, std::array{10'000});
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->size(), 1u);
+}
+
+TEST(PriceBands, UnsortedThresholdsAreRejected) {
+    // price_band_depth() walks bps_thresholds with a single
+    // monotonically-increasing index - an unsorted list would silently
+    // compute wrong band boundaries in a release build (where the old
+    // assert()-only check compiled out) instead of failing loudly.
+    L2OrderBook book;
+    book.asks[Price(100.0)] = Size(1.0);
+
+    auto result = ask_price_band_depths(book, std::array{100, 50});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), std::errc::invalid_argument);
+}
+
+TEST(PriceBands, NegativeThresholdIsRejected) {
+    L2OrderBook book;
+    book.asks[Price(100.0)] = Size(1.0);
+
+    auto result = ask_price_band_depths(book, std::array{-1});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), std::errc::invalid_argument);
 }
 
 // Mirrors volume_bands_test.cpp's own RejectsNegativePriceLevel/
