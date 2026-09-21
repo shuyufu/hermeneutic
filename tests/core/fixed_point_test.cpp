@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
 #include <random>
 #include <string>
 #include <string_view>
@@ -45,6 +46,35 @@ TEST(BasicFixedPoint, ArithmeticIsExactOnRawTicks) {
     EXPECT_DOUBLE_EQ(c.to_double(), 1.25);
     c -= b;
     EXPECT_DOUBLE_EQ(c.to_double(), 1.0);
+}
+
+// operator+/operator-/unary operator- widen to __int128 before computing
+// (see fixed_point.hpp's own comment on why: raw_ + other.raw_ overflowing
+// int64_t directly is undefined behavior, not just an inexact result), then
+// narrow back down through from_raw_checked()'s debug-only assert - same
+// shape as notional.hpp's operator*/operator/, and the same reason
+// Notional's own "DoesNotOverflowAtLargeMagnitudes" tests exist: proving the
+// wide intermediate keeps genuinely large-but-in-range magnitudes exact,
+// not just small ones like the test above.
+TEST(BasicFixedPoint, AddAndSubtractStayExactNearRawTypeBounds) {
+    constexpr auto kRawMax = std::numeric_limits<Price::raw_type>::max();
+
+    Price near_max = Price::from_raw(kRawMax - 1);
+    Price one = Price::from_raw(1);
+
+    // kRawMax - 1 + 1 == kRawMax exactly, right at the boundary this fix
+    // guards - a direct int64_t add here would already be UB territory for
+    // any larger left-hand operand, not just this exact case.
+    EXPECT_EQ((near_max + one).raw(), kRawMax);
+    EXPECT_EQ((Price::from_raw(kRawMax) - one).raw(), kRawMax - 1);
+    EXPECT_EQ((-Price::from_raw(kRawMax)).raw(), -kRawMax);
+
+    Price accumulator = Price::from_raw(kRawMax - 3);
+    accumulator += one;
+    accumulator += one;
+    EXPECT_EQ(accumulator.raw(), kRawMax - 1);
+    accumulator -= one;
+    EXPECT_EQ(accumulator.raw(), kRawMax - 2);
 }
 
 TEST(BasicFixedPoint, TotalOrdering) {

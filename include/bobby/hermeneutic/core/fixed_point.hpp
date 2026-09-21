@@ -219,23 +219,32 @@ class BasicFixedPoint {
     friend constexpr auto operator<=>(const BasicFixedPoint&,
                                        const BasicFixedPoint&) noexcept = default;
 
+    // Widened to __int128 before the actual add/subtract/negate, same as
+    // every other arithmetic op in this codebase (from_decimal_string above,
+    // notional.hpp's operator*), rather than operating on raw_type directly
+    // and asserting after the fact - raw_ + other.raw_ overflowing int64_t
+    // is itself undefined behavior, so an assert on the result would have
+    // to run after UB has already happened to reach it. from_raw_checked()'s
+    // debug-only assert then narrows back down, same as everywhere else.
     constexpr BasicFixedPoint operator+(BasicFixedPoint other) const noexcept {
-        return from_raw(raw_ + other.raw_);
+        return from_raw_checked(static_cast<__int128>(raw_) + static_cast<__int128>(other.raw_));
     }
 
     constexpr BasicFixedPoint operator-(BasicFixedPoint other) const noexcept {
-        return from_raw(raw_ - other.raw_);
+        return from_raw_checked(static_cast<__int128>(raw_) - static_cast<__int128>(other.raw_));
     }
 
-    constexpr BasicFixedPoint operator-() const noexcept { return from_raw(-raw_); }
+    constexpr BasicFixedPoint operator-() const noexcept {
+        return from_raw_checked(-static_cast<__int128>(raw_));
+    }
 
     constexpr BasicFixedPoint& operator+=(BasicFixedPoint other) noexcept {
-        raw_ += other.raw_;
+        *this = *this + other;
         return *this;
     }
 
     constexpr BasicFixedPoint& operator-=(BasicFixedPoint other) noexcept {
-        raw_ -= other.raw_;
+        *this = *this - other;
         return *this;
     }
 
