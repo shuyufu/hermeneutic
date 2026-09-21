@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstddef>
 #include <expected>
+#include <limits>
 #include <span>
 #include <system_error>
 #include <type_traits>
@@ -37,7 +38,22 @@ namespace detail {
 // round_down=false) so `boundary_price` never overstates the band's
 // actual reach. Display only -- membership is decided by within_bps()
 // below, not this function.
-constexpr Price offset_by_bps(Price price, int signed_bps, bool round_down) noexcept {
+//
+// Fails with std::errc::result_out_of_range if the resulting boundary
+// doesn't fit back into Price::raw_type - unlike notional.hpp's operators
+// (from_raw_checked()'s usual debug-only assert), this is a genuine
+// runtime possibility here, not just an internal invariant: bid_price_
+// band_depths()/ask_price_band_depths() cap the *bid* side's bps at under
+// 10000 (a domain requirement - a bid boundary at or past that would be
+// zero or negative), but the ask side has no such ceiling, and this
+// project validates no upper bound on price itself either (is_valid_level()
+// only checks price > 0) - so a sufficiently large ask bps threshold
+// against a sufficiently large price is a real, externally-reachable way
+// to overflow the __int128 intermediate's narrowing back to raw_type, not
+// a "no realistic input reaches this" case the way every other
+// from_raw_checked() call site in this codebase is.
+constexpr std::expected<Price, std::errc> offset_by_bps(Price price, int signed_bps,
+                                                          bool round_down) noexcept {
     assert(price.raw() > 0);
 
     // Widened to __int128 before adding: native `int` arithmetic would
@@ -52,9 +68,10 @@ constexpr Price offset_by_bps(Price price, int signed_bps, bool round_down) noex
     __int128 rounded = round_down ? scaled_numerator / denom
                                    : (scaled_numerator + denom - 1) / denom;
 
-    // Narrowing back to Price::raw_type via from_raw_checked() is
-    // debug-checked only, same pattern as notional.hpp's operators.
-    return Price::from_raw_checked(rounded);
+    constexpr __int128 kRawMax = static_cast<__int128>(std::numeric_limits<Price::raw_type>::max());
+    constexpr __int128 kRawMin = static_cast<__int128>(std::numeric_limits<Price::raw_type>::min());
+    if (rounded > kRawMax || rounded < kRawMin) return std::unexpected(std::errc::result_out_of_range);
+    return Price::from_raw(static_cast<Price::raw_type>(rounded));
 }
 
 // Exact membership test: price <= best_price*(10000+signed_bps)/10000
@@ -86,7 +103,7 @@ constexpr bool within_bps(Price price, Price best_price, int signed_bps, bool ge
 // of inward) has no caller today and is deliberately not implemented here --
 // add it only when something actually needs it.
 struct Ask {
-    static constexpr Price round_inner(Price price, int bps) noexcept {
+    static constexpr std::expected<Price, std::errc> round_inner(Price price, int bps) noexcept {
         return offset_by_bps(price, bps, /*round_down=*/true);
     }
     static constexpr bool within(Price price, Price reference, int bps) noexcept {
@@ -95,7 +112,7 @@ struct Ask {
 };
 
 struct Bid {
-    static constexpr Price round_inner(Price price, int bps) noexcept {
+    static constexpr std::expected<Price, std::errc> round_inner(Price price, int bps) noexcept {
         return offset_by_bps(price, -bps, /*round_down=*/false);
     }
     static constexpr bool within(Price price, Price reference, int bps) noexcept {
@@ -143,6 +160,13 @@ struct Bid {
 // price>0 precondition precisely because this function is what's
 // responsible for upholding it before ever calling them - never validated
 // twice.
+//
+// Also fails with std::errc::result_out_of_range if a boundary computed
+// from a (validated-in-range, but still arbitrarily large) bps threshold
+// against an (unbounded - this project validates no upper limit on price
+// anywhere) level price doesn't fit back into Price - see
+// offset_by_bps()'s own comment for why this is a real runtime
+// possibility here, not just an internal invariant.
 template <typename Side, typename Map>
 std::expected<std::vector<PriceBand>, std::errc> price_band_depth(
     const Map& levels, std::span<const int> bps_thresholds) {
@@ -173,8 +197,9 @@ std::expected<std::vector<PriceBand>, std::errc> price_band_depth(
         while (next < bps_thresholds.size()) {
             int bps = bps_thresholds[next];
             if (Side::within(price, best_price, bps)) break;
-            Price boundary = Side::round_inner(best_price, bps);
-            result.push_back({bps_thresholds[next], boundary, cum_size, cum_notional});
+            auto boundary = Side::round_inner(best_price, bps);
+            if (!boundary) return std::unexpected(boundary.error());
+            result.push_back({bps_thresholds[next], *boundary, cum_size, cum_notional});
             ++next;
         }
         if (next >= bps_thresholds.size()) break;
@@ -184,8 +209,9 @@ std::expected<std::vector<PriceBand>, std::errc> price_band_depth(
     }
 
     while (next < bps_thresholds.size()) {
-        Price boundary = Side::round_inner(best_price, bps_thresholds[next]);
-        result.push_back({bps_thresholds[next], boundary, cum_size, cum_notional});
+        auto boundary = Side::round_inner(best_price, bps_thresholds[next]);
+        if (!boundary) return std::unexpected(boundary.error());
+        result.push_back({bps_thresholds[next], *boundary, cum_size, cum_notional});
         ++next;
     }
 

@@ -1,6 +1,8 @@
 #include "bobby/hermeneutic/book/price_bands.hpp"
 
 #include <array>
+#include <cstdint>
+#include <limits>
 #include <span>
 #include <system_error>
 
@@ -10,20 +12,51 @@ namespace bobby::hermeneutic {
 namespace {
 
 TEST(PriceBands, OffsetByBpsUpAndDown) {
-    EXPECT_EQ(detail::offset_by_bps(Price(100.0), 50, /*round_down=*/true), Price(100.5));
-    EXPECT_EQ(detail::offset_by_bps(Price(100.0), -50, /*round_down=*/false), Price(99.5));
-    EXPECT_EQ(detail::offset_by_bps(Price(100.0), 0, /*round_down=*/true), Price(100.0));
+    EXPECT_EQ(*detail::offset_by_bps(Price(100.0), 50, /*round_down=*/true), Price(100.5));
+    EXPECT_EQ(*detail::offset_by_bps(Price(100.0), -50, /*round_down=*/false), Price(99.5));
+    EXPECT_EQ(*detail::offset_by_bps(Price(100.0), 0, /*round_down=*/true), Price(100.0));
 }
 
 TEST(PriceBands, OffsetByBpsRoundsInwardRatherThanToNearest) {
     // raw(5) * (10000 + 1000) = 55000, /10000 = 5.5 exactly: rounding down
     // (ask) keeps the boundary at 5, not 6 — 6 would be outside the true
     // 5.5 boundary.
-    EXPECT_EQ(detail::offset_by_bps(Price::from_raw(5), 1000, /*round_down=*/true).raw(), 5);
+    EXPECT_EQ(detail::offset_by_bps(Price::from_raw(5), 1000, /*round_down=*/true)->raw(), 5);
     // raw(6) * (10000 - 1000) = 54000, /10000 = 5.4: rounding up (bid)
     // keeps the boundary at 6, not 5 — 5 would be outside the true 5.4
     // boundary (5 < 5.4).
-    EXPECT_EQ(detail::offset_by_bps(Price::from_raw(6), -1000, /*round_down=*/false).raw(), 6);
+    EXPECT_EQ(detail::offset_by_bps(Price::from_raw(6), -1000, /*round_down=*/false)->raw(), 6);
+}
+
+// code-review finding: the bid side already rejects any threshold at or
+// past 10000bps at price_band_depth()'s own runtime check (a domain
+// requirement - a bid boundary that far out would be zero or negative),
+// but the ask side has no such ceiling, and this project validates no
+// upper bound on price anywhere either (is_valid_level() only checks
+// price > 0) - so offset_by_bps() itself has to be the last line of
+// defense against a boundary that doesn't fit back into Price, not
+// something a caller-side threshold check can rule out up front.
+TEST(PriceBands, OffsetByBpsReportsOutOfRangeInsteadOfOverflowingOrAborting) {
+    // Price::raw_type::max() ~ 9.2e18; a price near that combined with a
+    // merely-large (not even adversarially extreme) bps threshold already
+    // pushes the boundary well past it.
+    auto result = detail::offset_by_bps(Price::from_raw(std::numeric_limits<std::int64_t>::max() / 2),
+                                         1'000'000, /*round_down=*/true);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), std::errc::result_out_of_range);
+}
+
+TEST(PriceBands, AskBandDepthReportsOutOfRangeForAnOverflowingBoundaryInsteadOfCrashing) {
+    // Same shape as the direct offset_by_bps() test above, but exercised
+    // through the public ask_price_band_depths() entry point end to end -
+    // proves price_band_depth() actually propagates offset_by_bps()'s
+    // error instead of unconditionally dereferencing it.
+    L2OrderBook book;
+    book.asks[Price::from_raw(std::numeric_limits<std::int64_t>::max() / 2)] = Size(1.0);
+
+    auto result = ask_price_band_depths(book, std::array{1'000'000});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), std::errc::result_out_of_range);
 }
 
 // Regression test: rounding the boundary to *nearest* (rather than inward)
