@@ -259,14 +259,27 @@ class SymbolBook {
     std::expected<void, std::errc> apply_snapshot(
         const VenueId& venue, std::span<const std::pair<Price, Size>> bids,
         std::span<const std::pair<Price, Size>> asks) {
+        // Cheap enough to reject before taking mutex_/doing any lookups -
+        // book_.apply_snapshot() below re-validates and is what actually
+        // guarantees this (a caller skipping this class entirely and
+        // calling book_.apply_snapshot() directly still gets the same
+        // rejection), but there is no reason to take the lock at all for
+        // a snapshot already known to be bad - mirrors apply_batch()'s
+        // own pre-lock check below.
+        for (const auto& [price, size] : bids) {
+            if (!is_valid_level(price, size)) return std::unexpected(std::errc::invalid_argument);
+        }
+        for (const auto& [price, size] : asks) {
+            if (!is_valid_level(price, size)) return std::unexpected(std::errc::invalid_argument);
+        }
+
         std::lock_guard lock(mutex_);
 
-        ChangeCollector<std::greater<Price>> bid_changes;
-        ChangeCollector<std::less<Price>> ask_changes;
-        auto result = book_.apply_snapshot(venue, bids, asks, bid_changes, ask_changes);
+        SideChanges changes;
+        auto result = book_.apply_snapshot(venue, bids, asks, changes.bids, changes.asks);
         if (!result) return result;
 
-        publish(collect_changes(bid_changes, ask_changes));
+        publish(collect_changes(changes));
         return result;
     }
 
@@ -311,38 +324,27 @@ class SymbolBook {
         // this can only fail on allocation here, matching
         // book_.apply_batch()'s own documented not-rolled-back-partway
         // limitation.
-        ChangeCollector<std::greater<Price>> bid_changes;
-        ChangeCollector<std::less<Price>> ask_changes;
-        if (auto result = book_.apply_batch(venue, bids, asks, bid_changes, ask_changes); !result) {
+        SideChanges changes;
+        if (auto result = book_.apply_batch(venue, bids, asks, changes.bids, changes.asks); !result) {
             return result;
         }
 
-        publish(collect_changes(bid_changes, ask_changes));
+        publish(collect_changes(changes));
         return {};
     }
 
+    // book_.invalidate_venue() finishes mutating its own state for every
+    // price before invoking either Sink at all (see its own doc comment),
+    // so - unlike an earlier version of this method - nothing here needs
+    // to pre-populate the collectors to keep a mid-report allocation
+    // failure from corrupting book_'s state; a plain SideChanges is safe.
     void invalidate_venue(const VenueId& venue) {
         std::lock_guard lock(mutex_);
 
-        // Pre-inserts every price book_.invalidate_venue() below could
-        // possibly report - exactly `venue`'s own current bids/asks,
-        // known upfront without calling it - so each of its sink calls
-        // only ever reassigns an existing entry (insert_or_assign() on an
-        // present key can't allocate), never inserts a new one. This is
-        // what makes it safe to hand it an allocating Sink at all: see
-        // book_.invalidate_venue()'s own doc comment for why an
-        // allocation failure *during* that call, rather than before it,
-        // would be unrecoverable rather than merely undesirable.
-        ChangeCollector<std::greater<Price>> bid_changes;
-        ChangeCollector<std::less<Price>> ask_changes;
-        if (auto it = book_.venues().find(venue); it != book_.venues().end()) {
-            for (const auto& [price, size] : it->second.bids) bid_changes.by_price.try_emplace(price, Size{});
-            for (const auto& [price, size] : it->second.asks) ask_changes.by_price.try_emplace(price, Size{});
-        }
+        SideChanges changes;
+        book_.invalidate_venue(venue, changes.bids, changes.asks);
 
-        book_.invalidate_venue(venue, bid_changes, ask_changes);
-
-        publish(collect_changes(bid_changes, ask_changes));
+        publish(collect_changes(changes));
     }
 
     // Broadcasts a liveness signal to every subscriber of this symbol (both
@@ -496,18 +498,26 @@ class SymbolBook {
         void operator()(Price price, Size new_size) { by_price.insert_or_assign(price, new_size); }
     };
 
-    // Flattens two already-populated ChangeCollectors into the single
-    // Change sequence publish() wants - bids first (in bid_changes' own
-    // order), then asks. Reads only its own arguments, so - unlike most
-    // other private helpers here - this one has no mutex_ requirement.
-    template <typename BidCompare, typename AskCompare>
-    static std::vector<Change> collect_changes(const ChangeCollector<BidCompare>& bid_changes,
-                                                const ChangeCollector<AskCompare>& ask_changes) {
+    // The bid/ask ChangeCollector pair every one of apply_snapshot()/
+    // apply_batch()/invalidate_venue() above needs one of, one per call -
+    // named here instead of each declaring its own `bid_changes`/
+    // `ask_changes` pair so there is exactly one place holding "bids use
+    // std::greater, asks use std::less", not three.
+    struct SideChanges {
+        ChangeCollector<std::greater<Price>> bids;
+        ChangeCollector<std::less<Price>> asks;
+    };
+
+    // Flattens an already-populated SideChanges into the single Change
+    // sequence publish() wants - bids first (in their own order), then
+    // asks. Reads only its own argument, so - unlike most other private
+    // helpers here - this one has no mutex_ requirement.
+    static std::vector<Change> collect_changes(const SideChanges& changes) {
         std::vector<Change> changed;
-        for (const auto& [price, size] : bid_changes.by_price) {
+        for (const auto& [price, size] : changes.bids.by_price) {
             changed.push_back(Change{Side::Bid, price, size});
         }
-        for (const auto& [price, size] : ask_changes.by_price) {
+        for (const auto& [price, size] : changes.asks.by_price) {
             changed.push_back(Change{Side::Ask, price, size});
         }
         return changed;

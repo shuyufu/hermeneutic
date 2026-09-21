@@ -3,10 +3,12 @@
 #include <expected>
 #include <map>
 #include <new>
+#include <optional>
 #include <span>
 #include <system_error>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "bobby/hermeneutic/book/l2_order_book.hpp"
 #include "bobby/hermeneutic/symbol/symbol.hpp"
@@ -69,38 +71,42 @@ class AggregateOrderBook {
     // reflecting stale liquidity while the venue resynchronizes.
     //
     // Unlike the other three methods below, this one has no try/catch of
-    // its own - it was never noexcept, but before Sink existed, nothing it
-    // did could practically throw (venues_.erase() and every removal
-    // adjust_aggregate() does here only ever erase, never allocate). A
+    // its own - it was never noexcept, but nothing it does to venues_/
+    // aggregate_ can practically throw (venues_.erase() and every removal
+    // adjust_aggregate() does here only ever erases, never allocates). A
     // `Sink` that itself allocates (e.g. inserting a new key into a
-    // collector map) reintroduces a real throw path: an exception mid-loop
-    // leaves `aggregate_` partially decremented, `venues_.erase(it)` below
-    // never reached, and no way for anything downstream to know which
-    // prices still need subtracting - worse than any of this class's other
-    // documented not-rolled-back cases, because those leave venues_/
-    // aggregate_ mutually consistent and this would not. This function
-    // does not defend against that (catching here and still erasing would
-    // erase the one record - `it->second` - of what remains unsubtracted,
-    // turning a recoverable gap into an unrecoverable one). A caller whose
-    // Sink can allocate should make sure it can't do so *inside* this
-    // call - e.g. by pre-inserting every key it will receive (known
-    // upfront: exactly `venue`'s own current bids/asks) before calling
-    // this, so every call here only ever reassigns an existing entry - see
-    // aggregator::SymbolBook::invalidate_venue() for the concrete
-    // technique.
+    // collector map) is safe to hand this regardless: every price this
+    // venue held is fully computed and applied to aggregate_/venues_
+    // *before* either Sink is invoked at all (buffered in the two local
+    // vectors below, whose own allocation - the only thing here that can
+    // throw - happens before any mutation starts). A Sink that throws
+    // partway through being reported to can therefore only ever leave the
+    // caller missing some later Sink calls, never leave this class's own
+    // state inconsistent - unlike interleaving Sink calls with the
+    // mutation itself would.
     template <typename BidSink = NoopSink, typename AskSink = NoopSink>
     void invalidate_venue(const VenueId& venue, BidSink&& on_bid_change = {},
                            AskSink&& on_ask_change = {}) {
         auto it = venues_.find(venue);
         if (it == venues_.end()) return;
 
+        std::vector<std::pair<Price, Size>> bid_changes, ask_changes;
+        bid_changes.reserve(it->second.bids.size());
+        ask_changes.reserve(it->second.asks.size());
         for (const auto& [price, size] : it->second.bids) {
-            adjust_aggregate(aggregate_.bids, price, Size{} - size, on_bid_change);
+            if (auto result = adjust_aggregate(aggregate_.bids, price, Size{} - size)) {
+                bid_changes.emplace_back(price, *result);
+            }
         }
         for (const auto& [price, size] : it->second.asks) {
-            adjust_aggregate(aggregate_.asks, price, Size{} - size, on_ask_change);
+            if (auto result = adjust_aggregate(aggregate_.asks, price, Size{} - size)) {
+                ask_changes.emplace_back(price, *result);
+            }
         }
         venues_.erase(it);
+
+        for (const auto& [price, size] : bid_changes) on_bid_change(price, size);
+        for (const auto& [price, size] : ask_changes) on_ask_change(price, size);
     }
 
     // Replaces `venue`'s entire book (both sides at once) wholesale from a
@@ -230,27 +236,32 @@ class AggregateOrderBook {
     // can hold the same price - only ever a delta to fold in.
     //
     // `delta.raw() == 0` is the single source of truth for "no observable
-    // change": `sink` is only ever invoked past that check, so every call
-    // to it reports a real change to the aggregate, reported as the
-    // resulting size (Size{} if the level was removed, never the
-    // intermediate `updated` value that triggered the removal).
-    template <typename Map, typename Sink>
-    static void adjust_aggregate(Map& aggregate_side, Price price, Size delta, Sink&& sink) {
-        if (delta.raw() == 0) return;
+    // change": returns std::nullopt in that case, otherwise the resulting
+    // size (Size{} if the level was removed, never the intermediate
+    // `updated` value that triggered the removal). Deliberately returns
+    // rather than taking a Sink to call directly - unlike apply_level()/
+    // resync_side() below, which call the Sink immediately since nothing
+    // about a single level's own application can leave a caller worse off
+    // than "just this one Sink call didn't happen", invalidate_venue()
+    // needs to finish mutating aggregate_/venues_ for every price *before*
+    // invoking any Sink at all (see its own comment for why) - it collects
+    // every result this returns first.
+    template <typename Map>
+    static std::optional<Size> adjust_aggregate(Map& aggregate_side, Price price, Size delta) {
+        if (delta.raw() == 0) return std::nullopt;
 
         auto it = aggregate_side.find(price);
         Size updated = (it != aggregate_side.end() ? it->second : Size{}) + delta;
         if (updated.raw() <= 0) {
             if (it != aggregate_side.end()) aggregate_side.erase(it);
-            sink(price, Size{});
-        } else {
-            if (it != aggregate_side.end()) {
-                it->second = updated;
-            } else {
-                aggregate_side.emplace(price, updated);
-            }
-            sink(price, updated);
+            return Size{};
         }
+        if (it != aggregate_side.end()) {
+            it->second = updated;
+        } else {
+            aggregate_side.emplace(price, updated);
+        }
+        return updated;
     }
 
     // Sets one (price, new_size) level on both `venue_side` and, by the
@@ -261,7 +272,9 @@ class AggregateOrderBook {
     static void apply_level(Map& venue_side, Map& aggregate_side, Price price, Size new_size,
                              Sink&& sink) {
         Size old_size = set_level(venue_side, price, new_size);
-        adjust_aggregate(aggregate_side, price, new_size - old_size, sink);
+        if (auto result = adjust_aggregate(aggregate_side, price, new_size - old_size)) {
+            sink(price, *result);
+        }
     }
 
     // Resyncs one side of `venue_side` to `levels`: any price it currently
@@ -293,7 +306,9 @@ class AggregateOrderBook {
             if (new_levels.contains(it->first)) {
                 ++it;
             } else {
-                adjust_aggregate(aggregate_side, it->first, Size{} - it->second, sink);
+                if (auto result = adjust_aggregate(aggregate_side, it->first, Size{} - it->second)) {
+                    sink(it->first, *result);
+                }
                 it = venue_side.erase(it);
             }
         }

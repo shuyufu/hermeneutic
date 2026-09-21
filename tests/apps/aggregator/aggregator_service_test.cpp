@@ -549,6 +549,37 @@ TEST_F(AggregatorServiceTest, ApplyBatchProducesOneSeqBumpForMultipleLevels) {
     EXPECT_EQ(msg.diff().asks(0).size_raw(), Size(3.0).raw());
 }
 
+// AggregateOrderBook.ApplyBatchAggregatesAcrossVenues (aggregate_order_book_test.cpp)
+// covers this same scenario's arithmetic cheaply, but only at the in-memory
+// aggregate() layer - it can't see SymbolBook's own publish()/
+// collect_changes() wiring. This is the one case that puts both together:
+// a multi-level batch (so ordering/collect_changes has more than one price
+// to get right) where one of those levels also happens to overlap another
+// venue's existing contribution (so the aggregation itself isn't trivial),
+// verified all the way through to the wire-level L2Diff.
+TEST_F(AggregatorServiceTest, ApplyBatchMultiLevelAggregatesAcrossVenuesOverWire) {
+    updates_.wait_for(0);  // initial snapshot
+
+    ASSERT_TRUE(apply_one(book(), kOkx, Side::Bid, Price(100.0), Size(5.0)).has_value());
+    updates_.wait_for(1);
+
+    // binance's batch touches the same price okx already holds, plus a
+    // new one - the aggregate must reflect both venues' contributions.
+    std::array<std::pair<Price, Size>, 2> bids{{
+        {Price(100.0), Size(3.0)},
+        {Price(99.0), Size(1.0)},
+    }};
+    ASSERT_TRUE(book().apply_batch(kBinance, bids, {}).has_value());
+
+    L2Update msg = updates_.wait_for(2);
+    ASSERT_TRUE(msg.has_diff());
+    ASSERT_EQ(msg.diff().bids_size(), 2);
+    EXPECT_EQ(msg.diff().bids(0).price_raw(), Price(100.0).raw());
+    EXPECT_EQ(msg.diff().bids(0).size_raw(), Size(8.0).raw());  // okx's 5 + binance's new 3
+    EXPECT_EQ(msg.diff().bids(1).price_raw(), Price(99.0).raw());
+    EXPECT_EQ(msg.diff().bids(1).size_raw(), Size(1.0).raw());  // binance only
+}
+
 TEST_F(AggregatorServiceTest, ApplyBatchRejectsNegativeSizeWithoutMutatingOrBroadcasting) {
     updates_.wait_for(0);  // initial snapshot
 
