@@ -615,8 +615,38 @@ class VenueSession {
             co_return;
         } else {
             auto spec = feed_.snapshot_request(symbol);
-            auto body = co_await fetch(spec.host, spec.port, spec.target);
-            if (!body) co_return;  // next reconnect or steady-state gap retries
+            std::expected<std::string, std::errc> body;
+            // Retries the fetch itself in place - same connection, no WS
+            // involvement at all - rather than giving up after one failure.
+            // The comment this replaced ("next reconnect or steady-state
+            // gap retries") was wrong: kSnapshotViaRest == true only pairs
+            // with kTrustsConnectionOrder == false in this codebase (see
+            // symbol_sync.hpp's own doc comment), and for that combination
+            // the symbol never reaches Live at all if its very first
+            // snapshot fetch fails - on_depth_update() while Buffering just
+            // buffers, with no gap check of any kind (that check only
+            // exists in the Live branch), so "steady-state gap retries"
+            // can't ever fire, and nothing but an unrelated transport-level
+            // disconnect would ever re-request. Caught by another session
+            // working on a related connection-event/book-validity design
+            // question, not by any test in this file.
+            //
+            // Deliberately not should_force_reconnect()/run_sig_.emit():
+            // that gate is unconditionally false for every venue that can
+            // even reach this branch (kSnapshotViaRest == true implies
+            // kTrustsConnectionOrder == false), and this commit's own
+            // message already says why - a REST venue's fix is to retry in
+            // place, not tear down the whole connection (and every other
+            // symbol sharing it) over one HTTP failure. Reusing backoff()
+            // (the same helper run()'s own reconnect loop uses) keeps this
+            // consistent with that connection-level shape rather than
+            // inventing a second one.
+            for (int attempt = 0;; ++attempt) {
+                if (stopping_) co_return;
+                body = co_await fetch(spec.host, spec.port, spec.target);
+                if (body) break;
+                co_await backoff(attempt);
+            }
 
             // stop() emits on this fetch's own cancellation_signal too
             // (see stop()), but per-op cancellation for the resolve/

@@ -257,6 +257,28 @@ net::awaitable<void> run_fake_http_server(net::ip::tcp::acceptor acceptor, std::
     co_await http::async_write(socket, response, net::use_awaitable);
 }
 
+// Accepts a connection and closes it immediately - no request read, no
+// response written - simulating a REST fetch attempt that fails (refused,
+// reset, whatever the real cause), then accepts a second connection and
+// answers it normally. http_get()'s own catch-all (any exception from the
+// read/write chain becomes std::unexpected(std::errc::io_error)) turns the
+// abrupt close into exactly the same "fetch failed" outcome
+// handle_request_snapshot() sees from a real network failure.
+net::awaitable<void> run_fake_http_server_fails_once_then_succeeds(net::ip::tcp::acceptor acceptor,
+                                                                     std::string response_body) {
+    { auto socket = co_await acceptor.async_accept(net::use_awaitable); }  // closed here, unanswered
+
+    auto socket = co_await acceptor.async_accept(net::use_awaitable);
+    beast::flat_buffer buffer;
+    http::request<http::empty_body> request;
+    co_await http::async_read(socket, buffer, request, net::use_awaitable);
+
+    http::response<http::string_body> response{http::status::ok, request.version()};
+    response.body() = std::move(response_body);
+    response.prepare_payload();
+    co_await http::async_write(socket, response, net::use_awaitable);
+}
+
 // Accepts connections forever, each time consuming the SUBSCRIBE message
 // and then immediately closing (ws/socket are loop-local, so they're
 // destroyed - and the connection with them - the moment control loops back
@@ -1409,6 +1431,115 @@ TEST(VenueSessionTest, RejectedActionMidBatchStillLetsLaterActionsInTheSameBatch
     ASSERT_EQ(after_delta.diff().bids_size(), 1);
     EXPECT_EQ(after_delta.diff().bids(0).price_raw(), Price(100.0).raw());
     EXPECT_EQ(after_delta.diff().bids(0).size_raw(), Size(2.0).raw());
+
+    context.TryCancel();
+    if (reader_thread.joinable()) reader_thread.join();
+    server->Shutdown();
+}
+
+// docs/ingestion_design.md's own comment on handle_request_snapshot() used
+// to claim a failed REST fetch would recover via "next reconnect or
+// steady-state gap retries" - false for a kTrustsConnectionOrder == false
+// venue (Binance): the symbol never reaches Live if its very first fetch
+// fails (on_depth_update() while Buffering just buffers, with no gap check
+// at all - that only exists in the Live branch), so neither a gap-driven
+// retry nor an unrelated reconnect would ever re-trigger a request. Caught
+// by another session working on a related connection-event/book-validity
+// design question, not by any test in this file. Fixed by retrying the
+// fetch itself in place - same connection, no WS teardown at all - with the
+// same backoff() helper run()'s own reconnect loop already uses.
+TEST(VenueSessionTest, FailedSnapshotFetchRetriesInPlaceWithoutTouchingTheConnection) {
+    std::vector<std::string> symbols{"BTCUSDT"};
+    AggregatorService service(std::vector<BookId>{TestBookId()});
+
+    grpc::ServerBuilder builder;
+    int grpc_port = 0;
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &grpc_port);
+    builder.RegisterService(&service);
+    auto server = builder.BuildAndStart();
+    ASSERT_NE(server, nullptr);
+
+    auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(grpc_port),
+                                        grpc::InsecureChannelCredentials());
+    auto stub = bobby::hermeneutic::aggregator::Aggregator::NewStub(channel);
+    grpc::ClientContext context;
+    bobby::hermeneutic::aggregator::SubscribeL2DiffRequest request;
+    fill_wire_book_id(request.mutable_book(), TestBookId());
+    auto reader = stub->SubscribeL2Diff(&context, request);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<L2Update> updates;
+    std::thread reader_thread([&] {
+        L2Update update;
+        while (reader->Read(&update)) {
+            std::lock_guard lock(mutex);
+            updates.push_back(update);
+            cv.notify_all();
+        }
+    });
+    struct ReaderThreadGuard {
+        grpc::ClientContext& context;
+        std::thread& thread;
+        ~ReaderThreadGuard() {
+            context.TryCancel();
+            if (thread.joinable()) thread.join();
+        }
+    } reader_guard{context, reader_thread};
+
+    auto wait_for = [&](std::size_t index) -> L2Update {
+        std::unique_lock lock(mutex);
+        cv.wait_for(lock, std::chrono::seconds(10), [&] { return updates.size() > index; });
+        return updates.at(index);
+    };
+    wait_for(0);  // initial (empty) snapshot
+
+    // WS side: one connection, holding open past its one DEPTH message -
+    // same shape as SnapshotFetchOverlapsReadingSoBufferedLiveEventBridgesIt
+    // above, reusing its exact numbers (buffered event first_id=100
+    // final_id=110, snapshot last_update_id=105) so the bridge condition is
+    // already proven correct; this test is only about whether the snapshot
+    // ever arrives at all. REST side: first connection attempt is dropped
+    // unanswered (a stand-in for any transient network failure), second
+    // succeeds.
+    net::io_context io;
+    net::ip::tcp::acceptor ws_acceptor(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    unsigned short ws_port = ws_acceptor.local_endpoint().port();
+    net::co_spawn(io, run_fake_ws_server(std::move(ws_acceptor), "DEPTH:BTCUSDT:100:110:0:100.0:7.0"),
+                  fail_test_on_exception("ws server"));
+
+    net::ip::tcp::acceptor http_acceptor(io.get_executor(),
+                                         net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    unsigned short http_port = http_acceptor.local_endpoint().port();
+    net::co_spawn(io, run_fake_http_server_fails_once_then_succeeds(std::move(http_acceptor), "105:100.0:5.0"),
+                  fail_test_on_exception("http server"));
+
+    FakeFeed feed(std::to_string(ws_port), std::to_string(http_port));
+    SymbolRegistry<SymbolBook> registry;
+    registry.add("BTCUSDT", service.book(TestBookId()));
+    VenueSession<FakeFeed, BinanceFuturesSequencePolicy, beast::tcp_stream, SymbolBook> session(
+        std::move(feed), kFakeVenue, symbols, std::move(registry), io.get_executor());
+    session.start(fail_test_on_exception("session"));
+
+    // >=500ms backoff(0) wait between the failed first attempt and the
+    // retry, plus both HTTP round trips and the WS side.
+    io.run_for(std::chrono::seconds(2));
+
+    // Without the fix: the failed first attempt gives up outright (no
+    // retry, no reconnect - the WS side never drops), so no snapshot ever
+    // arrives to bridge the buffered DEPTH event, and wait_for(1) times
+    // out. With the fix: the retry succeeds - seq 1 is ApplySnapshot (bid
+    // 5.0), seq 2 is ApplyDelta from the bridged buffered event (bid
+    // 5.0 -> 7.0).
+    L2Update after_snapshot = wait_for(1);
+    ASSERT_TRUE(after_snapshot.has_diff());
+    ASSERT_EQ(after_snapshot.diff().bids_size(), 1);
+    EXPECT_EQ(after_snapshot.diff().bids(0).size_raw(), Size(5.0).raw());
+
+    L2Update after_delta = wait_for(2);
+    ASSERT_TRUE(after_delta.has_diff());
+    ASSERT_EQ(after_delta.diff().bids_size(), 1);
+    EXPECT_EQ(after_delta.diff().bids(0).size_raw(), Size(7.0).raw());
 
     context.TryCancel();
     if (reader_thread.joinable()) reader_thread.join();
