@@ -828,9 +828,14 @@ class MultiSymbolAggregatorServiceTest : public ::testing::Test {
   protected:
     static BookId BtcBook() { return BookId{BaseQuote{{"BTC"}, {"USDT"}}, MarketType::Spot}; }
     static BookId EthBook() { return BookId{BaseQuote{{"ETH"}, {"USDT"}}, MarketType::Spot}; }
+    // Same base/quote as BtcBook() but MarketType::Perp - a distinct BookId
+    // (symbol::BookId equality includes market type) that exists purely to
+    // exercise to_symbol_book_id()/fill_wire_book_id()'s PERP branch, which
+    // every other book in this file leaves untouched (all Spot).
+    static BookId BtcPerpBook() { return BookId{BaseQuote{{"BTC"}, {"USDT"}}, MarketType::Perp}; }
 
     void SetUp() override {
-        std::vector<BookId> books{BtcBook(), EthBook()};
+        std::vector<BookId> books{BtcBook(), EthBook(), BtcPerpBook()};
         service_ = std::make_unique<AggregatorService>(books);
 
         grpc::ServerBuilder builder;
@@ -931,6 +936,70 @@ TEST_F(MultiSymbolAggregatorServiceTest, MalformedBookFailsWithInvalidArgument) 
 
     grpc::Status status = reader->Finish();
     EXPECT_EQ(status.error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+}
+
+// SubscribeBbo counterpart of UnknownSymbolFailsWithNotFound above -
+// SubscribeBbo() runs the exact same to_symbol_book_id()/book() sequence as
+// SubscribeL2Diff() (see AggregatorService::SubscribeBbo()), but nothing
+// previously exercised it directly.
+TEST_F(MultiSymbolAggregatorServiceTest, UnknownSymbolFailsWithNotFoundBbo) {
+    grpc::ClientContext context;
+    auto reader = stub_->SubscribeBbo(
+        &context, subscribe_bbo_request(BookId{BaseQuote{{"DOGE"}, {"USDT"}}, MarketType::Spot}));
+
+    BboUpdate update;
+    EXPECT_FALSE(reader->Read(&update));
+
+    grpc::Status status = reader->Finish();
+    EXPECT_EQ(status.error_code(), grpc::StatusCode::NOT_FOUND);
+}
+
+// SubscribeBbo counterpart of MalformedBookFailsWithInvalidArgument above.
+TEST_F(MultiSymbolAggregatorServiceTest, MalformedBookFailsWithInvalidArgumentBbo) {
+    grpc::ClientContext context;
+    SubscribeBboRequest request;
+    auto reader = stub_->SubscribeBbo(&context, request);
+
+    BboUpdate update;
+    EXPECT_FALSE(reader->Read(&update));
+
+    grpc::Status status = reader->Finish();
+    EXPECT_EQ(status.error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+}
+
+// Every other test in this file uses MarketType::Spot books exclusively -
+// this is the only one that exercises to_symbol_book_id()/fill_wire_book_id()'s
+// PERP branch (see book_id.hpp) end to end: a well-formed PERP request must
+// resolve to BtcPerpBook(), a distinct book from the Spot BtcBook() sharing
+// the same base/quote, and receive updates applied to it specifically.
+TEST_F(MultiSymbolAggregatorServiceTest, PerpBookSubscribesAndReceivesUpdates) {
+    grpc::ClientContext context;
+    auto reader = stub_->SubscribeL2Diff(&context, subscribe_l2_diff_request(BtcPerpBook()));
+    UpdateQueue<L2Update> updates;
+    std::thread reader_thread([&] {
+        L2Update update;
+        while (reader->Read(&update)) updates.push(update);
+    });
+
+    L2Update snapshot = updates.wait_for(0);
+    ASSERT_TRUE(snapshot.has_snapshot());
+
+    ASSERT_TRUE(
+        apply_one(*service_->book(BtcPerpBook()), kBinance, Side::Bid, Price(100.0), Size(1.0))
+            .has_value());
+    L2Update diff = updates.wait_for(1);
+    ASSERT_TRUE(diff.has_diff());
+    ASSERT_EQ(diff.diff().bids_size(), 1);
+    EXPECT_EQ(diff.diff().bids(0).price_raw(), Price(100.0).raw());
+
+    // service_->book() resolved BtcPerpBook() to a distinct SymbolBook from
+    // the Spot BtcBook() sharing the same base/quote - proof
+    // to_symbol_book_id()'s PERP branch produced a real, separate
+    // symbol::BookId, not one that collided with (or was coerced to) Spot.
+    EXPECT_NE(service_->book(BtcPerpBook()), service_->book(BtcBook()));
+
+    context.TryCancel();
+    if (reader_thread.joinable()) reader_thread.join();
 }
 
 }  // namespace

@@ -78,11 +78,15 @@ VenueGroup* find_group(VenueGroups& groups, const VenueId& venue_id) {
 // pair replaces what used to be six near-identical inline blocks in
 // main(), so a fix here (or a future venue) only has to happen once.
 // `group->native_symbols`/`group->registry` are moved out, not copied -
-// `groups` isn't read again afterward - and `wired_venues` is grown here
-// so the caller's startup log line can list only what was actually wired.
+// `groups` isn't read again afterward - and `wired_venues`/`wired_venue_ids`
+// are grown here so the caller can both log what was actually wired
+// (wired_venues) and, below, fail startup if the config asked for a venue
+// none of these calls claimed (wired_venue_ids) - see that check's own
+// comment in main() for why the two can't be derived from each other.
 template <typename Feed, typename Policy>
 void wire_venue(bobby::hermeneutic::ingestion::IngestionRunner& runner, VenueGroups& groups,
-                 const VenueId& venue_id, std::vector<std::string>& wired_venues, net::any_io_executor executor,
+                 const VenueId& venue_id, std::vector<std::string>& wired_venues,
+                 std::unordered_set<VenueId>& wired_venue_ids, net::any_io_executor executor,
                  net::ssl::context* ssl_ctx) {
     auto* group = find_group(groups, venue_id);
     if (!group) return;
@@ -91,6 +95,7 @@ void wire_venue(bobby::hermeneutic::ingestion::IngestionRunner& runner, VenueGro
     // is what actually gets wired into IngestionRunner/VenueSession/
     // AggregateOrderBook below.
     wired_venues.push_back(bobby::hermeneutic::symbol::to_string(venue_id));
+    wired_venue_ids.insert(venue_id);
     runner.add<Feed, Policy, net::ssl::stream<boost::beast::tcp_stream>, SymbolBook>(
         Feed{}, venue_id, std::move(group->native_symbols), std::move(group->registry), executor, ssl_ctx);
 }
@@ -214,24 +219,60 @@ int main(int argc, char** argv) {
     net::io_context io;
     bobby::hermeneutic::ingestion::IngestionRunner runner;
     std::vector<std::string> wired_venues;
+    std::unordered_set<VenueId> wired_venue_ids;
 
     wire_venue<bobby::hermeneutic::ingestion::BinanceSpotFeed, bobby::hermeneutic::BinanceSpotSequencePolicy>(
-        runner, groups, VenueId{Exchange::Binance, MarketType::Spot}, wired_venues, io.get_executor(), &ssl_ctx);
+        runner, groups, VenueId{Exchange::Binance, MarketType::Spot}, wired_venues, wired_venue_ids,
+        io.get_executor(), &ssl_ctx);
     wire_venue<bobby::hermeneutic::ingestion::BinanceFuturesFeed, bobby::hermeneutic::BinanceFuturesSequencePolicy>(
-        runner, groups, VenueId{Exchange::Binance, MarketType::Perp}, wired_venues, io.get_executor(), &ssl_ctx);
+        runner, groups, VenueId{Exchange::Binance, MarketType::Perp}, wired_venues, wired_venue_ids,
+        io.get_executor(), &ssl_ctx);
     wire_venue<bobby::hermeneutic::ingestion::BybitSpotFeed, bobby::hermeneutic::BybitSequencePolicy>(
-        runner, groups, VenueId{Exchange::Bybit, MarketType::Spot}, wired_venues, io.get_executor(), &ssl_ctx);
+        runner, groups, VenueId{Exchange::Bybit, MarketType::Spot}, wired_venues, wired_venue_ids,
+        io.get_executor(), &ssl_ctx);
     wire_venue<bobby::hermeneutic::ingestion::BybitLinearFeed, bobby::hermeneutic::BybitSequencePolicy>(
-        runner, groups, VenueId{Exchange::Bybit, MarketType::Perp}, wired_venues, io.get_executor(), &ssl_ctx);
+        runner, groups, VenueId{Exchange::Bybit, MarketType::Perp}, wired_venues, wired_venue_ids,
+        io.get_executor(), &ssl_ctx);
     // OKX is a single Feed/Policy pair covering both spot and perpetual
     // swap instIds (the `books` channel is protocol-identical for both -
     // see okx_feed.hpp); "okx_spot"/"okx_swap" are two independent
     // VenueSessions of that same Feed type, one per book type, matching
     // every other venue's shape here.
     wire_venue<bobby::hermeneutic::ingestion::OkxFeed, bobby::hermeneutic::OkxSequencePolicy>(
-        runner, groups, VenueId{Exchange::Okx, MarketType::Spot}, wired_venues, io.get_executor(), &ssl_ctx);
+        runner, groups, VenueId{Exchange::Okx, MarketType::Spot}, wired_venues, wired_venue_ids, io.get_executor(),
+        &ssl_ctx);
     wire_venue<bobby::hermeneutic::ingestion::OkxFeed, bobby::hermeneutic::OkxSequencePolicy>(
-        runner, groups, VenueId{Exchange::Okx, MarketType::Perp}, wired_venues, io.get_executor(), &ssl_ctx);
+        runner, groups, VenueId{Exchange::Okx, MarketType::Perp}, wired_venues, wired_venue_ids, io.get_executor(),
+        &ssl_ctx);
+
+    // Fail startup, rather than run with silent zero-data ingestion for
+    // some book, if the config named a (venue, market type) none of the
+    // wire_venue<>() calls above claimed - e.g. a typo'd/future Exchange
+    // enumerator, or a market type this binary genuinely has no Feed for
+    // yet. Without this check, `groups` still holds that venue's entry
+    // (nothing above removes an unclaimed one), the process starts and
+    // listens normally, and the operator only discovers the gap when that
+    // venue's book quietly never receives an update - the exact same
+    // "config looks right but isn't actually wired" failure class as the
+    // once-empty Bybit SymbolSync buffer, just one layer further up the
+    // stack.
+    std::vector<std::string> unwired_venues;
+    for (const auto& [venue_id, group] : groups) {
+        if (!wired_venue_ids.contains(venue_id)) {
+            unwired_venues.push_back(bobby::hermeneutic::symbol::to_string(venue_id));
+        }
+    }
+    if (!unwired_venues.empty()) {
+        std::cerr << "fatal: subscription config names " << unwired_venues.size()
+                  << " venue(s) this binary has no wire_venue<>() call for (they would silently "
+                     "receive zero ingestion):";
+        for (const auto& venue : unwired_venues) std::cerr << ' ' << venue;
+        std::cerr << std::endl;
+        heartbeat_stop = true;
+        heartbeat_thread.join();
+        server->Shutdown();
+        return 1;
+    }
 
     // Lets a real SIGINT/SIGTERM (Ctrl-C, `docker stop`/`docker compose
     // down`) make server->Wait() below return, instead of the OS just

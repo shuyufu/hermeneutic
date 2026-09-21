@@ -73,9 +73,27 @@ TEST(BybitSpotFeedTest, SubscribeAckHasNoTopicFieldAndIsIgnored) {
     EXPECT_FALSE(result->has_value());  // recognized, nothing to do - not an error
 }
 
+TEST(BybitSpotFeedTest, UnrecognizedTypeUnderARealTopicIsIgnored) {
+    BybitSpotFeed feed;
+    auto result = feed.parse_message(
+        R"({"topic":"orderbook.50.BTCUSDT","type":"someFutureType","data":{},"ts":1,"cts":1})");
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FALSE(result->has_value());
+}
+
 TEST(BybitSpotFeedTest, MalformedJsonFailsWithBadMessage) {
     BybitSpotFeed feed;
     auto result = feed.parse_message(R"({"topic":"orderbook.50.BTCUSDT", not valid json)");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), std::errc::bad_message);
+}
+
+TEST(BybitSpotFeedTest, DeltaMissingRequiredFieldFailsWithBadMessage) {
+    BybitSpotFeed feed;
+    // Has a recognized topic/type but "data" has no "u" - genuinely
+    // malformed, not just a message type this feed doesn't care about.
+    auto result = feed.parse_message(
+        R"({"topic":"orderbook.50.BTCUSDT","type":"delta","data":{"s":"BTCUSDT","b":[],"a":[]}})");
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), std::errc::bad_message);
 }

@@ -2,12 +2,14 @@
 
 #include <gtest/gtest.h>
 
+#include <boost/asio/error.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
 
 #include <exception>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace bobby::hermeneutic::ingestion {
 namespace {
@@ -54,6 +56,14 @@ auto fail_test_on_exception(std::string_view label) {
     };
 }
 
+// The inverse of fail_test_on_exception() above, for the error-path tests
+// below where a thrown exception is the expected, correct outcome - stashes
+// it into `out` so the test body can inspect it after io.run() returns,
+// instead of failing (or silently discarding) it here.
+auto capture_exception(std::exception_ptr& out) {
+    return [&out](std::exception_ptr e) { out = e; };
+}
+
 TEST(WebSocketConnectionTest, ConnectsSendsAndReceivesOverPlainTcp) {
     net::io_context io;
     net::ip::tcp::acceptor acceptor(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
@@ -70,6 +80,121 @@ TEST(WebSocketConnectionTest, ConnectsSendsAndReceivesOverPlainTcp) {
 
     EXPECT_EQ(first_message, "hello from server");
     EXPECT_EQ(received_by_server, "hello from client");
+}
+
+// connect() covers three distinct failure points internally (TCP connect,
+// TLS handshake when NextLayer is an SSL stream, WebSocket upgrade
+// handshake) but until now nothing exercised any of them failing -
+// VenueSessionTest only ever drives connect() against a cooperating fake
+// server. The three tests below cover the plain-TCP-stream failure points
+// that don't need a test TLS certificate (see run_echo_server's own comment
+// on why TLS itself is out of scope here); connect()'s success path is
+// already covered by ConnectsSendsAndReceivesOverPlainTcp above.
+
+TEST(WebSocketConnectionTest, ConnectFailsWhenNothingIsListening) {
+    net::io_context io;
+    // Grabs an ephemeral port and then closes the acceptor without ever
+    // calling async_accept - nothing answers this port afterward, so
+    // connecting to it gets an immediate, deterministic connection-refused
+    // from the OS rather than a hang or a flaky external unreachable-host
+    // dependency.
+    net::ip::tcp::acceptor acceptor(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    unsigned short port = acceptor.local_endpoint().port();
+    acceptor.close();
+
+    std::exception_ptr thrown;
+    net::co_spawn(
+        io,
+        [port]() -> net::awaitable<void> {
+            auto executor = co_await net::this_coro::executor;
+            PlainWebSocketConnection conn(executor);
+            co_await conn.connect("127.0.0.1", std::to_string(port), "/");
+        }(),
+        capture_exception(thrown));
+
+    io.run();
+
+    ASSERT_TRUE(thrown);
+    try {
+        std::rethrow_exception(thrown);
+        FAIL() << "connect() should have thrown - nothing was listening";
+    } catch (const beast::system_error& e) {
+        EXPECT_EQ(e.code(), net::error::connection_refused);
+    }
+}
+
+net::awaitable<void> run_server_that_closes_before_ws_handshake(net::ip::tcp::acceptor acceptor) {
+    auto socket = co_await acceptor.async_accept(net::use_awaitable);
+    // Closes the raw TCP connection immediately after accepting it,
+    // without ever performing ws.async_accept() - simulates a peer that
+    // drops the connection mid-handshake (e.g. a load balancer health
+    // check, or a server rejecting the upgrade at the TCP level) rather
+    // than one that completes the handshake and only fails later.
+    socket.close();
+}
+
+TEST(WebSocketConnectionTest, ConnectFailsWhenServerClosesDuringWebSocketHandshake) {
+    net::io_context io;
+    net::ip::tcp::acceptor acceptor(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    unsigned short port = acceptor.local_endpoint().port();
+
+    net::co_spawn(io, run_server_that_closes_before_ws_handshake(std::move(acceptor)),
+                  fail_test_on_exception("server"));
+
+    std::exception_ptr thrown;
+    net::co_spawn(
+        io,
+        [port]() -> net::awaitable<void> {
+            auto executor = co_await net::this_coro::executor;
+            PlainWebSocketConnection conn(executor);
+            co_await conn.connect("127.0.0.1", std::to_string(port), "/");
+        }(),
+        capture_exception(thrown));
+
+    io.run();
+
+    ASSERT_TRUE(thrown);
+    // The exact code (eof, connection_reset, broken_pipe, ...) depends on
+    // exactly when the OS notices the peer is gone relative to the
+    // client's own connect/handshake writes - only that the WebSocket
+    // upgrade never completes is guaranteed here.
+    EXPECT_THROW(std::rethrow_exception(thrown), beast::system_error);
+}
+
+net::awaitable<void> run_server_that_force_closes_after_handshake(net::ip::tcp::acceptor acceptor) {
+    auto socket = co_await acceptor.async_accept(net::use_awaitable);
+    websocket::stream<net::ip::tcp::socket> ws(std::move(socket));
+    co_await ws.async_accept(net::use_awaitable);
+    // Tears down the underlying TCP socket directly - unlike
+    // run_echo_server's ws.async_close() above, this sends no WebSocket
+    // close frame at all, simulating a peer that vanishes (crash, network
+    // partition) rather than one that says goodbye.
+    beast::get_lowest_layer(ws).close();
+}
+
+TEST(WebSocketConnectionTest, ReadFailsAfterPeerAbruptlyClosesConnection) {
+    net::io_context io;
+    net::ip::tcp::acceptor acceptor(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    unsigned short port = acceptor.local_endpoint().port();
+
+    net::co_spawn(io, run_server_that_force_closes_after_handshake(std::move(acceptor)),
+                  fail_test_on_exception("server"));
+
+    std::exception_ptr thrown;
+    net::co_spawn(
+        io,
+        [port]() -> net::awaitable<void> {
+            auto executor = co_await net::this_coro::executor;
+            PlainWebSocketConnection conn(executor);
+            co_await conn.connect("127.0.0.1", std::to_string(port), "/");
+            co_await conn.read();  // expected to throw - the point of this test
+        }(),
+        capture_exception(thrown));
+
+    io.run();
+
+    ASSERT_TRUE(thrown);
+    EXPECT_THROW(std::rethrow_exception(thrown), beast::system_error);
 }
 
 }  // namespace
