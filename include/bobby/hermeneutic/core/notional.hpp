@@ -1,8 +1,6 @@
 #pragma once
 
-#include <cassert>
 #include <expected>
-#include <limits>
 #include <system_error>
 
 #include "bobby/hermeneutic/core/fixed_point.hpp"
@@ -29,13 +27,11 @@ constexpr Notional operator*(Price price, Size size) noexcept {
 
     // The __int128 intermediate above only protects the multiply itself;
     // it says nothing about whether the rescaled result still fits back
-    // into Notional's int64_t raw storage. Debug-only, since no real
-    // price/size pair reaches this: it would need notional near
-    // Notional::raw_type's max (~9.2 billion units of quote currency).
-    assert(rounded >= std::numeric_limits<Notional::raw_type>::min());
-    assert(rounded <= std::numeric_limits<Notional::raw_type>::max());
-
-    return Notional::from_raw(static_cast<Notional::raw_type>(rounded));
+    // into Notional's int64_t raw storage. from_raw_checked()'s assert is
+    // debug-only, since no real price/size pair reaches this: it would need
+    // notional near Notional::raw_type's max (~9.2 billion units of quote
+    // currency).
+    return Notional::from_raw_checked(rounded);
 }
 
 // Notional / Price -> Size: the quantity needed to reach `notional` at
@@ -58,13 +54,10 @@ constexpr std::expected<Size, std::errc> operator/(Notional notional, Price pric
     __int128 denominator = static_cast<__int128>(price.raw());
     __int128 rounded = detail::round_div_nearest_away(scaled_numerator, denominator);
 
-    // Same narrowing caveat as operator*: debug-only, since no realistic
-    // notional/price pair asks for a quantity anywhere near Size::raw_type's
-    // max (~9.2 trillion units).
-    assert(rounded >= std::numeric_limits<Size::raw_type>::min());
-    assert(rounded <= std::numeric_limits<Size::raw_type>::max());
-
-    return Size::from_raw(static_cast<Size::raw_type>(rounded));
+    // Same narrowing caveat as operator*: from_raw_checked()'s assert is
+    // debug-only, since no realistic notional/price pair asks for a quantity
+    // anywhere near Size::raw_type's max (~9.2 trillion units).
+    return Size::from_raw_checked(rounded);
 }
 
 // Notional / Size -> Price: the VWAP that was paid for `size` at a total
@@ -79,13 +72,11 @@ constexpr std::expected<Price, std::errc> operator/(Notional notional, Size size
     __int128 denominator = static_cast<__int128>(size.raw());
     __int128 rounded = detail::round_div_nearest_away(scaled_numerator, denominator);
 
-    // Same narrowing caveat as operator*: debug-only, since no realistic
-    // notional/size pair asks for a VWAP anywhere near Price::raw_type's
-    // max (~9.2 billion units of quote currency).
-    assert(rounded >= std::numeric_limits<Price::raw_type>::min());
-    assert(rounded <= std::numeric_limits<Price::raw_type>::max());
-
-    return Price::from_raw(static_cast<Price::raw_type>(rounded));
+    // Same narrowing caveat as operator*: from_raw_checked()'s assert is
+    // debug-only, since no realistic notional/size pair asks for a VWAP
+    // anywhere near Price::raw_type's max (~9.2 billion units of quote
+    // currency).
+    return Price::from_raw_checked(rounded);
 }
 
 }  // namespace bobby::hermeneutic

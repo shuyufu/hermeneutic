@@ -4,7 +4,6 @@
 #include <cassert>
 #include <cstddef>
 #include <expected>
-#include <limits>
 #include <optional>
 #include <span>
 #include <system_error>
@@ -111,13 +110,10 @@ constexpr std::expected<Price, std::errc> vwap_at_partial_fill(Notional cum_noti
 
     __int128 rounded = round_div_nearest_away(numerator, denominator);
 
-    // Same narrowing caveat as notional.hpp's operators: debug-only, since
-    // no realistic notional/size/price combination asks for a VWAP anywhere
-    // near Price::raw_type's max.
-    assert(rounded >= std::numeric_limits<Price::raw_type>::min());
-    assert(rounded <= std::numeric_limits<Price::raw_type>::max());
-
-    return Price::from_raw(static_cast<Price::raw_type>(rounded));
+    // Same narrowing caveat as notional.hpp's operators: from_raw_checked()'s
+    // assert is debug-only, since no realistic notional/size/price
+    // combination asks for a VWAP anywhere near Price::raw_type's max.
+    return Price::from_raw_checked(rounded);
 }
 
 }  // namespace detail

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cassert>
 #include <compare>
 #include <cstddef>
 #include <cstdint>
@@ -37,6 +38,23 @@ class BasicFixedPoint {
         BasicFixedPoint v;
         v.raw_ = raw;
         return v;
+    }
+
+    // Like from_raw(), but for a __int128 intermediate that's already been
+    // rescaled to this type's raw storage and just needs narrowing back down
+    // to raw_type - the last step of every __int128-intermediate computation
+    // in this codebase (notional.hpp's operator*/operator/, volume_bands.hpp's
+    // vwap_at_partial_fill, price_bands.hpp's offset_by_bps all used to repeat
+    // this exact debug-assert-then-narrow shape by hand). Debug-only, same as
+    // those call sites always were: no realistic Price/Size/Notional magnitude
+    // in this codebase reaches raw_type's ~9.2e18 range, so this documents an
+    // invariant rather than handling a reachable error - a caller with a
+    // genuine runtime-reachable overflow risk (unlike these internal
+    // fixed-point helpers) should check before calling this, not rely on it.
+    static constexpr BasicFixedPoint from_raw_checked(__int128 value) noexcept {
+        assert(value >= static_cast<__int128>(std::numeric_limits<raw_type>::min()));
+        assert(value <= static_cast<__int128>(std::numeric_limits<raw_type>::max()));
+        return from_raw(static_cast<raw_type>(value));
     }
 
     explicit constexpr BasicFixedPoint(double value) noexcept

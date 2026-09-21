@@ -4,7 +4,6 @@
 #include <cassert>
 #include <cstddef>
 #include <expected>
-#include <limits>
 #include <span>
 #include <system_error>
 #include <vector>
@@ -52,12 +51,9 @@ constexpr Price offset_by_bps(Price price, int signed_bps, bool round_down) noex
     __int128 rounded = round_down ? scaled_numerator / denom
                                    : (scaled_numerator + denom - 1) / denom;
 
-    // Narrowing back to Price::raw_type is debug-checked only, same
-    // pattern as notional.hpp's operators.
-    assert(rounded >= std::numeric_limits<Price::raw_type>::min());
-    assert(rounded <= std::numeric_limits<Price::raw_type>::max());
-
-    return Price::from_raw(static_cast<Price::raw_type>(rounded));
+    // Narrowing back to Price::raw_type via from_raw_checked() is
+    // debug-checked only, same pattern as notional.hpp's operators.
+    return Price::from_raw_checked(rounded);
 }
 
 // Exact membership test: price <= best_price*(10000+signed_bps)/10000
