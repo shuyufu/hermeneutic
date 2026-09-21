@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <condition_variable>
@@ -822,6 +823,19 @@ TEST_F(AggregatorServiceTest, StuckBboSubscriberDoesNotBlockIngestionOrOtherSubs
     stuck_context.TryCancel();
 }
 
+TEST_F(AggregatorServiceTest, ListBooksReturnsTheSingleConfiguredBook) {
+    grpc::ClientContext context;
+    ListBooksRequest request;
+    ListBooksResponse response;
+    grpc::Status status = stub_->ListBooks(&context, request, &response);
+    ASSERT_TRUE(status.ok());
+
+    ASSERT_EQ(response.books_size(), 1);
+    auto id = to_symbol_book_id(response.books(0));
+    ASSERT_TRUE(id.has_value());
+    EXPECT_EQ(*id, TestBook());
+}
+
 // Not part of AggregatorServiceTest: these need their own multi-symbol
 // AggregatorService instance rather than the fixture's single-symbol one.
 class MultiSymbolAggregatorServiceTest : public ::testing::Test {
@@ -1000,6 +1014,30 @@ TEST_F(MultiSymbolAggregatorServiceTest, PerpBookSubscribesAndReceivesUpdates) {
 
     context.TryCancel();
     if (reader_thread.joinable()) reader_thread.join();
+}
+
+TEST_F(MultiSymbolAggregatorServiceTest, ListBooksReturnsEveryConfiguredBook) {
+    grpc::ClientContext context;
+    ListBooksRequest request;
+    ListBooksResponse response;
+    grpc::Status status = stub_->ListBooks(&context, request, &response);
+    ASSERT_TRUE(status.ok());
+    ASSERT_EQ(response.books_size(), 3);
+
+    std::vector<BookId> returned;
+    for (const auto& wire_book : response.books()) {
+        auto id = to_symbol_book_id(wire_book);
+        ASSERT_TRUE(id.has_value());
+        returned.push_back(*id);
+    }
+
+    // ListBooksResponse.books' own proto comment says order isn't
+    // guaranteed (it comes off std::unordered_map iteration order) - so
+    // this checks set membership, not a fixed sequence.
+    for (const auto& expected : {BtcBook(), EthBook(), BtcPerpBook()}) {
+        EXPECT_NE(std::find(returned.begin(), returned.end(), expected), returned.end())
+            << "missing " << bobby::hermeneutic::symbol::to_string(expected);
+    }
 }
 
 }  // namespace

@@ -4,7 +4,8 @@ A multi-venue crypto order book aggregator. `hermeneutic_aggregator_service`
 ingests real-time L2 order book data from Binance, Bybit, and OKX (spot and
 perpetual/futures) over their public WebSocket feeds, merges each venue's
 view into one `AggregateOrderBook` per book, and re-publishes the merged
-book over gRPC (`SubscribeL2Diff`/`SubscribeBbo`) so downstream consumers
+book over gRPC (`SubscribeL2Diff`/`SubscribeBbo`, plus a `ListBooks` query
+RPC for discovering which books a given instance serves) so downstream consumers
 never have to speak to an exchange directly. `hermeneutic_aggregator_client`
 is a minimal example consumer of that stream. See "Aggregator service"
 below for how the two run together, and `docs/ingestion_design.md` (中文)
@@ -116,7 +117,9 @@ structured message, and its OKX section for why perp and spot aren't merged
 into one book. It only wraps the book(s) and broadcasts to subscribers —
 feeding real market data (`SymbolBook::apply_batch`/`apply_snapshot`/
 `invalidate_venue`, reached via `AggregatorService::book(BookId)`) is up to
-the caller.
+the caller. The unary `ListBooks` RPC returns that fixed book set directly,
+so a client (or an ops script) doesn't have to read the subscription config
+or the server's own startup log out-of-band just to find out what it serves.
 
 ```sh
 cmake --build build-vcpkg --target hermeneutic_aggregator_service
@@ -150,6 +153,10 @@ cmake --build build-vcpkg --target hermeneutic_aggregator_client
 ./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 bbo 60 BTC_USDT.SPOT BTC_USDT.PERP
 ./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 volume-bands 60 BTC_USDT.SPOT
 ./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 price-bands 60 BTC_USDT.SPOT
+
+# <address> list - calls ListBooks and prints every book the server was
+# started with, one per line, then exits (no duration/book arguments).
+./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 list
 ```
 
 `hermeneutic_aggregator_service_test` exercises it over a real (in-process)

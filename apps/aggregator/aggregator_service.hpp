@@ -752,6 +752,14 @@ class AggregatorService final : public Aggregator::Service {
         }
     }
 
+    grpc::Status ListBooks(grpc::ServerContext*, const ListBooksRequest*,
+                            ListBooksResponse* response) override {
+        for (const auto& entry : books_) {
+            fill_wire_book_id(response->add_books(), entry.first);
+        }
+        return grpc::Status::OK;
+    }
+
   private:
     std::unordered_map<symbol::BookId, SymbolBook> books_;
 };

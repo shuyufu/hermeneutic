@@ -14,9 +14,14 @@ package bobby.hermeneutic.aggregator;
 // The two are independent gRPC streams (independent lifecycle, independent
 // backpressure) even though they observe the same underlying aggregate book
 // - see Bbo.book_seq for how they correlate.
+//
+// ListBooks returns the fixed, immutable set of books this server instance
+// was started with - the same set SubscribeL2DiffRequest/SubscribeBboRequest
+// validate their own `book` field against.
 service Aggregator {
   rpc SubscribeL2Diff(SubscribeL2DiffRequest) returns (stream L2Update);
   rpc SubscribeBbo(SubscribeBboRequest) returns (stream BboUpdate);
+  rpc ListBooks(ListBooksRequest) returns (ListBooksResponse);
 }
 
 // Which market a book covers. MARKET_TYPE_UNSPECIFIED is proto3's implicit
@@ -57,6 +62,14 @@ message SubscribeL2DiffRequest {
 message SubscribeBboRequest {
   // Same contract as SubscribeL2DiffRequest.book.
   BookId book = 1;
+}
+
+message ListBooksRequest {}
+
+message ListBooksResponse {
+  // Every book this server instance was started with. Order is not
+  // guaranteed to be stable across calls or across server restarts.
+  repeated BookId books = 1;
 }
 
 // Fixed-point encoding, fixed by this protocol (not configurable per

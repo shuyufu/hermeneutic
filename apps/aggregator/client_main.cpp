@@ -6,7 +6,7 @@
 // aggregator's output next, and a manual way to poke at a running
 // aggregator instance during development.
 //
-// Three publisher modes, selected on the command line:
+// Three publisher modes plus one query mode, selected on the command line:
 //   bbo           best bid/offer - subscribes to SubscribeBbo only.
 //   volume-bands  VWAP needed to fill 1M/5M/10M/25M/50M+ notional on each
 //                 side - subscribes to SubscribeL2Diff and maintains a
@@ -14,6 +14,9 @@
 //   price-bands   depth within 50/100/200/500/1000+ bps of BBO on each
 //                 side - subscribes to SubscribeL2Diff and maintains a
 //                 local order book.
+//   list          calls the unary ListBooks RPC and prints every book the
+//                 server was started with, then exits - unlike the other
+//                 three modes, this takes no duration/book arguments.
 // volume-bands/price-bands both track SubscribeL2Diff's own book_seq
 // contiguity guarantee (aggregator.proto: "book_seq must be contiguous...
 // a gap means a revision was missed") and log a GAP line loudly if that
@@ -25,6 +28,7 @@
 #include "bobby/hermeneutic/aggregator/aggregator.grpc.pb.h"
 #include "bobby/hermeneutic/symbol/symbol.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -59,20 +63,24 @@ using bobby::hermeneutic::aggregator::Aggregator;
 using bobby::hermeneutic::aggregator::BboUpdate;
 using bobby::hermeneutic::aggregator::fill_wire_book_id;
 using bobby::hermeneutic::aggregator::L2Update;
+using bobby::hermeneutic::aggregator::ListBooksRequest;
+using bobby::hermeneutic::aggregator::ListBooksResponse;
 using bobby::hermeneutic::aggregator::PriceLevel;
 using bobby::hermeneutic::aggregator::SubscribeBboRequest;
 using bobby::hermeneutic::aggregator::SubscribeL2DiffRequest;
+using bobby::hermeneutic::aggregator::to_symbol_book_id;
 using bobby::hermeneutic::symbol::BookId;
 using bobby::hermeneutic::symbol::to_string;
 
 namespace {
 
-enum class Mode { Bbo, VolumeBands, PriceBands };
+enum class Mode { Bbo, VolumeBands, PriceBands, List };
 
 std::optional<Mode> parse_mode(const std::string& token) {
     if (token == "bbo") return Mode::Bbo;
     if (token == "volume-bands") return Mode::VolumeBands;
     if (token == "price-bands") return Mode::PriceBands;
+    if (token == "list") return Mode::List;
     return std::nullopt;
 }
 
@@ -322,10 +330,19 @@ void notify_all_of_stop() {
     for (StreamCanceller* canceller : canceller_registry()) canceller->notify_stop();
 }
 
+// Shared by publish_bbo()/publish_l2_bands()/list_books() - all three used
+// to each construct their own channel/stub with identical arguments, so any
+// future change to how a channel is built (credentials, keepalive,
+// message-size limits) would otherwise have to be made at three call sites
+// in lockstep.
+std::unique_ptr<Aggregator::Stub> make_stub(const std::string& address) {
+    auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
+    return Aggregator::NewStub(channel);
+}
+
 void publish_bbo(const std::string& address, const BookId& book_id, std::atomic<bool>* stop) {
     std::string label = to_string(book_id);
-    auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
-    auto stub = Aggregator::NewStub(channel);
+    auto stub = make_stub(address);
 
     grpc::ClientContext context;
     SubscribeBboRequest request;
@@ -360,13 +377,67 @@ void publish_bbo(const std::string& address, const BookId& book_id, std::atomic<
     print_line(done_line.str());
 }
 
+// Unlike publish_bbo()/publish_l2_bands(), this is a single blocking unary
+// call, not a stream - so it has no StreamCanceller/duration handling and
+// runs straight from main(), never on its own thread. Given its own
+// deadline below rather than main()'s duration mechanism (list intentionally
+// takes no duration argument): without one, a server that accepts the
+// connection but never replies would hang this call forever. Returns false
+// (having already printed the error) on a non-OK status, so main() can turn
+// that into a non-zero exit code the way the streaming modes' own DONE lines
+// only report, never enforce.
+constexpr std::chrono::seconds kListBooksTimeout{10};
+
+bool list_books(const std::string& address) {
+    auto stub = make_stub(address);
+
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + kListBooksTimeout);
+    ListBooksRequest request;
+    ListBooksResponse response;
+    auto status = stub->ListBooks(&context, request, &response);
+    if (!status.ok()) {
+        std::cerr << "ListBooks failed: grpc_status=" << status.error_code() << " (" << status.error_message()
+                   << ")\n";
+        return false;
+    }
+
+    // fill_wire_book_id() (the only thing that produces this response,
+    // server-side) never emits a malformed BookId - see to_symbol_book_id()'s
+    // own comment for when it returns nullopt - so this is unreached against
+    // this project's own server. Kept as a defensive fallback anyway, same
+    // as fill_wire_book_id() itself defends against an out-of-range
+    // symbol::MarketType: a future/buggy server on the other end of this
+    // wire is still bound by the .proto contract, not by this binary.
+    std::vector<std::string> labels;
+    for (const auto& wire_book : response.books()) {
+        auto book_id = to_symbol_book_id(wire_book);
+        labels.push_back(book_id ? to_string(*book_id) : "(malformed book in response)");
+    }
+    // ListBooksResponse.books' own proto comment says order isn't
+    // guaranteed (it comes off the server's std::unordered_map iteration
+    // order) - sorted here purely so this CLI's own output is stable across
+    // runs for a human diffing them, not because the wire contract requires it.
+    std::sort(labels.begin(), labels.end());
+
+    // An OK status with zero books printed would look identical to any
+    // other successful-but-empty run - print an explicit marker instead so
+    // "genuinely no books configured" is never indistinguishable from a
+    // query that silently came back empty for some other reason.
+    if (labels.empty()) {
+        print_line("(server reports no configured books)");
+        return true;
+    }
+    for (const auto& label : labels) print_line(label);
+    return true;
+}
+
 // Shared by volume-bands and price-bands: both subscribe to SubscribeL2Diff
 // and maintain the same local L2OrderBook, differing only in which bands
 // get computed/printed from it on every update.
 void publish_l2_bands(Mode mode, const std::string& address, const BookId& book_id, std::atomic<bool>* stop) {
     std::string label = to_string(book_id);
-    auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
-    auto stub = Aggregator::NewStub(channel);
+    auto stub = make_stub(address);
 
     grpc::ClientContext context;
     SubscribeL2DiffRequest request;
@@ -453,24 +524,52 @@ void publish_l2_bands(Mode mode, const std::string& address, const BookId& book_
 void print_usage() {
     std::cerr << "usage: hermeneutic_aggregator_client <address> <bbo|volume-bands|price-bands> "
                  "<duration_seconds> <book1> [book2 ...]\n"
+                 "       hermeneutic_aggregator_client <address> list\n"
                  "  duration_seconds <= 0 means run until interrupted or the server ends the stream\n"
                  "  books look like BTC_USDT.SPOT or BTC_USDT.PERP\n"
                  "  bbo:          subscribes to SubscribeBbo, prints best bid/ask on every update\n"
                  "  volume-bands: subscribes to SubscribeL2Diff, prints the VWAP needed to fill\n"
                  "                1M/5M/10M/25M/50M+ notional on each side on every update\n"
                  "  price-bands:  subscribes to SubscribeL2Diff, prints depth within\n"
-                 "                50/100/200/500/1000+ bps of BBO on each side on every update\n";
+                 "                50/100/200/500/1000+ bps of BBO on each side on every update\n"
+                 "  list:         calls ListBooks and prints every book the server was started\n"
+                 "                with, one per line, then exits (no duration/book arguments)\n";
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 5) {
+    if (argc < 3) {
         print_usage();
         return 1;
     }
     std::string address = argv[1];
     std::string mode_str = argv[2];
+
+    auto mode = parse_mode(mode_str);
+    if (!mode) {
+        std::cerr << "unknown mode \"" << mode_str << "\" (expected bbo, volume-bands, price-bands, or list)\n";
+        print_usage();
+        return 1;
+    }
+
+    // list takes no duration/book arguments and needs neither a stream nor
+    // a background thread - handled here, before the duration/book parsing
+    // the other three modes share below, and returns directly rather than
+    // falling into their thread-per-book dispatch.
+    if (*mode == Mode::List) {
+        if (argc != 3) {
+            std::cerr << "list takes no further arguments\n";
+            print_usage();
+            return 1;
+        }
+        return list_books(address) ? 0 : 1;
+    }
+
+    if (argc < 5) {
+        print_usage();
+        return 1;
+    }
     std::string duration_str = argv[3];
     int duration_s;
     try {
@@ -509,13 +608,6 @@ int main(int argc, char** argv) {
             return 1;
         }
         books.push_back(*book_id);
-    }
-
-    auto mode = parse_mode(mode_str);
-    if (!mode) {
-        std::cerr << "unknown mode \"" << mode_str << "\" (expected bbo, volume-bands, or price-bands)\n";
-        print_usage();
-        return 1;
     }
 
     std::atomic<bool> stop{false};
