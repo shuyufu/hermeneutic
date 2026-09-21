@@ -119,7 +119,9 @@ TEST(SymbolSyncTest, BridgingSnapshotDetectsAGapBetweenTwoBufferedTailEvents) {
 
     // Snapshot applies, then the bridge event (contiguous with it by
     // construction) - then the gap is caught before the second tail event is
-    // applied, not after.
+    // applied, not after. SymbolSync itself only ever reports
+    // InvalidateVenue here - see LiveGapInvalidatesAndReBuffersTheTriggeringEvent's
+    // own comment on why it doesn't also decide to re-request a snapshot.
     ASSERT_EQ(kinds_of(actions), (std::vector{Kind::ApplySnapshot, Kind::ApplyDelta, Kind::InvalidateVenue}));
     EXPECT_EQ(std::get<ApplyDelta>(actions[1]).bids,
               (std::vector<std::pair<Price, Size>>{{Price(2.0), Size(2.0)}}));
@@ -205,6 +207,14 @@ TEST(SymbolSyncTest, LiveGapInvalidatesAndReBuffersTheTriggeringEvent) {
     // Now live with last_final_id_ == 100.
 
     // pu (50) doesn't match the last applied final_id (100): a gap.
+    // SymbolSync itself stays venue-shape-agnostic here - it only ever
+    // reports InvalidateVenue, never decides whether that means "force a
+    // reconnect" or "re-request a snapshot in place"; that decision is
+    // made once, centrally, by VenueSession::resync_rest_venue_after_gap()
+    // (see its own comment for why it isn't duplicated into SymbolSync).
+    // VenueSessionTest.LiveStateGapForARestVenueRetriesTheSnapshotFetchWithoutTouchingTheConnection
+    // is what actually proves a kTrustsConnectionOrder == false venue
+    // gets a fresh snapshot requested after this.
     auto gap_actions = sync.on_depth_update(make_update(151, 160, 50, {{Price(9.0), Size(9.0)}}));
     EXPECT_EQ(kinds_of(gap_actions), (std::vector{Kind::InvalidateVenue}));
 

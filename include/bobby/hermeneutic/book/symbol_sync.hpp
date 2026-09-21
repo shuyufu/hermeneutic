@@ -310,6 +310,17 @@ class SymbolSync {
     // nothing yet in buffer_ to erase a prefix of (buffer_ is always empty
     // in Live state) - it pushes its one gap-triggering event in first,
     // then passes buffer_.begin(), making the erase a no-op.
+    // Deliberately venue-shape-agnostic: this class never decides what a
+    // gap *means* for the driver (force a reconnect? re-request a
+    // snapshot in place? both are wrong for the other venue shape - see
+    // docs/ingestion_design.md) - it only ever reports that one happened.
+    // VenueSession::maybe_resync_after_gap() is the one place that
+    // decision is made, for every trigger point (this one, plus
+    // on_disconnected() reached via a book-level rejection) - not split
+    // between here and there, which is exactly what let one of those
+    // trigger points fall through the cracks when the others were fixed
+    // (a /code-review finding on an earlier version of this function that
+    // did branch on SequencePolicy::kTrustsConnectionOrder here).
     std::vector<SyncAction> handle_gap(std::vector<DepthUpdate>::iterator first_unresolved) {
         buffer_.erase(buffer_.begin(), first_unresolved);
         state_ = State::Buffering;

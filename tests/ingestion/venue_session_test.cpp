@@ -239,22 +239,33 @@ net::awaitable<void> run_fake_ws_server(net::ip::tcp::acceptor acceptor, std::st
 // than the depth event's arrival but short enough for a normal test
 // timeout; StopDrainsInFlightSnapshotFetch below passes a much longer one
 // to prove a cancelled fetch doesn't just sit there waiting it out.
-net::awaitable<void> run_fake_http_server(net::ip::tcp::acceptor acceptor, std::string response_body,
-                                           std::chrono::milliseconds delay = std::chrono::milliseconds(100)) {
-    auto socket = co_await acceptor.async_accept(net::use_awaitable);
-
+// Reads one HTTP request off an already-accepted `socket` and answers it
+// with `body` (optionally after an artificial `delay`) - the accept/read/
+// (wait)/respond block every fake HTTP server below needs, factored out so
+// each one only has to say how many connections it accepts and in what
+// shape, not repeat this mechanics three times (a /code-review finding).
+net::awaitable<void> respond_to_one_http_request(net::ip::tcp::socket& socket, std::string body,
+                                                   std::chrono::milliseconds delay = std::chrono::milliseconds(0)) {
     beast::flat_buffer buffer;
     http::request<http::empty_body> request;
     co_await http::async_read(socket, buffer, request, net::use_awaitable);
 
-    auto executor = co_await net::this_coro::executor;
-    net::steady_timer timer(executor, delay);
-    co_await timer.async_wait(net::use_awaitable);
+    if (delay.count() > 0) {
+        auto executor = co_await net::this_coro::executor;
+        net::steady_timer timer(executor, delay);
+        co_await timer.async_wait(net::use_awaitable);
+    }
 
     http::response<http::string_body> response{http::status::ok, request.version()};
-    response.body() = std::move(response_body);
+    response.body() = std::move(body);
     response.prepare_payload();
     co_await http::async_write(socket, response, net::use_awaitable);
+}
+
+net::awaitable<void> run_fake_http_server(net::ip::tcp::acceptor acceptor, std::string response_body,
+                                           std::chrono::milliseconds delay = std::chrono::milliseconds(100)) {
+    auto socket = co_await acceptor.async_accept(net::use_awaitable);
+    co_await respond_to_one_http_request(socket, std::move(response_body), delay);
 }
 
 // Accepts a connection and closes it immediately - no request read, no
@@ -269,14 +280,35 @@ net::awaitable<void> run_fake_http_server_fails_once_then_succeeds(net::ip::tcp:
     { auto socket = co_await acceptor.async_accept(net::use_awaitable); }  // closed here, unanswered
 
     auto socket = co_await acceptor.async_accept(net::use_awaitable);
-    beast::flat_buffer buffer;
-    http::request<http::empty_body> request;
-    co_await http::async_read(socket, buffer, request, net::use_awaitable);
+    co_await respond_to_one_http_request(socket, std::move(response_body));
+}
 
-    http::response<http::string_body> response{http::status::ok, request.version()};
-    response.body() = std::move(response_body);
-    response.prepare_payload();
-    co_await http::async_write(socket, response, net::use_awaitable);
+// Answers two separate REST requests in sequence on the same acceptor -
+// for a scenario where handle_request_snapshot() gets triggered twice
+// (once for the initial snapshot, once more for a later gap) without any
+// WS reconnect in between, so the same acceptor has to serve both.
+net::awaitable<void> run_fake_http_server_twice(net::ip::tcp::acceptor acceptor, std::string first_body,
+                                                  std::string second_body,
+                                                  std::chrono::milliseconds second_delay = std::chrono::milliseconds(0)) {
+    {
+        auto socket = co_await acceptor.async_accept(net::use_awaitable);
+        co_await respond_to_one_http_request(socket, std::move(first_body));
+    }
+
+    auto socket = co_await acceptor.async_accept(net::use_awaitable);
+    // Unlike the first response, an artificial delay here (rather than
+    // just relying on run_fake_ws_server_two_messages_gated's own gate) is
+    // sometimes needed: that gate only proves the *first* batch's own
+    // resync has already run by the time the gated WS message gets sent -
+    // it says nothing about how long that message then takes to actually
+    // reach and get buffered by SymbolSync (a WS write+read, on this same
+    // io_context) relative to how fast *this* HTTP round trip (no delay of
+    // its own, loopback) resolves. Without this, a fast enough second
+    // response can arrive before the gated message does, find an empty
+    // buffer, and retry immediately (SymbolSync's own no-bridge/no-op
+    // RequestSnapshot loop) instead of exercising the bridge this test is
+    // actually for.
+    co_await respond_to_one_http_request(socket, std::move(second_body), second_delay);
 }
 
 // Accepts connections forever, each time consuming the SUBSCRIBE message
@@ -320,6 +352,43 @@ net::awaitable<void> run_fake_ws_server_two_messages(net::ip::tcp::acceptor acce
     // Same reasoning as run_fake_ws_server's own trailing idle read:
     // keeps the connection open so a disconnect-triggered invalidate/
     // reset isn't what this particular test is exercising.
+    beast::flat_buffer idle_buffer;
+    boost::system::error_code ec;
+    co_await ws.async_read(idle_buffer, net::redirect_error(net::use_awaitable, ec));
+}
+
+// Like run_fake_ws_server_two_messages, but blocks (polling `proceed`)
+// between the two writes instead of sending them back-to-back - so a test
+// can pin down exactly which SymbolSync state `second_message` arrives in
+// (e.g. "only after the first message's own resync has already gone
+// Live"), rather than racing it against however long an intervening REST
+// round trip happens to take. Without this, a fast-enough loopback round
+// trip could let `second_message` land while still Buffering, buffered
+// alongside the first rather than exercising the Live-state code path the
+// test is named for - the SyncAction/L2Update sequence can end up
+// identical either way, so a flaky-looking pass wouldn't even reveal the
+// problem (a /code-review finding on this file's own tests).
+net::awaitable<void> run_fake_ws_server_two_messages_gated(net::ip::tcp::acceptor acceptor,
+                                                              std::string first_message,
+                                                              std::string second_message,
+                                                              std::atomic<bool>* proceed) {
+    auto socket = co_await acceptor.async_accept(net::use_awaitable);
+    websocket::stream<net::ip::tcp::socket> ws(std::move(socket));
+    co_await ws.async_accept(net::use_awaitable);
+
+    beast::flat_buffer buffer;
+    co_await ws.async_read(buffer, net::use_awaitable);  // the SUBSCRIBE message; content unchecked
+
+    co_await ws.async_write(net::buffer(first_message), net::use_awaitable);
+
+    auto executor = co_await net::this_coro::executor;
+    while (!proceed->load()) {
+        net::steady_timer poll(executor, std::chrono::milliseconds(5));
+        co_await poll.async_wait(net::use_awaitable);
+    }
+
+    co_await ws.async_write(net::buffer(second_message), net::use_awaitable);
+
     beast::flat_buffer idle_buffer;
     boost::system::error_code ec;
     co_await ws.async_read(idle_buffer, net::redirect_error(net::use_awaitable, ec));
@@ -406,8 +475,10 @@ net::awaitable<void> run_fake_ws_server_live_gap_then_reconnect(net::ip::tcp::ac
 // BackoffEscalatesAcrossRepeatedForcedReconnects below needs to prove
 // run()'s backoff counter actually escalates across successive
 // forced-reconnect cycles rather than resetting to a fast retry every
-// single time (a code-review finding on the should_force_reconnect() fix
-// this file's other Live/BufferingState/RestSnapshot gap tests exercise).
+// single time (a code-review finding on the forced-reconnect fix this
+// file's other Live/BufferingState/RestSnapshot gap tests exercise -
+// execute_actions_and_maybe_force_reconnect()'s kTrustsConnectionOrder ==
+// true branch, in venue_session.hpp).
 net::awaitable<void> run_fake_ws_server_repeated_live_gaps(
     net::ip::tcp::acceptor acceptor, int gap_count, std::string snapshot, std::string gapped_depth,
     std::vector<std::chrono::steady_clock::time_point>* connect_times) {
@@ -423,9 +494,9 @@ net::awaitable<void> run_fake_ws_server_repeated_live_gaps(
 
         // The forced reconnect closes this connection by destroying
         // VenueSession's own `connection` local (stack unwinding out of
-        // run()'s try block via the thrown exception - see
-        // should_force_reconnect()'s own comment), not by this server
-        // ending it - so this just waits for that instead.
+        // run()'s try block via the thrown exception -
+        // execute_actions_and_maybe_force_reconnect()'s own comment), not
+        // by this server ending it - so this just waits for that instead.
         beast::flat_buffer idle_buffer;
         boost::system::error_code ec;
         co_await ws.async_read(idle_buffer, net::redirect_error(net::use_awaitable, ec));
@@ -1593,7 +1664,7 @@ TEST(VenueSessionTest, FailedSnapshotFetchRetriesInPlaceWithoutTouchingTheConnec
     server->Shutdown();
 }
 
-// code-review finding on should_force_reconnect(): run()'s reconnect loop
+// code-review finding on the forced-reconnect fix: run()'s reconnect loop
 // used to reset `attempt` back to 0 unconditionally the instant
 // connect+subscribe succeeded - before the connection had actually proven
 // itself healthy. Harmless for a genuine, infrequent disconnect, but for a
@@ -1660,6 +1731,277 @@ TEST(VenueSessionTest, BackoffEscalatesAcrossRepeatedForcedReconnects) {
         << "first reconnect happened suspiciously fast for any backoff wait at all";
     EXPECT_LT(interval_2_to_3, std::chrono::seconds(6))
         << "second forced reconnect took far longer than any expected backoff attempt";
+}
+
+// Another session's line-by-line review of the merged fix above found one
+// more instance of the same "stuck forever" bug class this whole file is
+// about, this time for a kTrustsConnectionOrder == false venue (Binance):
+// a Live-state gap reset the symbol to Buffering (handle_gap()) but never
+// re-requested a snapshot - VenueSession never forces a reconnect for this
+// venue shape (by design, tearing down the connection over one gap would
+// be the wrong fix for a REST venue), so nothing else would ever
+// re-trigger one either. This proves the fix
+// (execute_actions_and_maybe_force_reconnect()'s kTrustsConnectionOrder ==
+// false branch calls resync_rest_venue_after_gap() to request a fresh
+// snapshot directly for this venue shape): the WS side sends a bridging
+// DEPTH event, then a live-state gap, and never closes the connection
+// itself - a second REST fetch (proving handle_request_snapshot()'s
+// in-place retry path fired) is the
+// only way this test's own wait_for() calls below don't time out, and
+// nothing here ever exercises a second WS connection.
+TEST(VenueSessionTest, LiveStateGapForARestVenueRetriesTheSnapshotFetchWithoutTouchingTheConnection) {
+    std::vector<std::string> symbols{"BTCUSDT"};
+    AggregatorService service(std::vector<BookId>{TestBookId()});
+
+    grpc::ServerBuilder builder;
+    int grpc_port = 0;
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &grpc_port);
+    builder.RegisterService(&service);
+    auto server = builder.BuildAndStart();
+    ASSERT_NE(server, nullptr);
+
+    auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(grpc_port),
+                                        grpc::InsecureChannelCredentials());
+    auto stub = bobby::hermeneutic::aggregator::Aggregator::NewStub(channel);
+    grpc::ClientContext context;
+    bobby::hermeneutic::aggregator::SubscribeL2DiffRequest request;
+    fill_wire_book_id(request.mutable_book(), TestBookId());
+    auto reader = stub->SubscribeL2Diff(&context, request);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<L2Update> updates;
+    // Set once DEPTH1's own bridge (ApplyDelta, index 2 below) has been
+    // observed - the signal run_fake_ws_server_two_messages_gated waits on
+    // before sending DEPTH2, so DEPTH2 deterministically arrives only
+    // after the symbol has actually gone Live (see that helper's own
+    // comment on why racing it otherwise wouldn't reliably exercise
+    // on_depth_update()'s Live-state gap branch specifically). Set from
+    // this reader thread, not the main thread: io.run_for() below blocks
+    // the main thread for its whole duration, but this thread keeps
+    // receiving gRPC updates concurrently with it.
+    std::atomic<bool> depth1_bridged{false};
+    std::thread reader_thread([&] {
+        L2Update update;
+        while (reader->Read(&update)) {
+            std::lock_guard lock(mutex);
+            updates.push_back(update);
+            if (updates.size() == 3) depth1_bridged.store(true);
+            cv.notify_all();
+        }
+    });
+    struct ReaderThreadGuard {
+        grpc::ClientContext& context;
+        std::thread& thread;
+        ~ReaderThreadGuard() {
+            context.TryCancel();
+            if (thread.joinable()) thread.join();
+        }
+    } reader_guard{context, reader_thread};
+
+    auto wait_for = [&](std::size_t index) -> L2Update {
+        std::unique_lock lock(mutex);
+        cv.wait_for(lock, std::chrono::seconds(10), [&] { return updates.size() > index; });
+        return updates.at(index);
+    };
+    wait_for(0);  // initial (empty) snapshot
+
+    // WS side: DEPTH1 (final_id=110) bridges the first snapshot below and
+    // goes Live (last_final_id_ == 110); DEPTH2's prev_final_id (50)
+    // doesn't match that, a genuine Live-state gap - held back until
+    // depth1_bridged confirms the symbol is actually Live first, so this
+    // deterministically exercises on_depth_update()'s Live-state gap
+    // branch rather than possibly racing into on_snapshot()'s bridge-tail
+    // one instead (already covered by
+    // BridgingSnapshotDetectsAGapBetweenTwoBufferedTailEvents in
+    // tests/book/symbol_sync_test.cpp - not what this test is for). The
+    // connection is never closed by this server - see
+    // run_fake_ws_server_two_messages_gated's own comment. REST side:
+    // first response (last_update_id=105) bridges DEPTH1; second
+    // (last_update_id=155, only requested because of the fix under test)
+    // bridges DEPTH2.
+    net::io_context io;
+    net::ip::tcp::acceptor ws_acceptor(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    unsigned short ws_port = ws_acceptor.local_endpoint().port();
+    net::co_spawn(io,
+                  run_fake_ws_server_two_messages_gated(std::move(ws_acceptor), "DEPTH:BTCUSDT:100:110:0:100.0:7.0",
+                                                          "DEPTH:BTCUSDT:151:160:50:100.0:3.0", &depth1_bridged),
+                  fail_test_on_exception("ws server"));
+
+    net::ip::tcp::acceptor http_acceptor(io.get_executor(),
+                                         net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    unsigned short http_port = http_acceptor.local_endpoint().port();
+    net::co_spawn(io, run_fake_http_server_twice(std::move(http_acceptor), "105:100.0:5.0", "155:100.0:9.0"),
+                  fail_test_on_exception("http server"));
+
+    FakeFeed feed(std::to_string(ws_port), std::to_string(http_port));
+    SymbolRegistry<SymbolBook> registry;
+    registry.add("BTCUSDT", service.book(TestBookId()));
+    VenueSession<FakeFeed, BinanceFuturesSequencePolicy, beast::tcp_stream, SymbolBook> session(
+        std::move(feed), kFakeVenue, symbols, std::move(registry), io.get_executor());
+    session.start(fail_test_on_exception("session"));
+
+    io.run_for(std::chrono::seconds(2));
+
+    // seq 1: ApplySnapshot (bid 5.0); seq 2: ApplyDelta from DEPTH1's
+    // bridge (bid 5.0 -> 7.0) - now Live.
+    L2Update after_snapshot = wait_for(1);
+    ASSERT_TRUE(after_snapshot.has_diff());
+    EXPECT_EQ(after_snapshot.diff().bids(0).size_raw(), Size(5.0).raw());
+    L2Update after_delta = wait_for(2);
+    ASSERT_TRUE(after_delta.has_diff());
+    EXPECT_EQ(after_delta.diff().bids(0).size_raw(), Size(7.0).raw());
+
+    // seq 3: InvalidateVenue from DEPTH2's gap - this venue's only
+    // contribution (bid @100.0) reported removed (size_raw 0).
+    L2Update invalidated = wait_for(3);
+    ASSERT_TRUE(invalidated.has_diff());
+    ASSERT_EQ(invalidated.diff().bids_size(), 1);
+    EXPECT_EQ(invalidated.diff().bids(0).price_raw(), Price(100.0).raw());
+    EXPECT_EQ(invalidated.diff().bids(0).size_raw(), 0);
+
+    // seq 4: ApplySnapshot from the second REST fetch (bid 9.0) - without
+    // the fix, nothing after seq 3 ever arrives and this times out. seq 5:
+    // ApplyDelta from DEPTH2's own bridge (bid 9.0 -> 3.0).
+    L2Update second_snapshot = wait_for(4);
+    ASSERT_TRUE(second_snapshot.has_diff());
+    EXPECT_EQ(second_snapshot.diff().bids(0).size_raw(), Size(9.0).raw());
+    L2Update second_delta = wait_for(5);
+    ASSERT_TRUE(second_delta.has_diff());
+    EXPECT_EQ(second_delta.diff().bids(0).size_raw(), Size(3.0).raw());
+
+    context.TryCancel();
+    if (reader_thread.joinable()) reader_thread.join();
+    server->Shutdown();
+}
+
+// The same review pass that found the Live-state gap bug above found a
+// fourth instance of the same "stuck forever" bug class: a book-level
+// rejection (apply_failed) resyncs a symbol through
+// SymbolSync::on_disconnected(), which deliberately never re-requests a
+// snapshot itself (correct for a real drop, see its own comment) -
+// what a kTrustsConnectionOrder == false venue does about *any*
+// InvalidateVenue, including this one, is decided once, centrally, by
+// VenueSession::resync_rest_venue_after_gap() at the outermost caller
+// (see its own comment for why that decision isn't duplicated into
+// SymbolSync). This proves it end to end: a malformed first REST
+// snapshot (rejected by AggregateOrderBook, so no broadcast for it)
+// still lets the batch's other, valid action (DEPTH1's own bridge)
+// apply, and the resync it triggers succeeds via a second REST fetch
+// with the WS connection never touched throughout.
+TEST(VenueSessionTest, BookRejectionRetriesTheSnapshotFetchForARestVenueWithoutTouchingTheConnection) {
+    std::vector<std::string> symbols{"BTCUSDT"};
+    AggregatorService service(std::vector<BookId>{TestBookId()});
+
+    grpc::ServerBuilder builder;
+    int grpc_port = 0;
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &grpc_port);
+    builder.RegisterService(&service);
+    auto server = builder.BuildAndStart();
+    ASSERT_NE(server, nullptr);
+
+    auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(grpc_port),
+                                        grpc::InsecureChannelCredentials());
+    auto stub = bobby::hermeneutic::aggregator::Aggregator::NewStub(channel);
+    grpc::ClientContext context;
+    bobby::hermeneutic::aggregator::SubscribeL2DiffRequest request;
+    fill_wire_book_id(request.mutable_book(), TestBookId());
+    auto reader = stub->SubscribeL2Diff(&context, request);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<L2Update> updates;
+    // Set once DEPTH1's own bridge (index 1 below - the only broadcast
+    // from the first batch, since its ApplySnapshot was rejected) has been
+    // observed - by then the nested on_disconnected() resync has already
+    // run (it happens earlier in the same batch, before this ApplyDelta),
+    // so it's safe to send DEPTH2 for the second snapshot to bridge. See
+    // run_fake_ws_server_two_messages_gated's own comment.
+    std::atomic<bool> first_batch_done{false};
+    std::thread reader_thread([&] {
+        L2Update update;
+        while (reader->Read(&update)) {
+            std::lock_guard lock(mutex);
+            updates.push_back(update);
+            if (updates.size() == 2) first_batch_done.store(true);
+            cv.notify_all();
+        }
+    });
+    struct ReaderThreadGuard {
+        grpc::ClientContext& context;
+        std::thread& thread;
+        ~ReaderThreadGuard() {
+            context.TryCancel();
+            if (thread.joinable()) thread.join();
+        }
+    } reader_guard{context, reader_thread};
+
+    auto wait_for = [&](std::size_t index) -> L2Update {
+        std::unique_lock lock(mutex);
+        cv.wait_for(lock, std::chrono::seconds(10), [&] { return updates.size() > index; });
+        return updates.at(index);
+    };
+    wait_for(0);  // initial (empty) snapshot
+
+    // DEPTH1 (final_id=110) bridges the first (malformed) snapshot below.
+    // DEPTH2 (held back until first_batch_done) bridges the second,
+    // well-formed one.
+    net::io_context io;
+    net::ip::tcp::acceptor ws_acceptor(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    unsigned short ws_port = ws_acceptor.local_endpoint().port();
+    net::co_spawn(io,
+                  run_fake_ws_server_two_messages_gated(std::move(ws_acceptor), "DEPTH:BTCUSDT:100:110:0:100.0:7.0",
+                                                          "DEPTH:BTCUSDT:151:160:0:100.0:3.0", &first_batch_done),
+                  fail_test_on_exception("ws server"));
+
+    // First response (last_update_id=105, bridging DEPTH1): bid size is
+    // -1.0 - AggregateOrderBook::apply_snapshot() rejects the whole batch
+    // for a malformed level, so this produces no broadcast at all. Second
+    // (last_update_id=155, only requested because of the fix under test):
+    // well-formed, bridges DEPTH2.
+    net::ip::tcp::acceptor http_acceptor(io.get_executor(),
+                                         net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    unsigned short http_port = http_acceptor.local_endpoint().port();
+    net::co_spawn(io,
+                  run_fake_http_server_twice(std::move(http_acceptor), "105:100.0:-1.0", "155:100.0:9.0",
+                                              std::chrono::milliseconds(300)),
+                  fail_test_on_exception("http server"));
+
+    FakeFeed feed(std::to_string(ws_port), std::to_string(http_port));
+    SymbolRegistry<SymbolBook> registry;
+    registry.add("BTCUSDT", service.book(TestBookId()));
+    VenueSession<FakeFeed, BinanceFuturesSequencePolicy, beast::tcp_stream, SymbolBook> session(
+        std::move(feed), kFakeVenue, symbols, std::move(registry), io.get_executor());
+    session.start(fail_test_on_exception("session"));
+
+    // Two full REST round trips (not just one), plus the gating poll -
+    // more headroom than this file's other single-round-trip tests need.
+    io.run_for(std::chrono::seconds(4));
+
+    // seq 1: ApplyDelta from DEPTH1's own bridge (bid 7.0) - no preceding
+    // ApplySnapshot broadcast, since that action was rejected; the batch's
+    // remaining action still applies (see
+    // RejectedActionMidBatchStillLetsLaterActionsInTheSameBatchApply).
+    L2Update after_delta = wait_for(1);
+    ASSERT_TRUE(after_delta.has_diff());
+    ASSERT_EQ(after_delta.diff().bids_size(), 1);
+    EXPECT_EQ(after_delta.diff().bids(0).size_raw(), Size(7.0).raw());
+
+    // seq 2: ApplySnapshot from the second REST fetch (bid 9.0) - proves
+    // resync_rest_venue_after_gap() actually gets reached from this
+    // trigger point; without it, nothing would ever re-request a
+    // snapshot and this wait_for(2) times out. seq 3: ApplyDelta from
+    // DEPTH2's own bridge (bid 3.0).
+    L2Update second_snapshot = wait_for(2);
+    ASSERT_TRUE(second_snapshot.has_diff());
+    EXPECT_EQ(second_snapshot.diff().bids(0).size_raw(), Size(9.0).raw());
+    L2Update second_delta = wait_for(3);
+    ASSERT_TRUE(second_delta.has_diff());
+    EXPECT_EQ(second_delta.diff().bids(0).size_raw(), Size(3.0).raw());
+
+    context.TryCancel();
+    if (reader_thread.joinable()) reader_thread.join();
+    server->Shutdown();
 }
 
 }  // namespace

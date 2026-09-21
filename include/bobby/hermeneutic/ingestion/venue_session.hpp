@@ -421,18 +421,24 @@ class VenueSession {
     // premise kTrustsConnectionOrder relies on, so every other symbol
     // sharing this connection needs the same fresh start.
     //
-    // The one place the "does this gap mean force a reconnect" condition is
-    // written - both call sites below (this one and handle_request_snapshot())
-    // need it, but reach a differing termination mechanism afterward
-    // (throw vs. emit() - see each's own comment for why they can't share
-    // that part too), so a future change to the condition itself (e.g.
-    // narrowing it to only genuine sequence gaps) only has one place to
-    // update, not two that could quietly drift apart.
-    static constexpr bool should_force_reconnect(bool gap_detected) {
-        if constexpr (Policy::kTrustsConnectionOrder) {
-            return gap_detected;
-        } else {
-            return false;
+    // Re-requests a snapshot directly for a kTrustsConnectionOrder == false
+    // venue after a gap, since nothing else ever would: VenueSession never
+    // forces a reconnect for these venues (see the kTrustsConnectionOrder
+    // == true branch at each caller below), and on_connected() - the only
+    // other thing that ever emits RequestSnapshot - only fires on a *real*
+    // reconnect, which a gap alone doesn't trigger. Mirrors on_connected()'s
+    // own "Buffering and not yet requested" logic directly rather than
+    // SymbolSync hand-writing a second copy of that same rule internally (a
+    // /code-review finding on an earlier version of this fix, where
+    // SymbolSync::handle_gap() itself branched on kTrustsConnectionOrder -
+    // moved here so this is the *only* place that decision is made, not
+    // split across two files/abstraction levels, which is what let a
+    // fourth trigger point for this same bug class, the apply_failed
+    // resync below, fall through the cracks when the other three were
+    // fixed - see docs/ingestion_design.md).
+    net::awaitable<void> resync_rest_venue_after_gap(const NativeSymbol& symbol) {
+        if (auto it = symbol_syncs_.find(symbol); it != symbol_syncs_.end()) {
+            co_await execute_actions(symbol, it->second.on_connected());
         }
     }
 
@@ -443,14 +449,20 @@ class VenueSession {
     // co_await'ed by run() - see execute_action()'s RequestSnapshot
     // branch), so it can't use this: a throw there would only reach its own
     // completion handler, which logs and discards it rather than
-    // forwarding it anywhere run() would see. It calls execute_actions()
-    // directly instead and forces the reconnect itself - see there.
+    // forwarding it anywhere run() would see. It has its own near-identical
+    // wrapper below that emits instead of throwing for the
+    // kTrustsConnectionOrder == true case, but shares
+    // resync_rest_venue_after_gap() for the other one - see there for why
+    // that part isn't split in two either.
     net::awaitable<void> execute_actions_and_maybe_force_reconnect(const NativeSymbol& symbol,
                                                                      std::vector<SyncAction> actions) {
         bool gap_detected = co_await execute_actions(symbol, std::move(actions));
-        if (should_force_reconnect(gap_detected)) {
+        if (!gap_detected) co_return;
+        if constexpr (Policy::kTrustsConnectionOrder) {
             throw std::runtime_error(
                 "SymbolSync gap for a kTrustsConnectionOrder venue - forcing full reconnect");
+        } else {
+            co_await resync_rest_venue_after_gap(symbol);
         }
     }
 
@@ -583,15 +595,20 @@ class VenueSession {
 
         // A rejected level means this venue's data for `symbol` can no
         // longer be trusted - same reasoning as a lost connection (see
-        // AggregateOrderBook::invalidate_venue()'s own doc comment) - so
-        // this is handled exactly like on_disconnected() handles one:
-        // invalidate this venue's contribution and reset SymbolSync back
-        // to Buffering, via the same InvalidateVenue action path already
-        // above (SymbolSync::on_disconnected() is scoped to one symbol,
-        // unlike VenueSession::invalidate_all()). Logged here, not inside
-        // the visitor, since std::cerr is fine to call from a plain
-        // function but this project's convention (see log_exception) is
-        // to keep I/O out of the visitor itself.
+        // AggregateOrderBook::invalidate_venue()'s own doc comment), so
+        // this goes through SymbolSync::on_disconnected() exactly like a
+        // real drop does - it stays a plain InvalidateVenue either way;
+        // what a kTrustsConnectionOrder == false venue does in response
+        // (re-request a snapshot, since the connection is presumably
+        // still up and no reconnect is coming to trigger one otherwise) is
+        // decided once, centrally, by resync_rest_venue_after_gap() at the
+        // outermost caller below - not duplicated into SymbolSync itself
+        // (see that method's own comment for why: splitting the decision
+        // across both files is exactly what let this trigger point go
+        // unfixed the first two times this same bug class got fixed).
+        // Logged here, not inside the visitor, since std::cerr is fine to
+        // call from a plain function but this project's convention (see
+        // log_exception) is to keep I/O out of the visitor itself.
         std::cerr << "[venue_session] " << symbol
                   << ": rejected level(s) from this venue (malformed data) - invalidating and "
                      "resyncing\n";
@@ -616,7 +633,7 @@ class VenueSession {
         // execute_actions_and_maybe_force_reconnect()/
         // handle_request_snapshot() started the whole batch) decides once,
         // after every action in it has actually run, whether to force a
-        // reconnect.
+        // reconnect or (kTrustsConnectionOrder == false) resync in place.
         if (auto it = symbol_syncs_.find(symbol); it != symbol_syncs_.end()) {
             bool nested_gap = co_await execute_actions(symbol, it->second.on_disconnected());
             co_return nested_gap;
@@ -659,13 +676,12 @@ class VenueSession {
             // working on a related connection-event/book-validity design
             // question, not by any test in this file.
             //
-            // Deliberately not should_force_reconnect()/run_sig_.emit():
-            // that gate is unconditionally false for every venue that can
-            // even reach this branch (kSnapshotViaRest == true implies
-            // kTrustsConnectionOrder == false), and this commit's own
-            // message already says why - a REST venue's fix is to retry in
-            // place, not tear down the whole connection (and every other
-            // symbol sharing it) over one HTTP failure. Reusing backoff()
+            // Deliberately not run_sig_.emit() (the kTrustsConnectionOrder
+            // == true treatment below): kSnapshotViaRest == true implies
+            // kTrustsConnectionOrder == false for every venue that can even
+            // reach this branch, and a REST venue's fix for a failed fetch
+            // is to retry in place, not tear down the whole connection (and
+            // every other symbol sharing it) over one HTTP failure. Reusing backoff()
             // (the same helper run()'s own reconnect loop uses) keeps this
             // consistent with that connection-level shape rather than
             // inventing a second one.
@@ -703,15 +719,21 @@ class VenueSession {
             // this path was covered, but nothing here ever forwarded the
             // exception anywhere that would force a reconnect).
             //
-            // A no-op today either way (kSnapshotViaRest == true never
-            // pairs with kTrustsConnectionOrder == true in this codebase,
-            // so gap_detected is always false here) - but on_snapshot() can
+            // A no-op today either way for the kTrustsConnectionOrder ==
+            // true branch (kSnapshotViaRest == true never pairs with
+            // kTrustsConnectionOrder == true in this codebase, so
+            // gap_detected is always false here) - but on_snapshot() can
             // return InvalidateVenue from its own bridge-tail gap check,
             // not just on_depth_update()'s Live-state one, so a future
             // venue combining both flags needs this to actually work, not
-            // just look like it does.
+            // just look like it does. The kTrustsConnectionOrder == false
+            // branch is very much live, though: this is exactly how a gap
+            // discovered while resyncing (not just the plain first-time
+            // fetch above) gets a *second* snapshot fetch requested for a
+            // REST venue.
             bool gap_detected = co_await execute_actions(symbol, it->second.on_snapshot(std::move(*snapshot)));
-            if (should_force_reconnect(gap_detected)) {
+            if (!gap_detected) co_return;
+            if constexpr (Policy::kTrustsConnectionOrder) {
                 // Same outcome as the thrown exception at every other call
                 // site (abort the in-flight read/backoff wait, land in
                 // run()'s catch, invalidate_all(), backoff, reconnect)
@@ -722,6 +744,8 @@ class VenueSession {
                 // directly here, with no net::post needed, is exactly as
                 // safe as stop()'s own emit() call.
                 run_sig_.emit(net::cancellation_type::terminal);
+            } else {
+                co_await resync_rest_venue_after_gap(symbol);
             }
         }
     }
