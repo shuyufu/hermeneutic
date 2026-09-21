@@ -57,6 +57,27 @@ class BasicFixedPoint {
         return from_raw(static_cast<raw_type>(value));
     }
 
+    // Same narrowing as from_raw_checked(), but for a caller with a genuine
+    // runtime-reachable overflow risk - std::errc::result_out_of_range
+    // instead of a debug-only assert. price_bands.hpp's offset_by_bps() is
+    // exactly that caller: this project validates no upper bound on Price
+    // anywhere (is_valid_level() only checks price > 0), so a boundary
+    // computed from an unbounded price and a large-but-otherwise-valid bps
+    // threshold is a real way to overflow raw_type, not a "no realistic
+    // input reaches this" case the way from_raw_checked()'s other call
+    // sites are - see offset_by_bps()'s own comment. Also what a caller
+    // accumulating many individually-valid values (e.g. price_band_depth()'s
+    // running cum_notional) uses to catch the running total itself
+    // overflowing, which from_raw_checked()'s per-call assert can't -
+    // each individual add can be in-range while the accumulated series
+    // isn't.
+    static constexpr std::expected<BasicFixedPoint, std::errc> from_raw_safe(__int128 value) noexcept {
+        constexpr __int128 kRawMax = static_cast<__int128>(std::numeric_limits<raw_type>::max());
+        constexpr __int128 kRawMin = static_cast<__int128>(std::numeric_limits<raw_type>::min());
+        if (value > kRawMax || value < kRawMin) return std::unexpected(std::errc::result_out_of_range);
+        return from_raw(static_cast<raw_type>(value));
+    }
+
     explicit constexpr BasicFixedPoint(double value) noexcept
         : raw_(static_cast<raw_type>(value * static_cast<double>(scale) +
                                       (value >= 0 ? 0.5 : -0.5))) {}
@@ -238,13 +259,19 @@ class BasicFixedPoint {
         return from_raw_checked(-static_cast<__int128>(raw_));
     }
 
+    // raw_ updated directly from the checked __int128 result, rather than
+    // `*this = *this + other`: the latter widens/checks/narrows via
+    // operator+ and then copy-assigns the whole (one-member) object back -
+    // an extra copy this hot path (e.g. price_bands.hpp's/volume_bands.hpp's
+    // per-level cum_size accumulation) doesn't need on top of the widen
+    // that's actually required for overflow safety.
     constexpr BasicFixedPoint& operator+=(BasicFixedPoint other) noexcept {
-        *this = *this + other;
+        raw_ = from_raw_checked(static_cast<__int128>(raw_) + static_cast<__int128>(other.raw_)).raw();
         return *this;
     }
 
     constexpr BasicFixedPoint& operator-=(BasicFixedPoint other) noexcept {
-        *this = *this - other;
+        raw_ = from_raw_checked(static_cast<__int128>(raw_) - static_cast<__int128>(other.raw_)).raw();
         return *this;
     }
 

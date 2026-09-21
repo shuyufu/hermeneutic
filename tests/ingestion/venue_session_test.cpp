@@ -1638,20 +1638,28 @@ TEST(VenueSessionTest, BackoffEscalatesAcrossRepeatedForcedReconnects) {
     auto interval_1_to_2 = connect_times[1] - connect_times[0];
     auto interval_2_to_3 = connect_times[2] - connect_times[1];
 
-    // attempt=1's backoff range, plus generous overhead margin for
-    // connect/subscribe/message round trips on top of the wait itself.
-    EXPECT_LT(interval_1_to_2, std::chrono::milliseconds(1800))
-        << "first reconnect should follow attempt=1's backoff, not something already escalated";
+    // Ratio-based, not tight absolute millisecond windows pinned to
+    // backoff()'s exact jittered ranges (a code-review finding: every other
+    // test in this file uses only generous, one-sided timeouts - 500ms to
+    // 10s - never a tight two-sided window like the ones this replaced).
+    // Connect/handshake/read overhead is roughly constant per reconnect
+    // cycle, so it shifts both intervals by about the same amount and
+    // mostly cancels out in their ratio, while the ratio itself still
+    // cleanly separates "escalated" (backoff()'s ~2x-per-attempt growth,
+    // still comfortably >1.4x after jitter) from "reset back to the fast
+    // retry every time" (~1x - the bug this fix addresses) under far more
+    // scheduling noise than a fixed millisecond threshold would tolerate.
+    EXPECT_GT(interval_2_to_3, interval_1_to_2 * 7 / 5)
+        << "backoff between successive forced reconnects should escalate roughly geometrically, not "
+           "stay flat";
 
-    // Comfortably between attempt=1's max (~1.2s, or ~1.8s with the same
-    // overhead margin above) and attempt=2's min (~2.0s): only reachable if
-    // the second forced reconnect actually escalated to attempt=2 rather
-    // than resetting back to attempt=1's fast retry.
-    EXPECT_GT(interval_2_to_3, std::chrono::milliseconds(1900))
-        << "second forced reconnect should follow attempt=2's escalated backoff, not reset back to "
-           "attempt=1's fast retry";
-    EXPECT_GT(interval_2_to_3, interval_1_to_2)
-        << "backoff between successive forced reconnects should grow, not stay flat";
+    // Loose sanity bounds, not tight ones: catch a fully broken run (a
+    // near-instant reconnect with no backoff wait at all, or a hang) without
+    // being sensitive to ordinary scheduling jitter.
+    EXPECT_GT(interval_1_to_2, std::chrono::milliseconds(200))
+        << "first reconnect happened suspiciously fast for any backoff wait at all";
+    EXPECT_LT(interval_2_to_3, std::chrono::seconds(6))
+        << "second forced reconnect took far longer than any expected backoff attempt";
 }
 
 }  // namespace

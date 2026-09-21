@@ -141,6 +141,12 @@ constexpr std::expected<Price, std::errc> vwap_at_partial_fill(Notional cum_noti
 // into cum_size with no corresponding notional, diluting the VWAP of any
 // later, legitimate crossing. Checking eagerly aborts on the first bad
 // level found rather than letting it silently corrupt later results.
+//
+// Also fails with std::errc::result_out_of_range if the running cum_notional
+// total itself overflows Notional while accumulating across levels: each
+// individual level's price*size can be in-range while the series still
+// isn't, which a plain per-call assert (BasicFixedPoint's own operator+=)
+// can't catch - see Notional::from_raw_safe()'s own comment.
 template <typename Map>
 std::expected<std::vector<VolumeBand>, std::errc> volume_band_prices(
     const Map& levels, std::span<const Notional> thresholds) {
@@ -161,8 +167,15 @@ std::expected<std::vector<VolumeBand>, std::errc> volume_band_prices(
 
         Notional level_notional = price * size;
 
-        while (next < thresholds.size() &&
-               cum_notional + level_notional >= thresholds[next]) {
+        // Checked once here, not as a plain `cum_notional + level_notional`
+        // repeated on every while-loop iteration below (that sum is
+        // loop-invariant within this level, so this also avoids redoing the
+        // same check) - see this function's own doc comment.
+        auto next_cum_notional = Notional::from_raw_safe(static_cast<__int128>(cum_notional.raw()) +
+                                                           static_cast<__int128>(level_notional.raw()));
+        if (!next_cum_notional) return std::unexpected(next_cum_notional.error());
+
+        while (next < thresholds.size() && *next_cum_notional >= thresholds[next]) {
             Notional remaining = thresholds[next] - cum_notional;
 
             std::expected<Price, std::errc> vwap;
@@ -189,7 +202,7 @@ std::expected<std::vector<VolumeBand>, std::errc> volume_band_prices(
             ++next;
         }
 
-        cum_notional += level_notional;
+        cum_notional = *next_cum_notional;
         cum_size += size;
     }
 

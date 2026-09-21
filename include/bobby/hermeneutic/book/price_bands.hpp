@@ -4,7 +4,6 @@
 #include <cassert>
 #include <cstddef>
 #include <expected>
-#include <limits>
 #include <span>
 #include <system_error>
 #include <type_traits>
@@ -51,7 +50,9 @@ namespace detail {
 // against a sufficiently large price is a real, externally-reachable way
 // to overflow the __int128 intermediate's narrowing back to raw_type, not
 // a "no realistic input reaches this" case the way every other
-// from_raw_checked() call site in this codebase is.
+// from_raw_checked() call site in this codebase is. Price::from_raw_safe()
+// is the shared bounds check for exactly this situation - see its own
+// comment.
 constexpr std::expected<Price, std::errc> offset_by_bps(Price price, int signed_bps,
                                                           bool round_down) noexcept {
     assert(price.raw() > 0);
@@ -68,10 +69,7 @@ constexpr std::expected<Price, std::errc> offset_by_bps(Price price, int signed_
     __int128 rounded = round_down ? scaled_numerator / denom
                                    : (scaled_numerator + denom - 1) / denom;
 
-    constexpr __int128 kRawMax = static_cast<__int128>(std::numeric_limits<Price::raw_type>::max());
-    constexpr __int128 kRawMin = static_cast<__int128>(std::numeric_limits<Price::raw_type>::min());
-    if (rounded > kRawMax || rounded < kRawMin) return std::unexpected(std::errc::result_out_of_range);
-    return Price::from_raw(static_cast<Price::raw_type>(rounded));
+    return Price::from_raw_safe(rounded);
 }
 
 // Exact membership test: price <= best_price*(10000+signed_bps)/10000
@@ -166,7 +164,11 @@ struct Bid {
 // against an (unbounded - this project validates no upper limit on price
 // anywhere) level price doesn't fit back into Price - see
 // offset_by_bps()'s own comment for why this is a real runtime
-// possibility here, not just an internal invariant.
+// possibility here, not just an internal invariant - or if the running
+// cum_notional total itself overflows Notional while accumulating across
+// levels: each individual price*size can be in-range while the series
+// still isn't, which a plain per-call assert (BasicFixedPoint's own
+// operator+=) can't catch - see Notional::from_raw_safe()'s own comment.
 template <typename Side, typename Map>
 std::expected<std::vector<PriceBand>, std::errc> price_band_depth(
     const Map& levels, std::span<const int> bps_thresholds) {
@@ -205,7 +207,15 @@ std::expected<std::vector<PriceBand>, std::errc> price_band_depth(
         if (next >= bps_thresholds.size()) break;
 
         cum_size += size;
-        cum_notional += price * size;
+        // Checked, not a plain `cum_notional += price * size`: the running
+        // total across many levels is the actual overflow risk, not any
+        // single level's own product (which is already bounds-checked, via
+        // from_raw_checked, inside operator*) - see this function's own
+        // doc comment.
+        auto next_cum_notional = Notional::from_raw_safe(static_cast<__int128>(cum_notional.raw()) +
+                                                           static_cast<__int128>((price * size).raw()));
+        if (!next_cum_notional) return std::unexpected(next_cum_notional.error());
+        cum_notional = *next_cum_notional;
     }
 
     while (next < bps_thresholds.size()) {

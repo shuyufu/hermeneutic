@@ -12,20 +12,30 @@ namespace bobby::hermeneutic {
 namespace {
 
 TEST(PriceBands, OffsetByBpsUpAndDown) {
-    EXPECT_EQ(*detail::offset_by_bps(Price(100.0), 50, /*round_down=*/true), Price(100.5));
-    EXPECT_EQ(*detail::offset_by_bps(Price(100.0), -50, /*round_down=*/false), Price(99.5));
-    EXPECT_EQ(*detail::offset_by_bps(Price(100.0), 0, /*round_down=*/true), Price(100.0));
+    auto up = detail::offset_by_bps(Price(100.0), 50, /*round_down=*/true);
+    auto down = detail::offset_by_bps(Price(100.0), -50, /*round_down=*/false);
+    auto zero = detail::offset_by_bps(Price(100.0), 0, /*round_down=*/true);
+    ASSERT_TRUE(up.has_value());
+    ASSERT_TRUE(down.has_value());
+    ASSERT_TRUE(zero.has_value());
+    EXPECT_EQ(*up, Price(100.5));
+    EXPECT_EQ(*down, Price(99.5));
+    EXPECT_EQ(*zero, Price(100.0));
 }
 
 TEST(PriceBands, OffsetByBpsRoundsInwardRatherThanToNearest) {
     // raw(5) * (10000 + 1000) = 55000, /10000 = 5.5 exactly: rounding down
     // (ask) keeps the boundary at 5, not 6 — 6 would be outside the true
     // 5.5 boundary.
-    EXPECT_EQ(detail::offset_by_bps(Price::from_raw(5), 1000, /*round_down=*/true)->raw(), 5);
+    auto ask = detail::offset_by_bps(Price::from_raw(5), 1000, /*round_down=*/true);
+    ASSERT_TRUE(ask.has_value());
+    EXPECT_EQ(ask->raw(), 5);
     // raw(6) * (10000 - 1000) = 54000, /10000 = 5.4: rounding up (bid)
     // keeps the boundary at 6, not 5 — 5 would be outside the true 5.4
     // boundary (5 < 5.4).
-    EXPECT_EQ(detail::offset_by_bps(Price::from_raw(6), -1000, /*round_down=*/false)->raw(), 6);
+    auto bid = detail::offset_by_bps(Price::from_raw(6), -1000, /*round_down=*/false);
+    ASSERT_TRUE(bid.has_value());
+    EXPECT_EQ(bid->raw(), 6);
 }
 
 // code-review finding: the bid side already rejects any threshold at or
@@ -370,6 +380,25 @@ TEST(PriceBands, RejectsNonPositivePriceLevelEvenWhenNotTheBest) {
     auto result = bid_price_band_depths(book, std::array{50});
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), std::errc::argument_out_of_domain);
+}
+
+// code-review finding: cum_notional accumulates via a checked add now (see
+// price_band_depth()'s own comment), not a plain operator+= - each level's
+// own price*size here is comfortably in range (~5e9, well under
+// Notional::raw_type's ~9.22e9 max), so this specifically exercises the
+// *running total* overflowing across levels, not any single level's own
+// product.
+TEST(PriceBands, CumulativeNotionalOverflowReportsOutOfRangeInsteadOfWrapping) {
+    L2OrderBook book;
+    book.asks[Price(1'000'000.0)] = Size(5'000.0);
+    book.asks[Price(1'000'001.0)] = Size(5'000.0);
+
+    // A huge ask bps threshold so both levels stay "within" it (see
+    // detail::within_bps()) and the checked accumulation runs for both,
+    // regardless of any boundary crossing.
+    auto result = ask_price_band_depths(book, std::array{1'000'000});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), std::errc::result_out_of_range);
 }
 
 }  // namespace

@@ -77,6 +77,33 @@ TEST(BasicFixedPoint, AddAndSubtractStayExactNearRawTypeBounds) {
     EXPECT_EQ(accumulator.raw(), kRawMax - 2);
 }
 
+// from_raw_safe() is from_raw_checked()'s runtime-checked twin - added for
+// price_bands.hpp's offset_by_bps() (a genuine runtime overflow risk, not
+// an internal invariant - see from_raw_safe()'s own comment) and reused by
+// price_band_depth()/volume_band_prices() for their own running-total
+// accumulation, instead of each duplicating the same __int128-vs-raw_type
+// bounds check by hand.
+TEST(BasicFixedPoint, FromRawSafeAcceptsInRangeAndRejectsOutOfRange) {
+    constexpr auto kRawMax = std::numeric_limits<Price::raw_type>::max();
+    constexpr auto kRawMin = std::numeric_limits<Price::raw_type>::min();
+
+    auto at_max = Price::from_raw_safe(static_cast<__int128>(kRawMax));
+    ASSERT_TRUE(at_max.has_value());
+    EXPECT_EQ(at_max->raw(), kRawMax);
+
+    auto at_min = Price::from_raw_safe(static_cast<__int128>(kRawMin));
+    ASSERT_TRUE(at_min.has_value());
+    EXPECT_EQ(at_min->raw(), kRawMin);
+
+    auto above_max = Price::from_raw_safe(static_cast<__int128>(kRawMax) + 1);
+    ASSERT_FALSE(above_max.has_value());
+    EXPECT_EQ(above_max.error(), std::errc::result_out_of_range);
+
+    auto below_min = Price::from_raw_safe(static_cast<__int128>(kRawMin) - 1);
+    ASSERT_FALSE(below_min.has_value());
+    EXPECT_EQ(below_min.error(), std::errc::result_out_of_range);
+}
+
 TEST(BasicFixedPoint, TotalOrdering) {
     Price low(1.0);
     Price high(2.0);
