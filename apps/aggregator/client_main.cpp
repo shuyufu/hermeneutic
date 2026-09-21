@@ -25,6 +25,7 @@
 #include <grpcpp/grpcpp.h>
 
 #include "apps/aggregator/book_id.hpp"
+#include "apps/aggregator/client_book.hpp"
 #include "bobby/hermeneutic/aggregator/aggregator.grpc.pb.h"
 #include "bobby/hermeneutic/symbol/symbol.hpp"
 
@@ -60,8 +61,10 @@ using bobby::hermeneutic::bid_price_band_depths;
 using bobby::hermeneutic::bid_volume_band_prices;
 
 using bobby::hermeneutic::aggregator::Aggregator;
+using bobby::hermeneutic::aggregator::apply_levels;
 using bobby::hermeneutic::aggregator::BboUpdate;
 using bobby::hermeneutic::aggregator::fill_wire_book_id;
+using bobby::hermeneutic::aggregator::is_book_seq_gap;
 using bobby::hermeneutic::aggregator::L2Update;
 using bobby::hermeneutic::aggregator::ListBooksRequest;
 using bobby::hermeneutic::aggregator::ListBooksResponse;
@@ -180,38 +183,6 @@ std::string format_price_bands(const std::vector<PriceBand>& bands) {
             << format_fixed(bands[i].cumulative_notional);
     }
     return out.str();
-}
-
-// Applies one side of a snapshot or diff onto the local book. A snapshot
-// level always replaces the side wholesale (hence `clear()` first, done by
-// the caller before the first side); a diff level is a replacement at that
-// price (size_raw > 0) or a removal (size_raw == 0) - same per-level rule
-// either way, see aggregator.proto's PriceLevel/L2Diff comment. `Levels` is
-// left as a template parameter (rather than naming the protobuf
-// RepeatedPtrField type) purely to avoid an extra include here.
-//
-// Deliberately does not validate price_raw/size_raw itself (unlike
-// AggregateOrderBook::apply_batch()'s is_valid_level() check on the
-// server side, which rejects a non-positive price or negative size
-// before it ever reaches a book): a wire-level malformed value here would
-// still get caught downstream, by price_band_depth()/volume_band_prices()
-// erroring out on the next print_bands() call - printing "ERROR" for that
-// side going forward rather than silently computing a wrong band. That's
-// an accepted, known-limited response (the bad level stays in the local
-// book forever; nothing here removes it or breaks the stream the way a
-// book_seq gap does), not an oversight - this is a diagnostic client, and
-// "ERROR" already surfaces the problem to whoever's watching it, which
-// was this fix's actual goal. A gap-triggered break()-out-of-read-loop
-// treatment for this case, if ever wanted, is future scope, not implied
-// by fixing the validation gap itself.
-template <typename Map, typename Levels>
-void apply_levels(Map& side, const Levels& levels) {
-    for (const auto& level : levels) {
-        Price price = Price::from_raw(level.price_raw());
-        Size size = Size::from_raw(level.size_raw());
-        if (size.raw() == 0) side.erase(price);
-        else side[price] = size;
-    }
 }
 
 class StreamCanceller;
@@ -494,7 +465,7 @@ void publish_l2_bands(Mode mode, const std::string& address, const BookId& book_
                 // tool doesn't resubscribe to recover (that needs a whole new
                 // RPC, not just a fresh snapshot on this one) - a GAP line is
                 // the operator's signal to restart it.
-                if (last_seq && diff.book_seq() != *last_seq + 1) {
+                if (is_book_seq_gap(last_seq, diff.book_seq())) {
                     ++gap_count;
                     std::ostringstream gap_line;
                     gap_line << "[" << label << " " << mode_tag << "] GAP: expected book_seq="

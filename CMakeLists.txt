@@ -336,6 +336,18 @@ if(HERMENEUTIC_BUILD_SERVICE)
             hermeneutic::book hermeneutic::proto hermeneutic::symbol GTest::gtest_main)
         gtest_discover_tests(hermeneutic_aggregator_service_test)
 
+        # apps/aggregator/client_book.hpp: apply_levels()/is_book_seq_gap(),
+        # split out of client_main.cpp's own anonymous namespace precisely so
+        # this target could exist - see client_book.hpp's own comment. Only
+        # needs hermeneutic::core (Price/Size), not proto/gRPC: `Levels` is a
+        # template parameter here too, so this test's FakeLevel stand-in is
+        # all that's required.
+        add_executable(hermeneutic_client_book_test tests/apps/aggregator/client_book_test.cpp)
+        target_include_directories(hermeneutic_client_book_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_link_libraries(hermeneutic_client_book_test PRIVATE
+            hermeneutic::core GTest::gtest_main)
+        gtest_discover_tests(hermeneutic_client_book_test)
+
         add_executable(hermeneutic_websocket_connection_test tests/net/websocket_connection_test.cpp)
         target_link_libraries(hermeneutic_websocket_connection_test PRIVATE
             hermeneutic::net GTest::gtest_main)
