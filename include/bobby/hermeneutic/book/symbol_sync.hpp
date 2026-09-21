@@ -112,7 +112,17 @@ class SymbolSync {
             return actions;
         }
 
-        std::vector<SyncAction> actions{ApplyDelta{std::move(update.bids), std::move(update.asks)}};
+        // Not `std::vector<SyncAction> actions{ApplyDelta{...}}`: a braced
+        // initializer-list constructor copy-constructs its element from the
+        // (necessarily const) std::initializer_list entry, so the
+        // std::move()s below would silently deep-copy update.bids/asks
+        // instead of moving them - the vector ends up with the right
+        // *values* either way, so nothing catches this by behavior, only by
+        // profiling or reading the generated code. emplace_back constructs
+        // the element in place from an rvalue, so the moves inside ApplyDelta
+        // actually move.
+        std::vector<SyncAction> actions;
+        actions.emplace_back(ApplyDelta{std::move(update.bids), std::move(update.asks)});
         last_final_id_ = update.final_id;
         return actions;
     }
@@ -164,7 +174,17 @@ class SymbolSync {
                 if (nothing_was_ever_buffered) {
                     last_final_id_ = snapshot.last_update_id;
                     state_ = State::Live;
-                    return {ApplySnapshot{std::move(snapshot.bids), std::move(snapshot.asks)}};
+                    // Not `return {ApplySnapshot{std::move(...)}};` - same
+                    // reasoning as on_depth_update()'s own comment above:
+                    // a braced initializer-list forces a copy of
+                    // snapshot.bids/asks here too, and this snapshot is a
+                    // full order book (hundreds to thousands of levels in
+                    // practice), not one diff's worth - the wasted copy is
+                    // much larger per occurrence than on_depth_update()'s,
+                    // even though this branch only runs once per connection.
+                    std::vector<SyncAction> actions;
+                    actions.emplace_back(ApplySnapshot{std::move(snapshot.bids), std::move(snapshot.asks)});
+                    return actions;
                 }
             }
             // No buffered event bridges this snapshot - either nothing
