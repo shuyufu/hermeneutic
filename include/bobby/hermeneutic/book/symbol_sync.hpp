@@ -103,13 +103,11 @@ class SymbolSync {
         }
 
         if (!SequencePolicy::is_contiguous(update, last_final_id_)) {
-            std::vector<SyncAction> actions{InvalidateVenue{}};
-            reset();
-            // This event may still be the one that bridges the *next*
-            // snapshot, so it's folded into the fresh buffer rather than
-            // discarded.
+            // buffer_ is always empty here (Live state never buffers) -
+            // push this gap-triggering event in first so handle_gap() has
+            // something to keep; buffer_.begin() then erases nothing.
             buffer_.push_back(std::move(update));
-            return actions;
+            return handle_gap(buffer_.begin());
         }
 
         // Not `std::vector<SyncAction> actions{ApplyDelta{...}}`: a braced
@@ -186,6 +184,31 @@ class SymbolSync {
                     actions.emplace_back(ApplySnapshot{std::move(snapshot.bids), std::move(snapshot.asks)});
                     return actions;
                 }
+                // A *non-empty* buffer that still doesn't bridge is the
+                // "genuinely unexpected" case flagged above - some event
+                // arrived despite this venue's ordering guarantee. Unlike
+                // kTrustsConnectionOrder == false (Binance), the plain
+                // RequestSnapshot retry below is a dead end here: it's a
+                // no-op for these venues (kSnapshotViaRest == false - see
+                // venue_session.hpp), so "stay in Buffering and ask for
+                // another one" would never actually get a fresh snapshot -
+                // this symbol would sit in Buffering forever with no
+                // further trigger short of an unrelated transport-level
+                // disconnect, the same "stuck forever" failure mode
+                // handle_gap()'s other two call sites exist to prevent
+                // (docs/ingestion_design.md 第 10 節第 8 項; caught by a
+                // second /code-review pass on this file's other two fixes,
+                // not by any test - the existing
+                // NonEmptyBufferThatDoesNotBridgeStillRetriesDespiteTrustingConnectionOrder
+                // test only ever checked SymbolSync's return value in
+                // isolation, never a driven-through-VenueSession scenario
+                // where that no-op RequestSnapshot's consequence would
+                // actually show up). Handled the same way as every other
+                // gap in this class: invalidate, reset, and keep whatever's
+                // left in `buffer_` around in case it bridges the *next*
+                // (post-reconnect) snapshot. buffer_.begin() erases
+                // nothing - the whole (post-drop-filter) buffer survives.
+                return handle_gap(buffer_.begin());
             }
             // No buffered event bridges this snapshot - either nothing
             // survived the drop filter, or everything that did starts
@@ -219,10 +242,39 @@ class SymbolSync {
 
         std::vector<SyncAction> actions;
         actions.emplace_back(ApplySnapshot{std::move(snapshot.bids), std::move(snapshot.asks)});
+
+        // bridge itself is only guaranteed to bridge the *snapshot*
+        // (SequencePolicy::bridges_snapshot) - nothing guarantees it's
+        // contiguous with whatever buffered event follows it. Two events
+        // that both survived should_drop_buffered's numeric filter can
+        // still have a real gap between them (e.g. a message this
+        // SymbolSync never saw - dropped upstream, or a parse failure the
+        // driver's read loop skipped). Replaying the tail blindly would
+        // silently apply across that gap and leave last_final_id_ pointing
+        // past it, so every subsequent on_depth_update() is_contiguous()
+        // check would pass despite the missing update. Every tail event
+        // except bridge itself - which is validated by bridges_snapshot(),
+        // not is_contiguous() - must pass the same is_contiguous() check
+        // on_depth_update() applies in Live state; `it != bridge` is what
+        // skips that check for exactly (and only) the first iteration,
+        // letting one loop apply the whole tail instead of bridge getting
+        // its own separate, near-identical copy of the apply step above it.
         for (auto it = bridge; it != buffer_.end(); ++it) {
+            if (it != bridge && !SequencePolicy::is_contiguous(*it, last_final_id_)) {
+                // Same treatment as on_depth_update()'s Live-state gap
+                // branch (handle_gap()): invalidate, reset, and keep
+                // everything from this point on (including the
+                // gap-triggering event) buffered - it may still bridge the
+                // *next* snapshot.
+                auto gap_actions = handle_gap(it);
+                actions.insert(actions.end(), std::make_move_iterator(gap_actions.begin()),
+                                std::make_move_iterator(gap_actions.end()));
+                return actions;
+            }
             last_final_id_ = it->final_id;
             actions.emplace_back(ApplyDelta{std::move(it->bids), std::move(it->asks)});
         }
+
         buffer_.clear();
         state_ = State::Live;
         return actions;
@@ -239,6 +291,32 @@ class SymbolSync {
 
   private:
     enum class State { Buffering, Live };
+
+    // Shared by on_depth_update()'s Live-state gap branch and both of
+    // on_snapshot()'s gap checks (no-bridge-with-a-non-empty-buffer, and
+    // bridge-tail) - all three need to invalidate, reset back to Buffering,
+    // and keep buffer_'s unresolved suffix around: it may still bridge the
+    // *next* snapshot. A single helper instead of each writing its own
+    // copy, so the three can't quietly drift out of sync on a future change
+    // to any one of them.
+    //
+    // Takes an iterator *into buffer_ itself* - everything from
+    // `first_unresolved` onward is what survives, and it's kept by erasing
+    // the already-resolved prefix in place rather than building a separate
+    // vector to swap in. That's not just tidiness: a venue like Bybit hits
+    // this path as a routine, not rare, event (see the callers' own
+    // comments), so the allocation/copy a separate vector would cost on
+    // every occurrence is worth avoiding. on_depth_update()'s call site has
+    // nothing yet in buffer_ to erase a prefix of (buffer_ is always empty
+    // in Live state) - it pushes its one gap-triggering event in first,
+    // then passes buffer_.begin(), making the erase a no-op.
+    std::vector<SyncAction> handle_gap(std::vector<DepthUpdate>::iterator first_unresolved) {
+        buffer_.erase(buffer_.begin(), first_unresolved);
+        state_ = State::Buffering;
+        last_final_id_ = 0;
+        snapshot_requested_ = false;
+        return {InvalidateVenue{}};
+    }
 
     void reset() {
         state_ = State::Buffering;

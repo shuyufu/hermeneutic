@@ -338,6 +338,90 @@ net::awaitable<void> run_fake_ws_server_drop_then_reconnect(net::ip::tcp::accept
     co_await ws.async_read(idle_buffer, net::redirect_error(net::use_awaitable, ec));
 }
 
+// First connection: pushes a snapshot, then a live depth update carrying a
+// sequencing gap, then holds the connection open (idle read) - deliberately
+// never closing it itself. If VenueSession doesn't force a reconnect after
+// the gap (the bug LiveGapForcesFullReconnectForTrustConnectionOrderVenue
+// below guards against), this idle read simply never completes and no
+// second connection ever arrives - the acceptor below blocks until the
+// test's io.run_for() deadline, and the test fails on a missing update
+// rather than hanging forever. Second connection: pushes a fresh,
+// non-gapped snapshot, proving the symbol actually resyncs once the client
+// itself tears down and reconnects.
+net::awaitable<void> run_fake_ws_server_live_gap_then_reconnect(net::ip::tcp::acceptor acceptor,
+                                                                  std::string snapshot,
+                                                                  std::string gapped_depth,
+                                                                  std::string second_snapshot) {
+    {
+        auto socket = co_await acceptor.async_accept(net::use_awaitable);
+        websocket::stream<net::ip::tcp::socket> ws(std::move(socket));
+        co_await ws.async_accept(net::use_awaitable);
+        beast::flat_buffer buffer;
+        co_await ws.async_read(buffer, net::use_awaitable);
+        co_await ws.async_write(net::buffer(snapshot), net::use_awaitable);
+        co_await ws.async_write(net::buffer(gapped_depth), net::use_awaitable);
+
+        beast::flat_buffer idle_buffer;
+        boost::system::error_code ec;
+        co_await ws.async_read(idle_buffer, net::redirect_error(net::use_awaitable, ec));
+    }  // Only reached once the client closes this connection.
+
+    auto socket = co_await acceptor.async_accept(net::use_awaitable);
+    websocket::stream<net::ip::tcp::socket> ws(std::move(socket));
+    co_await ws.async_accept(net::use_awaitable);
+    beast::flat_buffer buffer;
+    co_await ws.async_read(buffer, net::use_awaitable);
+    co_await ws.async_write(net::buffer(second_snapshot), net::use_awaitable);
+
+    beast::flat_buffer idle_buffer;
+    boost::system::error_code ec;
+    co_await ws.async_read(idle_buffer, net::redirect_error(net::use_awaitable, ec));
+}
+
+// For the RequestSnapshot/handle_request_snapshot() call site specifically
+// (FakeFeed's REST path), not the WS-push one above: sends two buffered
+// DEPTH events - the first bridges the snapshot the HTTP server below will
+// answer with, the second is a gap relative to it - then holds the
+// connection open, never closing it itself. `connect_count` is the actual
+// proof this test needs: without VenueSession forcing a reconnect after
+// on_snapshot()'s own bridge-tail gap check (reached only via
+// handle_request_snapshot(), which runs net::co_spawn'ed rather than
+// co_await'ed by run() - see execute_actions_and_maybe_force_reconnect()'s
+// own comment on why that call site can't just reuse it), nothing about the
+// L2Update sequence a subscriber sees would look any different - the
+// forced-reconnect exception this bug swallows never touches the book, only
+// whether a second connection happens at all.
+net::awaitable<void> run_fake_ws_server_rest_snapshot_gap_then_reconnect(net::ip::tcp::acceptor acceptor,
+                                                                           std::string bridge_depth,
+                                                                           std::string gapped_depth,
+                                                                           std::atomic<int>* connect_count) {
+    {
+        auto socket = co_await acceptor.async_accept(net::use_awaitable);
+        connect_count->fetch_add(1);
+        websocket::stream<net::ip::tcp::socket> ws(std::move(socket));
+        co_await ws.async_accept(net::use_awaitable);
+        beast::flat_buffer buffer;
+        co_await ws.async_read(buffer, net::use_awaitable);
+        co_await ws.async_write(net::buffer(bridge_depth), net::use_awaitable);
+        co_await ws.async_write(net::buffer(gapped_depth), net::use_awaitable);
+
+        beast::flat_buffer idle_buffer;
+        boost::system::error_code ec;
+        co_await ws.async_read(idle_buffer, net::redirect_error(net::use_awaitable, ec));
+    }  // Only reached once the client closes this connection.
+
+    auto socket = co_await acceptor.async_accept(net::use_awaitable);
+    connect_count->fetch_add(1);
+    websocket::stream<net::ip::tcp::socket> ws(std::move(socket));
+    co_await ws.async_accept(net::use_awaitable);
+    beast::flat_buffer buffer;
+    co_await ws.async_read(buffer, net::use_awaitable);  // the SUBSCRIBE message
+
+    beast::flat_buffer idle_buffer;
+    boost::system::error_code ec;
+    co_await ws.async_read(idle_buffer, net::redirect_error(net::use_awaitable, ec));
+}
+
 auto fail_test_on_exception(std::string_view label) {
     return [label](std::exception_ptr e) {
         if (!e) return;
@@ -901,6 +985,430 @@ TEST(VenueSessionTest, ReconnectRepeatsSnapshotPushedAsFirstMessageFlow) {
     ASSERT_TRUE(second_snapshot.has_diff());
     ASSERT_EQ(second_snapshot.diff().bids_size(), 1);
     EXPECT_EQ(second_snapshot.diff().bids(0).size_raw(), Size(9.0).raw());
+
+    context.TryCancel();
+    if (reader_thread.joinable()) reader_thread.join();
+    server->Shutdown();
+}
+
+// docs/ingestion_design.md 第 10 節第 8 項: a Live-state gap for a
+// kTrustsConnectionOrder venue (Bybit/OKX) used to leave the symbol stuck
+// in Buffering forever, because RequestSnapshot is a no-op for a Feed with
+// kSnapshotViaRest == false and nothing else ever re-requested one short of
+// an actual reconnect. This proves VenueSession itself now forces that
+// reconnect: the fake server below never closes the first connection on its
+// own (see its own comment) - a second connection only ever arrives if
+// VenueSession's execute_actions_and_maybe_force_reconnect() tears the first
+// one down.
+TEST(VenueSessionTest, LiveGapForcesFullReconnectForTrustConnectionOrderVenue) {
+    std::vector<std::string> symbols{"BTCUSDT"};
+    AggregatorService service(std::vector<BookId>{TestBookId()});
+
+    grpc::ServerBuilder builder;
+    int grpc_port = 0;
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &grpc_port);
+    builder.RegisterService(&service);
+    auto server = builder.BuildAndStart();
+    ASSERT_NE(server, nullptr);
+
+    auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(grpc_port),
+                                        grpc::InsecureChannelCredentials());
+    auto stub = bobby::hermeneutic::aggregator::Aggregator::NewStub(channel);
+    grpc::ClientContext context;
+    bobby::hermeneutic::aggregator::SubscribeL2DiffRequest request;
+    fill_wire_book_id(request.mutable_book(), TestBookId());
+    auto reader = stub->SubscribeL2Diff(&context, request);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<L2Update> updates;
+    std::thread reader_thread([&] {
+        L2Update update;
+        while (reader->Read(&update)) {
+            std::lock_guard lock(mutex);
+            updates.push_back(update);
+            cv.notify_all();
+        }
+    });
+    struct ReaderThreadGuard {
+        grpc::ClientContext& context;
+        std::thread& thread;
+        ~ReaderThreadGuard() {
+            context.TryCancel();
+            if (thread.joinable()) thread.join();
+        }
+    } reader_guard{context, reader_thread};
+
+    auto wait_for = [&](std::size_t index) -> L2Update {
+        std::unique_lock lock(mutex);
+        cv.wait_for(lock, std::chrono::seconds(10), [&] { return updates.size() > index; });
+        return updates.at(index);
+    };
+    wait_for(0);  // initial (empty) snapshot
+
+    // First connection: pushed snapshot (last_update_id=100, bid 100.0 ->
+    // 5.0), then a depth update whose final_id (105) isn't last_final_id+1
+    // (101) - a real gap under BybitSequencePolicy's is_contiguous(). Second
+    // connection (only reachable if VenueSession itself reconnects): a
+    // fresh snapshot (last_update_id=200, bid 100.0 -> 9.0).
+    net::io_context io;
+    net::ip::tcp::acceptor ws_acceptor(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    unsigned short ws_port = ws_acceptor.local_endpoint().port();
+    net::co_spawn(io,
+                  run_fake_ws_server_live_gap_then_reconnect(
+                      std::move(ws_acceptor), "SNAPSHOT:BTCUSDT:100:100.0:5.0",
+                      "DEPTH:BTCUSDT:105:105:0:100.0:1.0", "SNAPSHOT:BTCUSDT:200:100.0:9.0"),
+                  fail_test_on_exception("ws server"));
+
+    FakeFeedNoRest feed(std::to_string(ws_port));
+    SymbolRegistry<SymbolBook> registry;
+    registry.add("BTCUSDT", service.book(TestBookId()));
+    VenueSession<FakeFeedNoRest, BybitSequencePolicy, beast::tcp_stream, SymbolBook> session(
+        std::move(feed), kFakeVenue, symbols, std::move(registry), io.get_executor());
+    session.start(fail_test_on_exception("session"));
+
+    // >=1s reconnect backoff (see StopAbortsBackoffWaitAndDoesNotReconnect's
+    // own comment on that minimum) plus both connections' round trips.
+    io.run_for(std::chrono::seconds(4));
+
+    // seq 1: ApplySnapshot from the first pushed snapshot (bid 5.0).
+    L2Update first_snapshot = wait_for(1);
+    ASSERT_TRUE(first_snapshot.has_diff());
+    ASSERT_EQ(first_snapshot.diff().bids_size(), 1);
+    EXPECT_EQ(first_snapshot.diff().bids(0).size_raw(), Size(5.0).raw());
+
+    // seq 2: InvalidateVenue from the live gap - this venue's only
+    // contribution (bid @100.0) is reported removed (size_raw 0).
+    L2Update invalidated = wait_for(2);
+    ASSERT_TRUE(invalidated.has_diff());
+    ASSERT_EQ(invalidated.diff().bids_size(), 1);
+    EXPECT_EQ(invalidated.diff().bids(0).price_raw(), Price(100.0).raw());
+    EXPECT_EQ(invalidated.diff().bids(0).size_raw(), 0);
+
+    // seq 3: ApplySnapshot from the forced reconnect's fresh snapshot (bid
+    // 9.0) - proves the symbol actually left Buffering again, rather than
+    // sitting there forever waiting for a RequestSnapshot that would have
+    // been a no-op on the still-open first connection.
+    L2Update second_snapshot = wait_for(3);
+    ASSERT_TRUE(second_snapshot.has_diff());
+    ASSERT_EQ(second_snapshot.diff().bids_size(), 1);
+    EXPECT_EQ(second_snapshot.diff().bids(0).size_raw(), Size(9.0).raw());
+
+    context.TryCancel();
+    if (reader_thread.joinable()) reader_thread.join();
+    server->Shutdown();
+}
+
+// A second /code-review pass on the two fixes above found that the forced
+// reconnect only actually worked for 3 of its 4 call sites -
+// handle_request_snapshot() itself (RequestSnapshot's own fulfillment,
+// reached only for a Feed with kSnapshotViaRest == true) threw the same
+// exception the other 3 do, but that coroutine runs net::co_spawn'ed
+// detached rather than co_await'ed by run() - the exception only ever
+// reached its own completion handler (which logs and discards it), never
+// run()'s try/catch. This manufactures the one Feed/Policy combination
+// that exercises that call site - no shipped venue pairs kSnapshotViaRest
+// with kTrustsConnectionOrder today, but VenueSession's own driver logic
+// has to behave correctly if one ever does, and this proves it now does.
+TEST(VenueSessionTest, RestSnapshotBridgeTailGapForcesFullReconnectEvenThoughItsCoroutineIsDetached) {
+    std::vector<std::string> symbols{"BTCUSDT"};
+    AggregatorService service(std::vector<BookId>{TestBookId()});
+
+    grpc::ServerBuilder builder;
+    int grpc_port = 0;
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &grpc_port);
+    builder.RegisterService(&service);
+    auto server = builder.BuildAndStart();
+    ASSERT_NE(server, nullptr);
+
+    auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(grpc_port),
+                                        grpc::InsecureChannelCredentials());
+    auto stub = bobby::hermeneutic::aggregator::Aggregator::NewStub(channel);
+    grpc::ClientContext context;
+    bobby::hermeneutic::aggregator::SubscribeL2DiffRequest request;
+    fill_wire_book_id(request.mutable_book(), TestBookId());
+    auto reader = stub->SubscribeL2Diff(&context, request);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<L2Update> updates;
+    std::thread reader_thread([&] {
+        L2Update update;
+        while (reader->Read(&update)) {
+            std::lock_guard lock(mutex);
+            updates.push_back(update);
+            cv.notify_all();
+        }
+    });
+    struct ReaderThreadGuard {
+        grpc::ClientContext& context;
+        std::thread& thread;
+        ~ReaderThreadGuard() {
+            context.TryCancel();
+            if (thread.joinable()) thread.join();
+        }
+    } reader_guard{context, reader_thread};
+
+    // Two DEPTH events buffered while the REST snapshot fetch below is in
+    // flight: the first (final_id=101) bridges the snapshot's
+    // last_update_id=100 (101 == 100+1, BybitSequencePolicy's exact-+1
+    // bridge condition); the second (final_id=105) is a gap relative to it
+    // (105 != 101+1) - discovered only once on_snapshot() replays the
+    // buffered tail past the bridge event, exactly like
+    // BridgingSnapshotDetectsAGapBetweenTwoBufferedTailEvents in
+    // tests/book/symbol_sync_test.cpp, but reached here through
+    // VenueSession's real REST-fetch path instead of calling SymbolSync
+    // directly.
+    net::io_context io;
+    net::ip::tcp::acceptor ws_acceptor(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    unsigned short ws_port = ws_acceptor.local_endpoint().port();
+    std::atomic<int> connect_count{0};
+    net::co_spawn(io,
+                  run_fake_ws_server_rest_snapshot_gap_then_reconnect(
+                      std::move(ws_acceptor), "DEPTH:BTCUSDT:101:101:0:100.0:1.0",
+                      "DEPTH:BTCUSDT:105:105:0:100.0:2.0", &connect_count),
+                  fail_test_on_exception("ws server"));
+
+    net::ip::tcp::acceptor http_acceptor(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    unsigned short http_port = http_acceptor.local_endpoint().port();
+    net::co_spawn(io, run_fake_http_server(std::move(http_acceptor), "100:100.0:5.0"),
+                  fail_test_on_exception("http server"));
+
+    // FakeFeed (kSnapshotViaRest == true) paired with BybitSequencePolicy
+    // (kTrustsConnectionOrder == true) - the manufactured combination this
+    // test exists to exercise; see this test's own comment.
+    FakeFeed feed(std::to_string(ws_port), std::to_string(http_port));
+    SymbolRegistry<SymbolBook> registry;
+    registry.add("BTCUSDT", service.book(TestBookId()));
+    VenueSession<FakeFeed, BybitSequencePolicy, beast::tcp_stream, SymbolBook> session(
+        std::move(feed), kFakeVenue, symbols, std::move(registry), io.get_executor());
+    session.start(fail_test_on_exception("session"));
+
+    // >=1s reconnect backoff plus both connections' round trips (same
+    // budget as LiveGapForcesFullReconnectForTrustConnectionOrderVenue
+    // above).
+    io.run_for(std::chrono::seconds(4));
+
+    // The actual proof: without the fix, the forced-reconnect exception
+    // handle_request_snapshot() throws is silently swallowed by its own
+    // completion handler - the book-level effects (ApplySnapshot/ApplyDelta/
+    // InvalidateVenue all still execute, since they run *before* that
+    // exception is thrown) would look identical either way, so only the
+    // WS layer actually reconnecting - a second real TCP connection -
+    // distinguishes "fixed" from "silently broken."
+    EXPECT_EQ(connect_count.load(), 2);
+
+    context.TryCancel();
+    if (reader_thread.joinable()) reader_thread.join();
+    server->Shutdown();
+}
+
+// A third /code-review pass found on_snapshot()'s *other* no-bridge branch
+// (buffer non-empty at entry, but nothing in it bridges the snapshot - the
+// "some event arrived before the snapshot despite this venue's ordering
+// guarantee" case) still only ever returned RequestSnapshot, never
+// InvalidateVenue - for a kTrustsConnectionOrder venue that's the exact
+// same dead end the other two fixes in this commit exist to close
+// (RequestSnapshot is a no-op for these venues), just reached through
+// on_snapshot()'s no-bridge path instead of on_depth_update()'s live-gap
+// path or on_snapshot()'s bridge-tail path. Fixed in symbol_sync.hpp by
+// routing this branch through handle_gap() too. This test proves the
+// existing VenueSession-level plumbing (dispatch_snapshot()'s
+// execute_actions_and_maybe_force_reconnect(), unchanged by that fix) picks
+// up the new InvalidateVenue and forces a reconnect through it, the same
+// way it already does for the other two SymbolSync-level fixes - reusing
+// run_fake_ws_server_live_gap_then_reconnect with its two messages
+// reinterpreted: here the first message is a DEPTH event arriving *before*
+// any snapshot (violating BybitSequencePolicy's trust assumption on
+// purpose) and the second is a SNAPSHOT that doesn't bridge it, rather than
+// a snapshot followed by a live-state gap.
+TEST(VenueSessionTest, BufferingStateGapForcesFullReconnectForTrustConnectionOrderVenue) {
+    std::vector<std::string> symbols{"BTCUSDT"};
+    AggregatorService service(std::vector<BookId>{TestBookId()});
+
+    grpc::ServerBuilder builder;
+    int grpc_port = 0;
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &grpc_port);
+    builder.RegisterService(&service);
+    auto server = builder.BuildAndStart();
+    ASSERT_NE(server, nullptr);
+
+    auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(grpc_port),
+                                        grpc::InsecureChannelCredentials());
+    auto stub = bobby::hermeneutic::aggregator::Aggregator::NewStub(channel);
+    grpc::ClientContext context;
+    bobby::hermeneutic::aggregator::SubscribeL2DiffRequest request;
+    fill_wire_book_id(request.mutable_book(), TestBookId());
+    auto reader = stub->SubscribeL2Diff(&context, request);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<L2Update> updates;
+    std::thread reader_thread([&] {
+        L2Update update;
+        while (reader->Read(&update)) {
+            std::lock_guard lock(mutex);
+            updates.push_back(update);
+            cv.notify_all();
+        }
+    });
+    struct ReaderThreadGuard {
+        grpc::ClientContext& context;
+        std::thread& thread;
+        ~ReaderThreadGuard() {
+            context.TryCancel();
+            if (thread.joinable()) thread.join();
+        }
+    } reader_guard{context, reader_thread};
+
+    auto wait_for = [&](std::size_t index) -> L2Update {
+        std::unique_lock lock(mutex);
+        cv.wait_for(lock, std::chrono::seconds(10), [&] { return updates.size() > index; });
+        return updates.at(index);
+    };
+    wait_for(0);  // initial (empty) snapshot
+
+    // First connection: a DEPTH event (final_id=105) arrives before any
+    // snapshot - buffered while still Buffering. Then a SNAPSHOT
+    // (last_update_id=100) that this event doesn't bridge (bridges_snapshot
+    // needs final_id == 101; should_drop_buffered needs final_id <= 100 -
+    // neither holds for 105) - InvalidateVenue, per the fix under test.
+    // Because this venue never contributed anything before this point,
+    // that InvalidateVenue itself produces no observable book change
+    // (AggregateOrderBook::invalidate_venue() is a no-op for a venue with
+    // no existing entry) - the only way to observe whether the fix worked
+    // is whether a real reconnect (and the second connection's own fresh
+    // snapshot) ever happens at all.
+    net::io_context io;
+    net::ip::tcp::acceptor ws_acceptor(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    unsigned short ws_port = ws_acceptor.local_endpoint().port();
+    net::co_spawn(io,
+                  run_fake_ws_server_live_gap_then_reconnect(
+                      std::move(ws_acceptor), "DEPTH:BTCUSDT:105:105:0:100.0:1.0",
+                      "SNAPSHOT:BTCUSDT:100:100.0:5.0", "SNAPSHOT:BTCUSDT:200:100.0:9.0"),
+                  fail_test_on_exception("ws server"));
+
+    FakeFeedNoRest feed(std::to_string(ws_port));
+    SymbolRegistry<SymbolBook> registry;
+    registry.add("BTCUSDT", service.book(TestBookId()));
+    VenueSession<FakeFeedNoRest, BybitSequencePolicy, beast::tcp_stream, SymbolBook> session(
+        std::move(feed), kFakeVenue, symbols, std::move(registry), io.get_executor());
+    session.start(fail_test_on_exception("session"));
+
+    // Same budget as the other forced-reconnect tests in this file.
+    io.run_for(std::chrono::seconds(4));
+
+    // Without the fix: on_snapshot() returns only RequestSnapshot (a no-op
+    // for this venue), nothing ever gets applied or invalidated, no
+    // reconnect happens, and this wait_for(1) times out - the book stays
+    // permanently, silently empty. With the fix: exactly one more update
+    // arrives, from the second connection's own fresh snapshot (bid 9.0).
+    L2Update reconnected_snapshot = wait_for(1);
+    ASSERT_TRUE(reconnected_snapshot.has_diff());
+    ASSERT_EQ(reconnected_snapshot.diff().bids_size(), 1);
+    EXPECT_EQ(reconnected_snapshot.diff().bids(0).size_raw(), Size(9.0).raw());
+
+    context.TryCancel();
+    if (reader_thread.joinable()) reader_thread.join();
+    server->Shutdown();
+}
+
+// A book-level rejection (apply_failed) partway through a multi-action
+// batch used to abort the rest of that same batch for a
+// kTrustsConnectionOrder venue - execute_action()'s apply_failed branch
+// routed its own nested resync through the throwing
+// execute_actions_and_maybe_force_reconnect(), and that throw unwound
+// execute_actions()'s for-loop over the *outer* batch, skipping whatever
+// was still queued after the rejected action even though SymbolSync had
+// already computed it as valid, contiguous data. This constructs exactly
+// that batch shape: a rejected ApplySnapshot (index 0) followed by a valid
+// ApplyDelta (index 1) from a buffered event that bridges it.
+TEST(VenueSessionTest, RejectedActionMidBatchStillLetsLaterActionsInTheSameBatchApply) {
+    std::vector<std::string> symbols{"BTCUSDT"};
+    AggregatorService service(std::vector<BookId>{TestBookId()});
+
+    grpc::ServerBuilder builder;
+    int grpc_port = 0;
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &grpc_port);
+    builder.RegisterService(&service);
+    auto server = builder.BuildAndStart();
+    ASSERT_NE(server, nullptr);
+
+    auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(grpc_port),
+                                        grpc::InsecureChannelCredentials());
+    auto stub = bobby::hermeneutic::aggregator::Aggregator::NewStub(channel);
+    grpc::ClientContext context;
+    bobby::hermeneutic::aggregator::SubscribeL2DiffRequest request;
+    fill_wire_book_id(request.mutable_book(), TestBookId());
+    auto reader = stub->SubscribeL2Diff(&context, request);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<L2Update> updates;
+    std::thread reader_thread([&] {
+        L2Update update;
+        while (reader->Read(&update)) {
+            std::lock_guard lock(mutex);
+            updates.push_back(update);
+            cv.notify_all();
+        }
+    });
+    struct ReaderThreadGuard {
+        grpc::ClientContext& context;
+        std::thread& thread;
+        ~ReaderThreadGuard() {
+            context.TryCancel();
+            if (thread.joinable()) thread.join();
+        }
+    } reader_guard{context, reader_thread};
+
+    auto wait_for = [&](std::size_t index) -> L2Update {
+        std::unique_lock lock(mutex);
+        cv.wait_for(lock, std::chrono::seconds(10), [&] { return updates.size() > index; });
+        return updates.at(index);
+    };
+    wait_for(0);  // initial (empty) snapshot
+
+    // DEPTH sent *before* any snapshot - deliberately violates
+    // BybitSequencePolicy's usual "snapshot arrives first" assumption, so
+    // it lands in buffer_ while still Buffering. When the snapshot below
+    // then arrives, this buffered event bridges it (final_id=101 ==
+    // last_update_id 100 + 1) - on_snapshot() takes the bridge-found path,
+    // which always starts its returned batch with ApplySnapshot followed by
+    // this event's own ApplyDelta, regardless of kTrustsConnectionOrder
+    // (that flag's shortcut only ever fires from the *other*, no-bridge
+    // branch - see symbol_sync.hpp). The snapshot's own bid size (-1.0) is
+    // malformed - AggregateOrderBook::apply_snapshot() validates every
+    // level before applying any, so the whole ApplySnapshot action is
+    // rejected outright, with nothing broadcast for it.
+    net::io_context io;
+    net::ip::tcp::acceptor ws_acceptor(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    unsigned short ws_port = ws_acceptor.local_endpoint().port();
+    net::co_spawn(io,
+                  run_fake_ws_server_two_messages(std::move(ws_acceptor), "DEPTH:BTCUSDT:101:101:0:100.0:2.0",
+                                                   "SNAPSHOT:BTCUSDT:100:100.0:-1.0"),
+                  fail_test_on_exception("ws server"));
+
+    FakeFeedNoRest feed(std::to_string(ws_port));
+    SymbolRegistry<SymbolBook> registry;
+    registry.add("BTCUSDT", service.book(TestBookId()));
+    VenueSession<FakeFeedNoRest, BybitSequencePolicy, beast::tcp_stream, SymbolBook> session(
+        std::move(feed), kFakeVenue, symbols, std::move(registry), io.get_executor());
+    session.start(fail_test_on_exception("session"));
+
+    io.run_for(std::chrono::seconds(2));
+
+    // Without the fix: the rejected ApplySnapshot (index 0 of this batch)
+    // triggers a nested resync that throws immediately, aborting the batch
+    // before the buffered event's own ApplyDelta (index 1) ever runs - the
+    // book would never see this bid at all, and wait_for(1) below would
+    // time out. With the fix: the batch keeps going after the rejection,
+    // so this is the only update ever broadcast for this venue.
+    L2Update after_delta = wait_for(1);
+    ASSERT_TRUE(after_delta.has_diff());
+    ASSERT_EQ(after_delta.diff().bids_size(), 1);
+    EXPECT_EQ(after_delta.diff().bids(0).price_raw(), Price(100.0).raw());
+    EXPECT_EQ(after_delta.diff().bids(0).size_raw(), Size(2.0).raw());
 
     context.TryCancel();
     if (reader_thread.joinable()) reader_thread.join();

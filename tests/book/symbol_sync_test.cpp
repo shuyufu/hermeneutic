@@ -99,6 +99,44 @@ TEST(SymbolSyncTest, BridgingSnapshotAppliesSnapshotThenBufferedTailInOrder) {
               (std::vector<std::pair<Price, Size>>{{Price(4.0), Size(4.0)}}));
 }
 
+TEST(SymbolSyncTest, BridgingSnapshotDetectsAGapBetweenTwoBufferedTailEvents) {
+    // Both tail events individually survive should_drop_buffered (neither
+    // final_id is < the snapshot's last_update_id) and the first of the two
+    // bridges the snapshot - but there's a real gap between them (a message
+    // this SymbolSync never saw). Replaying the tail must catch this the
+    // same way on_depth_update() catches a Live-state gap, not silently
+    // apply across it.
+    Sync sync;
+    sync.on_connected();
+
+    // Bridges: first_id (151) <= 160 <= final_id (160), no +1 offset needed.
+    sync.on_depth_update(make_update(151, 160, 150, {{Price(2.0), Size(2.0)}}));
+    // Gap: prev_final_id (162) != the bridge event's final_id (160) - a
+    // message covering 161 was missed.
+    sync.on_depth_update(make_update(163, 165, 162, {}, {{Price(3.0), Size(3.0)}}));
+
+    auto actions = sync.on_snapshot(make_snapshot(160, {{Price(50.0), Size(5.0)}}));
+
+    // Snapshot applies, then the bridge event (contiguous with it by
+    // construction) - then the gap is caught before the second tail event is
+    // applied, not after.
+    ASSERT_EQ(kinds_of(actions), (std::vector{Kind::ApplySnapshot, Kind::ApplyDelta, Kind::InvalidateVenue}));
+    EXPECT_EQ(std::get<ApplyDelta>(actions[1]).bids,
+              (std::vector<std::pair<Price, Size>>{{Price(2.0), Size(2.0)}}));
+
+    // Back in Buffering: a fresh on_connected() must request a snapshot
+    // again, exactly like any other gap.
+    EXPECT_EQ(kinds_of(sync.on_connected()), (std::vector{Kind::RequestSnapshot}));
+
+    // The gap-triggering event must have been folded into the new buffer,
+    // not discarded - a snapshot landing inside its range bridges
+    // immediately.
+    auto resync_actions = sync.on_snapshot(make_snapshot(163));
+    ASSERT_EQ(kinds_of(resync_actions), (std::vector{Kind::ApplySnapshot, Kind::ApplyDelta}));
+    EXPECT_EQ(std::get<ApplyDelta>(resync_actions[1]).asks,
+              (std::vector<std::pair<Price, Size>>{{Price(3.0), Size(3.0)}}));
+}
+
 TEST(SymbolSyncTest, SnapshotThatDoesNotBridgeRetriesAndKeepsBufferedEvent) {
     Sync sync;
     sync.on_connected();
@@ -303,19 +341,36 @@ TEST(SymbolSyncBybitTest, SnapshotArrivingBeforeAnyBufferedEventGoesLiveDirectly
               (std::vector<std::pair<Price, Size>>{{Price(2.0), Size(2.0)}}));
 }
 
-TEST(SymbolSyncBybitTest, NonEmptyBufferThatDoesNotBridgeStillRetriesDespiteTrustingConnectionOrder) {
+TEST(SymbolSyncBybitTest, NonEmptyBufferThatDoesNotBridgeForcesAGapDespiteTrustingConnectionOrder) {
     // The empty-buffer branch is deliberately narrow: a *non-empty* buffer
     // that still doesn't bridge is not silently trusted just because this
     // policy sets kTrustsConnectionOrder - that would mean some event
-    // arrived before the snapshot despite Bybit's ordering guarantee,
-    // which is unexpected enough to fall back to the ordinary retry path
-    // rather than being papered over.
+    // arrived before the snapshot despite Bybit's ordering guarantee, which
+    // is unexpected enough to require a real resync. Unlike
+    // kTrustsConnectionOrder == false (Binance), a plain RequestSnapshot
+    // retry here would be a dead end: it's a no-op for this venue (its
+    // snapshot only ever arrives pushed on a fresh connection), so nothing
+    // would ever actually re-request - this must be InvalidateVenue, the
+    // same treatment as every other gap in this class (see handle_gap()'s
+    // own comment), not just a retry that papers over the eventual "stuck
+    // in Buffering forever" outcome. Caught by a /code-review pass, not by
+    // this test before it was rewritten - the previous version asserted
+    // exactly that dead-end RequestSnapshot-only behavior as correct.
     BybitSync sync;
     sync.on_connected();
     sync.on_depth_update(make_update(165, 165, /*prev_final_id=*/0));
 
     auto actions = sync.on_snapshot(make_snapshot(160));
-    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::RequestSnapshot}));
+    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::InvalidateVenue}));
+
+    // Reconnect-equivalent: state reset, so on_connected() must request a
+    // fresh snapshot again (not suppressed as "already requested").
+    EXPECT_EQ(kinds_of(sync.on_connected()), (std::vector{Kind::RequestSnapshot}));
+
+    // The buffered event must have been kept, not discarded - a snapshot
+    // landing inside its range now bridges immediately.
+    auto resync_actions = sync.on_snapshot(make_snapshot(164));
+    ASSERT_EQ(kinds_of(resync_actions), (std::vector{Kind::ApplySnapshot, Kind::ApplyDelta}));
 }
 
 TEST(SymbolSyncBybitTest, PostGapBufferedEventIsNotDiscardedByTheEmptyBufferShortcut) {
@@ -339,9 +394,13 @@ TEST(SymbolSyncBybitTest, PostGapBufferedEventIsNotDiscardedByTheEmptyBufferShor
 
     // A fresher snapshot arrives whose u+1 (161) doesn't match the
     // buffered event's u (105) - a real gap the buffered event doesn't
-    // bridge, not the "first message ever" case. Must retry, not apply.
+    // bridge, not the "first message ever" case. buffer_ was non-empty at
+    // entry (the re-buffered gap event), so this is InvalidateVenue - a
+    // plain RequestSnapshot retry would be a dead end for this venue (see
+    // NonEmptyBufferThatDoesNotBridgeForcesAGapDespiteTrustingConnectionOrder's
+    // own comment).
     auto actions = sync.on_snapshot(make_snapshot(160));
-    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::RequestSnapshot}));
+    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::InvalidateVenue}));
 }
 
 TEST(SymbolSyncBybitTest, DropBoundaryIsNonStrictLessThanOrEqualUnlikeFutures) {
@@ -352,9 +411,11 @@ TEST(SymbolSyncBybitTest, DropBoundaryIsNonStrictLessThanOrEqualUnlikeFutures) {
     sync.on_depth_update(make_update(160, 160, /*prev_final_id=*/0));
 
     // final_id (160) == last_update_id (160): dropped under Bybit's rule,
-    // so nothing survives to bridge - must retry, not apply.
+    // so nothing survives to bridge - but buffer_ was non-empty at entry
+    // (the on_depth_update() above), so this is the real-gap branch
+    // (InvalidateVenue), not the "nothing ever buffered" shortcut.
     auto actions = sync.on_snapshot(make_snapshot(160));
-    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::RequestSnapshot}));
+    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::InvalidateVenue}));
 }
 
 TEST(SymbolSyncBybitTest, BridgeIsExactUPlusOneNotARange) {
@@ -366,9 +427,11 @@ TEST(SymbolSyncBybitTest, BridgeIsExactUPlusOneNotARange) {
     sync.on_connected();
     sync.on_depth_update(make_update(165, 165, /*prev_final_id=*/0));
 
-    // Not a match: snapshot.last_update_id+1 (161) != this event's u (165).
+    // Not a match: snapshot.last_update_id+1 (161) != this event's u (165) -
+    // buffer_ non-empty at entry, so InvalidateVenue (see
+    // NonEmptyBufferThatDoesNotBridgeForcesAGapDespiteTrustingConnectionOrder).
     auto actions = sync.on_snapshot(make_snapshot(160));
-    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::RequestSnapshot}));
+    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::InvalidateVenue}));
 }
 
 TEST(SymbolSyncBybitTest, ExactUPlusOneBridgesAndContinuityUsesFinalIdEquality) {
@@ -436,7 +499,12 @@ TEST(SymbolSyncOkxTest, SnapshotArrivingBeforeAnyBufferedEventGoesLiveDirectly) 
               (std::vector<std::pair<Price, Size>>{{Price(2.0), Size(2.0)}}));
 }
 
-TEST(SymbolSyncOkxTest, NonEmptyBufferThatDoesNotBridgeStillRetriesDespiteTrustingConnectionOrder) {
+TEST(SymbolSyncOkxTest, NonEmptyBufferThatDoesNotBridgeForcesAGapDespiteTrustingConnectionOrder) {
+    // See BybitSequencePolicy's own version of this test for the full
+    // reasoning: a plain RequestSnapshot retry is a dead end for a
+    // kTrustsConnectionOrder venue (its snapshot only ever arrives pushed
+    // on a fresh connection), so this must be InvalidateVenue - a real
+    // resync, not just a retry.
     OkxSync sync;
     sync.on_connected();
     // Buffered, but neither dropped (final_id 15 is not < 5) nor bridging
@@ -444,7 +512,16 @@ TEST(SymbolSyncOkxTest, NonEmptyBufferThatDoesNotBridgeStillRetriesDespiteTrusti
     sync.on_depth_update(make_update(15, 15, /*prev_final_id=*/10));
 
     auto actions = sync.on_snapshot(make_snapshot(5));
-    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::RequestSnapshot}));
+    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::InvalidateVenue}));
+
+    // Reconnect-equivalent: state reset, so on_connected() must request a
+    // fresh snapshot again.
+    EXPECT_EQ(kinds_of(sync.on_connected()), (std::vector{Kind::RequestSnapshot}));
+
+    // The buffered event must have been kept, not discarded - a snapshot
+    // landing inside its range now bridges immediately.
+    auto resync_actions = sync.on_snapshot(make_snapshot(10));
+    ASSERT_EQ(kinds_of(resync_actions), (std::vector{Kind::ApplySnapshot, Kind::ApplyDelta}));
 }
 
 TEST(SymbolSyncOkxTest, PostGapBufferedEventIsNotDiscardedByTheEmptyBufferShortcut) {
@@ -458,10 +535,12 @@ TEST(SymbolSyncOkxTest, PostGapBufferedEventIsNotDiscardedByTheEmptyBufferShortc
     EXPECT_EQ(kinds_of(gap_actions), (std::vector{Kind::InvalidateVenue}));
 
     // A fresher snapshot (2000) drops that buffered event as stale
-    // (1000 < 2000) - buffer_ ends up empty *after* dropping, the same
-    // observable state as "nothing was ever buffered". Must still retry.
+    // (1000 < 2000) - buffer_ ends up empty *after* dropping, but was
+    // non-empty *at entry* (that's the whole point of this test - the
+    // empty-buffer shortcut must not be fooled by the post-drop state), so
+    // this is InvalidateVenue, not "nothing was ever buffered" territory.
     auto actions = sync.on_snapshot(make_snapshot(2000));
-    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::RequestSnapshot}));
+    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::InvalidateVenue}));
 }
 
 TEST(SymbolSyncOkxTest, DropBoundaryIsStrictLessThan) {
@@ -471,8 +550,11 @@ TEST(SymbolSyncOkxTest, DropBoundaryIsStrictLessThan) {
     // (should_drop_buffered is strict <, not <=).
     sync.on_depth_update(make_update(160, 160, /*prev_final_id=*/149));
 
+    // Survives the drop filter but doesn't bridge (prev_final_id 149 !=
+    // snapshot's last_update_id 160) - buffer_ was non-empty at entry, so
+    // InvalidateVenue.
     auto actions = sync.on_snapshot(make_snapshot(160));
-    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::RequestSnapshot}));
+    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::InvalidateVenue}));
 }
 
 TEST(SymbolSyncOkxTest, BridgeCanLandAfterAnEarlierNonBridgingSurvivorAcrossASequenceReset) {
@@ -516,9 +598,11 @@ TEST(SymbolSyncOkxTest, BridgeIsExactPrevSeqIdEqualityNotARange) {
     sync.on_depth_update(make_update(165, 165, /*prev_final_id=*/12));
 
     // Not a match: this event's prev_final_id (12) != snapshot's
-    // last_update_id (10).
+    // last_update_id (10) - buffer_ non-empty at entry, so InvalidateVenue
+    // (see
+    // NonEmptyBufferThatDoesNotBridgeForcesAGapDespiteTrustingConnectionOrder).
     auto actions = sync.on_snapshot(make_snapshot(10));
-    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::RequestSnapshot}));
+    EXPECT_EQ(kinds_of(actions), (std::vector{Kind::InvalidateVenue}));
 }
 
 // Traces the exact four-message worked example from OKX's own

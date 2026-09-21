@@ -21,6 +21,7 @@
 #include <iostream>
 #include <list>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -349,8 +350,80 @@ class VenueSession {
         }
     }
 
-    net::awaitable<void> execute_actions(const NativeSymbol& symbol, std::vector<SyncAction> actions) {
-        for (auto& action : actions) co_await execute_action(symbol, std::move(action));
+    // Executes every action in `actions`, always - never stops partway
+    // through just because an earlier one triggered a nested resync (see
+    // execute_action()'s own apply_failed branch) - and returns whether any
+    // of them, directly or via that nested resync, was InvalidateVenue.
+    // The caller decides what a true result means; execute_actions() itself
+    // has no policy-specific behavior.
+    net::awaitable<bool> execute_actions(const NativeSymbol& symbol, std::vector<SyncAction> actions) {
+        bool gap_detected = false;
+        for (auto& action : actions) {
+            if (co_await execute_action(symbol, std::move(action))) gap_detected = true;
+        }
+        co_return gap_detected;
+    }
+
+    // Executes `actions`, then - only for a SequencePolicy that trusts the
+    // WebSocket connection's own ordering to deliver its snapshot as the
+    // first message (kTrustsConnectionOrder) - forces this whole
+    // connection to drop and reconnect if any of them was InvalidateVenue.
+    //
+    // Why this is necessary: a Live-state gap (on_depth_update()) or a
+    // book-level rejection (execute_action()'s apply_failed branch) both
+    // reset the affected SymbolSync back to Buffering, but on_connected()
+    // is the only thing that ever re-requests a snapshot - and
+    // kTrustsConnectionOrder implies kSnapshotViaRest == false in this
+    // codebase (see symbol_sync.hpp's own doc comment), so RequestSnapshot
+    // on an already-open connection is a no-op. Without a genuine
+    // reconnect, this symbol would buffer live events forever and never
+    // resync (docs/ingestion_design.md 第 10 節第 8 項). A
+    // kTrustsConnectionOrder == false venue (Binance) keeps its own, less
+    // severe version of this limitation for now - its RequestSnapshot
+    // really does perform a REST fetch, so a future fix there can retry in
+    // place rather than tearing down the whole connection; that's out of
+    // scope here.
+    //
+    // Throwing rather than adding a dedicated SyncAction: this reuses
+    // run()'s existing reconnect machinery (backoff, invalidate_all() for
+    // every symbol this connection covers) verbatim - a
+    // kTrustsConnectionOrder venue's resync degrading to "reconnect the
+    // whole session" is already what a real disconnect does, and this is
+    // the same situation: one ordered stream per connection is the whole
+    // premise kTrustsConnectionOrder relies on, so every other symbol
+    // sharing this connection needs the same fresh start.
+    //
+    // The one place the "does this gap mean force a reconnect" condition is
+    // written - both call sites below (this one and handle_request_snapshot())
+    // need it, but reach a differing termination mechanism afterward
+    // (throw vs. emit() - see each's own comment for why they can't share
+    // that part too), so a future change to the condition itself (e.g.
+    // narrowing it to only genuine sequence gaps) only has one place to
+    // update, not two that could quietly drift apart.
+    static constexpr bool should_force_reconnect(bool gap_detected) {
+        if constexpr (Policy::kTrustsConnectionOrder) {
+            return gap_detected;
+        } else {
+            return false;
+        }
+    }
+
+    // Only usable by a caller that's directly co_await'ed from inside
+    // run()'s own try block (dispatch_snapshot()/dispatch_depth_update()) -
+    // the thrown exception needs run()'s try/catch to actually reach it.
+    // handle_request_snapshot() runs detached (net::co_spawn, not
+    // co_await'ed by run() - see execute_action()'s RequestSnapshot
+    // branch), so it can't use this: a throw there would only reach its own
+    // completion handler, which logs and discards it rather than
+    // forwarding it anywhere run() would see. It calls execute_actions()
+    // directly instead and forces the reconnect itself - see there.
+    net::awaitable<void> execute_actions_and_maybe_force_reconnect(const NativeSymbol& symbol,
+                                                                     std::vector<SyncAction> actions) {
+        bool gap_detected = co_await execute_actions(symbol, std::move(actions));
+        if (should_force_reconnect(gap_detected)) {
+            throw std::runtime_error(
+                "SymbolSync gap for a kTrustsConnectionOrder venue - forcing full reconnect");
+        }
     }
 
     // Named coroutines for the two ParsedMessage alternatives, rather than
@@ -360,17 +433,23 @@ class VenueSession {
         NativeSymbol symbol = message.symbol;
         auto it = symbol_syncs_.find(symbol);
         if (it == symbol_syncs_.end()) co_return;  // not ours
-        co_await execute_actions(symbol, it->second.on_snapshot(std::move(message)));
+        co_await execute_actions_and_maybe_force_reconnect(symbol, it->second.on_snapshot(std::move(message)));
     }
 
     net::awaitable<void> dispatch_depth_update(DepthUpdate message) {
         NativeSymbol symbol = message.symbol;
         auto it = symbol_syncs_.find(symbol);
         if (it == symbol_syncs_.end()) co_return;  // not ours
-        co_await execute_actions(symbol, it->second.on_depth_update(std::move(message)));
+        co_await execute_actions_and_maybe_force_reconnect(symbol, it->second.on_depth_update(std::move(message)));
     }
 
-    net::awaitable<void> execute_action(const NativeSymbol& symbol, SyncAction action) {
+    // Returns whether executing `action` means this symbol just saw
+    // InvalidateVenue - directly (the action itself) or via the nested
+    // resync the apply_failed branch below triggers. execute_actions()
+    // aggregates this across a whole batch; only its caller decides what a
+    // true result should do (see execute_actions_and_maybe_force_reconnect()
+    // and handle_request_snapshot()).
+    net::awaitable<bool> execute_action(const NativeSymbol& symbol, SyncAction action) {
         if (std::holds_alternative<RequestSnapshot>(action)) {
             // Spawned rather than co_await'ed: the snapshot fetch can take
             // a while, and the whole point of buffering is that live
@@ -384,7 +463,7 @@ class VenueSession {
             // fetch begun after that point would just be one more thing
             // drain_pending_snapshots() has to wait out below, for no
             // benefit (its result can never reach a live connection).
-            if (stopping_) co_return;
+            if (stopping_) co_return false;
 
             // Its own cancellation_signal, not run_sig_: a
             // cancellation_slot only forwards to the most recently bound
@@ -415,7 +494,7 @@ class VenueSession {
                     net::post(strand_, [this, sig_it] { snapshot_sigs_.erase(sig_it); });
                     log_exception("venue_session", "snapshot fetch failed", e);
                 }));
-            co_return;
+            co_return false;
         }
 
         // RequestSnapshot returned above before reaching here. Everything
@@ -442,6 +521,13 @@ class VenueSession {
         // be two independent per-side calls, which could do exactly that;
         // see AggregateOrderBook::apply_snapshot()'s own doc comment for
         // why it no longer can).
+        //
+        // Captured before std::visit() below moves out of `action`:
+        // holds_alternative() only inspects the active alternative, not the
+        // value, but checking it before the move keeps that non-dependency
+        // obvious rather than relying on it.
+        bool is_invalidate = std::holds_alternative<InvalidateVenue>(action);
+
         bool apply_failed = false;
         std::visit(
             [this, &symbol, &apply_failed](auto&& a) {
@@ -465,7 +551,7 @@ class VenueSession {
             },
             std::move(action));
 
-        if (!apply_failed) co_return;
+        if (!apply_failed) co_return is_invalidate;
 
         // A rejected level means this venue's data for `symbol` can no
         // longer be trusted - same reasoning as a lost connection (see
@@ -485,10 +571,29 @@ class VenueSession {
         // further: on_disconnected() only ever returns {InvalidateVenue{}},
         // and InvalidateVenue's own branch above never sets apply_failed,
         // so this nested execute_actions() call can't loop back into this
-        // same resync path again.
+        // same resync path again. Routed through the plain execute_actions()
+        // (which reports whether this nested resync was itself an
+        // InvalidateVenue - on_disconnected() always is), not the throwing
+        // execute_actions_and_maybe_force_reconnect(): this call can be
+        // reached partway through the *outer* batch execute_actions() is
+        // still iterating (e.g. this rejection was action 1 of 3 in a
+        // snapshot-bridge batch) - throwing here would abort that outer
+        // loop and skip whatever's still queued after this action, even
+        // though it was already fully computed as valid, contiguous data
+        // by SymbolSync before any of this ran (a real bug a second
+        // /code-review pass caught: throwing from inside a mid-batch nested
+        // call silently dropped the batch's remaining actions). Instead,
+        // this just reports the gap upward like any other action would, and
+        // the outermost caller (whichever of
+        // execute_actions_and_maybe_force_reconnect()/
+        // handle_request_snapshot() started the whole batch) decides once,
+        // after every action in it has actually run, whether to force a
+        // reconnect.
         if (auto it = symbol_syncs_.find(symbol); it != symbol_syncs_.end()) {
-            co_await execute_actions(symbol, it->second.on_disconnected());
+            bool nested_gap = co_await execute_actions(symbol, it->second.on_disconnected());
+            co_return nested_gap;
         }
+        co_return false;
     }
 
     // RequestSnapshot's fulfillment: for a Feed whose snapshot arrives over
@@ -529,7 +634,37 @@ class VenueSession {
 
             auto it = symbol_syncs_.find(symbol);
             if (it == symbol_syncs_.end()) co_return;
-            co_await execute_actions(symbol, it->second.on_snapshot(std::move(*snapshot)));
+            // Can't use execute_actions_and_maybe_force_reconnect() here -
+            // that throws to reach run()'s try/catch, but this coroutine is
+            // net::co_spawn'ed detached (see execute_action()'s
+            // RequestSnapshot branch), not co_await'ed by run(). A throw
+            // here would only reach this spawn's own completion handler
+            // (execute_action() above), which logs and discards it - it was
+            // never actually reaching run() at all (a bug a second
+            // /code-review pass caught: the comment this replaced claimed
+            // this path was covered, but nothing here ever forwarded the
+            // exception anywhere that would force a reconnect).
+            //
+            // A no-op today either way (kSnapshotViaRest == true never
+            // pairs with kTrustsConnectionOrder == true in this codebase,
+            // so gap_detected is always false here) - but on_snapshot() can
+            // return InvalidateVenue from its own bridge-tail gap check,
+            // not just on_depth_update()'s Live-state one, so a future
+            // venue combining both flags needs this to actually work, not
+            // just look like it does.
+            bool gap_detected = co_await execute_actions(symbol, it->second.on_snapshot(std::move(*snapshot)));
+            if (should_force_reconnect(gap_detected)) {
+                // Same outcome as the thrown exception at every other call
+                // site (abort the in-flight read/backoff wait, land in
+                // run()'s catch, invalidate_all(), backoff, reconnect)
+                // reached the other way: this coroutine runs on strand_
+                // itself (spawned via the executor obtained in
+                // execute_action(), which is strand_'s own executor there),
+                // the same strand stop() emits run_sig_ from - so emitting
+                // directly here, with no net::post needed, is exactly as
+                // safe as stop()'s own emit() call.
+                run_sig_.emit(net::cancellation_type::terminal);
+            }
         }
     }
 
