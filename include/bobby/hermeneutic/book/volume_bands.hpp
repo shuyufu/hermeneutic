@@ -12,6 +12,7 @@
 
 #include "bobby/hermeneutic/book/l2_order_book.hpp"
 #include "bobby/hermeneutic/core/notional.hpp"
+#include "bobby/hermeneutic/core/rounding.hpp"
 
 namespace bobby::hermeneutic {
 

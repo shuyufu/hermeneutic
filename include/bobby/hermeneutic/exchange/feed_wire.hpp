@@ -2,9 +2,6 @@
 
 #include <simdjson.h>
 
-#include <algorithm>
-#include <cstddef>
-#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -75,9 +72,16 @@ namespace bobby::hermeneutic::ingestion::detail {
 
 // Several venues (Binance, Bybit) send price/quantity as JSON strings, not
 // numbers, to avoid any floating-point ambiguity in the wire format itself.
-// A malformed string throws simdjson::simdjson_error so every parse
-// failure in a Feed header that calls this funnels through the same catch
-// site as every other simdjson error there.
+// The actual decimal-string parse is BasicFixedPoint::from_decimal_string
+// (core/fixed_point.hpp): a pure string -> fixed-point conversion with
+// nothing wire- or exchange-specific about it, so it lives there, not here
+// - see that function's own comment for the parsing rationale (grammar,
+// rounding, overflow bounds) and the 2026-09-19 double-precision
+// measurement that motivated it. This wrapper's only remaining job is the
+// wire-specific part: translating that venue-neutral std::expected failure
+// into simdjson::simdjson_error, so every parse failure in a Feed header
+// that calls this funnels through the same catch site as every other
+// simdjson error there.
 //
 // Shared here, not defined once per Feed header: VenueSession consumes
 // each Feed's parse_message()/parse_snapshot_response() duck-typed, so
@@ -86,153 +90,11 @@ namespace bobby::hermeneutic::ingestion::detail {
 // (server_main.cpp, once it wires up a second venue) would otherwise
 // get a duplicate-definition (ODR) error from two identical `namespace
 // bobby::hermeneutic::ingestion::detail { ... }` blocks.
-//
-// Parses a decimal string directly into FixedPointType's raw integer
-// scale, entirely in integer arithmetic. Replaces a previous
-// std::from_chars (string -> double) + FixedPointType(double)
-// (double -> raw int64, via `value * scale + 0.5`) two-step path: a
-// 2026-09-19 measurement found the first step safe below 15 total
-// significant digits, unsafe above it (see this file's own git history
-// for the brute-force numbers) - but that measurement covered only the
-// first step. The second step - BasicFixedPoint(double)'s own
-// `value * scale + 0.5` - is an independent double-precision multiply
-// with its own rounding error, unmeasured by that first pass and not
-// fixed by improving the first step alone. Removing the double
-// intermediate entirely, not just narrowing one of its two uses, is the
-// only way to close both at once. No other production call site should
-// route wire-parsed price/size text through FixedPointType(double) again -
-// that constructor is still used elsewhere (e.g.
-// apps/aggregator/client_main.cpp's compile-time volume-band threshold
-// literals like Notional(1e6), which are exact in double and never came
-// off a wire), just never again for text that did.
-//
-// Accepted grammar: an optional leading '-' (never '+' - verified
-// std::from_chars<double> itself rejects a leading '+', so dropping it
-// here isn't a narrowing versus the path this replaces), then digits,
-// optionally followed by '.' and more digits, with at least one digit
-// somewhere (rejects "", "-", ".", and "-."). Deliberately narrower than
-// std::from_chars<double>'s own grammar in two ways, both confirmed
-// safe: scientific notation ("1e5") is rejected as a format error -
-// every Binance/Bybit/OKX test fixture in this repo was checked and none
-// use it, so there is nothing real to support; and "nan"/"inf"/
-// "infinity" (which std::from_chars<double> parses successfully) are
-// rejected too - an incidental fix for a real, if never-observed-in-the-
-// wild, gap in the path this replaces: a feed sending literal "NaN" text
-// would previously parse into a double NaN, then into
-// `static_cast<raw_type>(NaN * scale + 0.5)`, which is undefined
-// behavior, not a caught parse error.
 template <typename FixedPointType>
 inline FixedPointType parse_decimal_string_to_fixed(std::string_view text) {
-    using Raw = typename FixedPointType::raw_type;
-    constexpr int kDecimals = FixedPointType::decimals;
-    constexpr Raw kScale = FixedPointType::scale;
-    constexpr __int128 kRawMax = static_cast<__int128>(std::numeric_limits<Raw>::max());
-
-    auto fail = [] { throw simdjson::simdjson_error(simdjson::NUMBER_ERROR); };
-
-    // Stripped before splitting on '.', and applied to the whole
-    // magnitude at the very end - not derived from int_part's own sign -
-    // so a value like "-0.5" (integer part "0") doesn't lose its sign.
-    std::string_view rest = text;
-    bool negative = false;
-    if (!rest.empty() && rest.front() == '-') {
-        negative = true;
-        rest.remove_prefix(1);
-    }
-
-    auto dot = rest.find('.');
-    std::string_view int_part = dot == std::string_view::npos ? rest : rest.substr(0, dot);
-    std::string_view frac_part =
-        dot == std::string_view::npos ? std::string_view{} : rest.substr(dot + 1);
-    if (int_part.empty() && frac_part.empty()) fail();  // "", "-", ".", "-."
-
-    // Integer part: digit validation and accumulation fused into one
-    // pass (each was previously a separate full pass over int_part - a
-    // code-review finding, since this parser runs on every price/size
-    // field of every venue's every message). Accumulated in a 128-bit
-    // intermediate. Bailing as soon as it exceeds Raw's own max (not
-    // Raw's max/scale - the final, tight bound is applied after scaling
-    // below) is a looser check, but it's what keeps this loop itself
-    // safe from ever overflowing __int128 on a maliciously long digit
-    // string: __int128 has roughly 20 more decimal digits of headroom
-    // than Raw::max, so this trips long before that could happen,
-    // however many digits `int_part` has.
-    unsigned __int128 int_value = 0;
-    for (char c : int_part) {
-        if (c < '0' || c > '9') fail();
-        int_value = int_value * 10 + static_cast<unsigned>(c - '0');
-        if (int_value > static_cast<unsigned __int128>(kRawMax)) fail();
-    }
-
-    // Fractional part: every character still has to be validated (this
-    // is untrusted wire text - "1.23abc" must still be rejected, not
-    // silently truncated to "1.23"), but only the first kDecimals+1
-    // characters are ever *accumulated*: under "round half up, ties
-    // away from zero", the single digit immediately after the cut point
-    // already fully determines the outcome (>=5 always rounds up
-    // regardless of what follows, since further digits can only make
-    // the discarded remainder larger, never pull it back under half;
-    // <=4 always rounds down for the same reason in reverse) - so
-    // digits beyond that one can never change the result. One pass
-    // over the whole of frac_part does both at once, rather than a full
-    // validation pass followed by a separate (shorter) accumulation
-    // pass - same fusion as int_part above, for the same reason.
-    std::size_t take = std::min(frac_part.size(), static_cast<std::size_t>(kDecimals) + 1);
-    __int128 frac_numerator = 0;
-    for (std::size_t i = 0; i < frac_part.size(); ++i) {
-        char c = frac_part[i];
-        if (c < '0' || c > '9') fail();  // also rejects a second '.', e.g. "1.2.3"
-        if (i < take) frac_numerator = frac_numerator * 10 + (c - '0');
-    }
-
-    __int128 frac_value;
-    if (frac_part.size() > static_cast<std::size_t>(kDecimals)) {
-        // Exactly kDecimals+1 digits were gathered - rescale by dividing
-        // out the extra one, rounding ties away from zero: the same
-        // helper/convention every other rescale in this project uses
-        // (see notional.hpp).
-        frac_value = bobby::hermeneutic::detail::round_div_nearest_away(frac_numerator, 10);
-    } else {
-        // kDecimals or fewer digits were present - `frac_numerator`
-        // already holds exactly `take` digits with nothing discarded;
-        // pad with zeros on the right to reach kDecimals digits.
-        frac_value = frac_numerator;
-        for (std::size_t i = take; i < static_cast<std::size_t>(kDecimals); ++i) frac_value *= 10;
-    }
-
-    // Rounding the fractional part up can carry into the integer part
-    // (e.g. "0.999" at 2 decimals rounds to "1.00") - round_div_nearest_
-    // away can push frac_value to exactly kScale (never beyond: the
-    // largest possible frac_numerator, kDecimals+1 nines, rounds to
-    // exactly 10^kDecimals), so a single carry is the only case to
-    // handle.
-    if (frac_value == static_cast<__int128>(kScale)) {
-        int_value += 1;
-        frac_value = 0;
-    }
-    // Re-checks the same loose bound as the accumulation loop above,
-    // now including the carry - only load-bearing for a hypothetical
-    // Decimals=0 type (where int_value IS the final magnitude, so a
-    // carry landing exactly on kRawMax needs to be caught here). For
-    // Price/Size (Decimals=9/6), int_value at this point is still many
-    // orders of magnitude below kRawMax whenever the final result is
-    // going to be valid at all - the real guard for those is the tight
-    // post-scale check just below, not this one.
-    if (int_value > static_cast<unsigned __int128>(kRawMax)) fail();
-
-    // Final, tight bound: against Raw::max after scaling, the actual
-    // overflow condition for the raw_type this returns (unlike the loose
-    // checks above, which only protect the accumulation loop itself and
-    // the Decimals=0 edge case). Applies the same bound to both signs
-    // rather than letting a negative result use Raw::min's one-unit-
-    // larger magnitude (two's complement) - real price/size data never
-    // comes remotely close to either bound, so this asymmetry has no
-    // practical effect, and treating both signs identically here is
-    // simpler than the alternative.
-    __int128 magnitude = static_cast<__int128>(int_value) * static_cast<__int128>(kScale) + frac_value;
-    if (magnitude > kRawMax) fail();
-
-    return FixedPointType::from_raw(static_cast<Raw>(negative ? -magnitude : magnitude));
+    auto result = FixedPointType::from_decimal_string(text);
+    if (!result) throw simdjson::simdjson_error(simdjson::NUMBER_ERROR);
+    return *result;
 }
 
 // Reads only the first two elements ([price, size, ...]) - deliberately
