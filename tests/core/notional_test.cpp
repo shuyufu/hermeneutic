@@ -189,5 +189,29 @@ TEST(Notional, RoundTripThroughMultiplyThenDivideIsNotAlwaysExact) {
     EXPECT_EQ(recovered_price->raw(), 1);  // this direction happens to land exactly
 }
 
+// Regression coverage for the #17 refactor: fixed_multiply/fixed_divide
+// (fixed_point.hpp) must generalize to a decimal width that has nothing to
+// do with Price/Size/Notional, not just the trio they were extracted from.
+// `Rate` is defined locally, here, rather than in production code - the
+// point is to prove the templates work for an arbitrary new width without
+// growing the production type surface just to demonstrate it.
+TEST(FixedPointArithmeticHelpers, GeneralizeToAFixedPointWidthOtherThanPriceSizeNotional) {
+    using Rate = BasicFixedPoint<8>;
+
+    // Rate(8) * Size(6) -> Notional(9): shift = 8 + 6 - 9 = 5.
+    // raw: 25'000 * 1'000'000'000 / 10^5 = 250'000'000.
+    Rate rate = Rate::from_raw(25'000);
+    Size size = Size::from_raw(1'000'000'000);
+    Notional product = detail::fixed_multiply<Rate, Size, Notional>(rate, size);
+    EXPECT_EQ(product.raw(), 250'000'000);
+    EXPECT_DOUBLE_EQ(product.to_double(), 0.25);
+
+    // Notional(9) / Rate(8) -> Size(6): shift = 6 + 8 - 9 = 5.
+    // raw: 250'000'000 * 10^5 / 25'000 = 1'000'000'000, recovering `size`.
+    auto recovered_size = detail::fixed_divide<Notional, Rate, Size>(product, rate);
+    ASSERT_TRUE(recovered_size.has_value());
+    EXPECT_EQ(recovered_size->raw(), size.raw());
+}
+
 }  // namespace
 }  // namespace bobby::hermeneutic

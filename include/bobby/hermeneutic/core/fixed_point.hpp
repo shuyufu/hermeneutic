@@ -250,4 +250,84 @@ class BasicFixedPoint {
 using Price = BasicFixedPoint<9>;
 using Size = BasicFixedPoint<6>;
 
+namespace detail {
+
+// 10^Exponent as a __int128, for rescaling between two BasicFixedPoint
+// widths in fixed_multiply/fixed_divide below. A template rather than a
+// runtime-argument function so the caller's own static_assert on Exponent's
+// range (see fixed_multiply/fixed_divide) happens before this ever runs.
+template <int Exponent>
+constexpr __int128 pow10() noexcept {
+    static_assert(Exponent >= 0, "pow10 exponent must be non-negative");
+    __int128 result = 1;
+    for (int i = 0; i < Exponent; ++i) result *= 10;
+    return result;
+}
+
+// Cross-width multiply: A::raw() * B::raw(), widened to __int128 for the
+// multiply itself (same reason as every other __int128 intermediate in this
+// codebase - the product can exceed raw_type's range even when both
+// operands and the final rescaled result fit), then rescaled down to
+// Result's precision and narrowed back via from_raw_checked. The rescale
+// direction (A::decimals + B::decimals - Result::decimals) is always a
+// right-shift (a division) for the type combinations this codebase actually
+// uses (Price*Size -> Notional, at scale 10^15 rescaled to Notional's
+// 10^9) - the static_assert below is what makes that a checked precondition
+// rather than an assumption.
+//
+// Deliberately kept in detail:: rather than exposed as a public, directly
+// callable helper: it's a building block for the explicit, individually-
+// declared operators in notional.hpp (and similar files), not a substitute
+// for declaring them. A public fixed_multiply<A, B, Result> would let any
+// caller instantiate a meaningless combination (fixed_multiply<Price,
+// Price, Notional>) that no operator* actually exposes - keeping it in
+// detail:: confines that possibility to this file's own operator
+// definitions, which only ever instantiate the combinations they declare.
+template <typename A, typename B, typename Result>
+constexpr Result fixed_multiply(A a, B b) noexcept {
+    constexpr int shift = A::decimals + B::decimals - Result::decimals;
+    static_assert(shift >= 0 && shift <= 19,
+                  "fixed_multiply needs a rescale this template can't do safely - "
+                  "write an explicit operator for this pairing instead");
+    __int128 raw_product = static_cast<__int128>(a.raw()) * static_cast<__int128>(b.raw());
+    if constexpr (shift == 0) {
+        return Result::from_raw_checked(raw_product);
+    } else {
+        return Result::from_raw_checked(round_div_nearest_away(raw_product, pow10<shift>()));
+    }
+}
+
+// Cross-width divide: Dividend::raw() / Divisor::raw() -> Result, rescaled
+// by 10^(Result::decimals + Divisor::decimals - Dividend::decimals) so the
+// integer division lands directly on Result's precision. Mirrors
+// fixed_multiply's shape and the same non-templated logic every
+// hand-written rescaling operator/ in notional.hpp used to repeat, and the
+// same detail:: reasoning as fixed_multiply above for why this isn't public.
+template <typename Dividend, typename Divisor, typename Result>
+constexpr std::expected<Result, std::errc> fixed_divide(Dividend a, Divisor b) noexcept {
+    // This rejects a non-positive divisor, but that's a domain judgment
+    // inherited from the types this is used with, not a property of
+    // division in general: Price, Size, and Notional are all non-negative
+    // quantities, so a non-positive divisor here always means malformed
+    // input (a default-constructed or corrupt value), not a legitimate
+    // signed division. It also happens to be what round_div_nearest_away
+    // below requires (a strictly positive denominator) - but that mechanical
+    // requirement is a coincidence of the current all-non-negative type set,
+    // not the reason for the check. A future signed Divisor type would need
+    // sign-normalization here instead of outright rejection - see
+    // round_div_nearest_away's own doc comment on the same distinction.
+    if (b.raw() <= 0) return std::unexpected(std::errc::argument_out_of_domain);
+
+    constexpr int shift = Result::decimals + Divisor::decimals - Dividend::decimals;
+    static_assert(shift >= 0 && shift <= 19,
+                  "fixed_divide needs a rescale this template can't do safely - "
+                  "write an explicit operator for this pairing instead");
+    __int128 numerator = static_cast<__int128>(a.raw());
+    if constexpr (shift > 0) numerator *= pow10<shift>();
+    return Result::from_raw_checked(
+        round_div_nearest_away(numerator, static_cast<__int128>(b.raw())));
+}
+
+}  // namespace detail
+
 }  // namespace bobby::hermeneutic
