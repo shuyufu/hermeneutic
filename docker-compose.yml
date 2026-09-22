@@ -88,11 +88,21 @@ services:
     image: aggregator-client-bbo
     command: ["aggregator-service:50051", "bbo", "0", "BTC_USDT.SPOT", "BTC_USDT.PERP"]
 
+  # To use custom notional thresholds instead of client_main.cpp's default
+  # 1M/5M/10M/25M/50M+, add a "--volume-thresholds=<n1,n2,...>" element to
+  # the command: list below - client_main.cpp accepts it anywhere on the
+  # command line (see its print_usage()/README.md's "Aggregator service"
+  # section for the exact syntax), e.g.:
+  #   command: ["aggregator-service:50051", "volume-bands", "0",
+  #             "--volume-thresholds=1000000,5000000,10000000,25000000,50000000",
+  #             "BTC_USDT.SPOT"]
   aggregator-client-volume-bands:
     <<: *client-base
     image: aggregator-client-volume-bands
     command: ["aggregator-service:50051", "volume-bands", "0", "BTC_USDT.SPOT"]
 
+  # Same idea for price-bands' bps thresholds, via "--price-bps=<b1,b2,...>"
+  # in place of client_main.cpp's default 50/100/200/500/1000+.
   aggregator-client-price-bands:
     <<: *client-base
     image: aggregator-client-price-bands

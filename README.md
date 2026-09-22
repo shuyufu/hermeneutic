@@ -280,6 +280,20 @@ after `up` starts only that one.
 docker compose --profile client up
 ```
 
+To use custom `--volume-thresholds=`/`--price-bps=` values instead of
+`client_main.cpp`'s defaults (see "Aggregator service" above for their
+syntax), add the flag as an extra element of the relevant service's
+`command:` list in `docker-compose.yml` - there's no separate env-var
+knob for this, the `command:` list is already the one place that
+controls it:
+
+```yaml
+aggregator-client-volume-bands:
+  command: ["aggregator-service:50051", "volume-bands", "0",
+            "--volume-thresholds=1000000,5000000,10000000,25000000,50000000",
+            "BTC_USDT.SPOT"]
+```
+
 To watch all four containers' stdout, either stay in that same foreground
 terminal - Compose interleaves every container's output there, each line
 prefixed with its service name - or run detached and follow each client
