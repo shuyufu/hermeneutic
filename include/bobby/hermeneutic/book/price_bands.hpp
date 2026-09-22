@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstddef>
 #include <expected>
+#include <functional>
 #include <span>
 #include <system_error>
 #include <type_traits>
@@ -106,7 +107,14 @@ constexpr bool within_bps(Price price, Price best_price, int signed_bps, bool ge
 // round_away (the boundary that overstates reach, rounding outward instead
 // of inward) has no caller today and is deliberately not implemented here --
 // add it only when something actually needs it.
+//
+// `expected_key_compare` names the map ordering price_band_depth() below
+// requires of a Map that has one at all (see its own static_assert): Ask
+// walks ascending (best ask first), Bid descending (best bid first). Kept
+// here rather than re-derived at the call site, so this file's one place
+// for "what does each side mean" doesn't grow a second, disconnected copy.
 struct Ask {
+    using expected_key_compare = std::less<Price>;
     static constexpr std::expected<Price, std::errc> round_inner(Price price, int bps) noexcept {
         return offset_by_bps(price, bps, /*round_down=*/true);
     }
@@ -116,6 +124,7 @@ struct Ask {
 };
 
 struct Bid {
+    using expected_key_compare = std::greater<Price>;
     static constexpr std::expected<Price, std::errc> round_inner(Price price, int bps) noexcept {
         return offset_by_bps(price, -bps, /*round_down=*/false);
     }
@@ -202,6 +211,31 @@ std::expected<std::vector<PriceBand>, std::errc> price_band_depth(
     const Map& levels, Price reference, std::span<const int> bps_thresholds) {
     static_assert(std::is_same_v<Side, detail::Ask> || std::is_same_v<Side, detail::Bid>,
                   "Side must be detail::Ask or detail::Bid");
+    // `Side::within()`'s true->false monotonicity as `levels` is walked
+    // (see this function's own doc comment on `next`) depends on `levels`
+    // being ordered to match `Side` (Side::expected_key_compare, see the
+    // Ask/Bid definitions above). Nothing else in this function checks
+    // that -- a caller that paired them backwards (e.g.
+    // price_band_depth<detail::Ask>(book.bids, ...)) would silently walk
+    // `levels` in the wrong direction and get a well-formed but wrong
+    // std::vector<PriceBand> back, not a compile or runtime error.
+    // bid_price_band_depths()/ask_price_band_depths() below always pair
+    // them correctly, so this only guards direct callers.
+    //
+    // Gated on Map actually having a `key_compare` (an associative
+    // container like std::map, which is what every real caller passes):
+    // this function's contract otherwise only requires `levels` to be
+    // iterable "best price first" (see this function's own doc comment
+    // above), which a plain sorted std::vector<std::pair<Price, Size>>
+    // satisfies without exposing an ordering type to check against, so
+    // that shape is left to the doc comment's precondition, unchecked,
+    // exactly as before this static_assert existed.
+    if constexpr (requires { typename Map::key_compare; }) {
+        static_assert(std::is_same_v<typename Map::key_compare, typename Side::expected_key_compare>,
+                      "Map's ordering must match Side: detail::Ask needs ascending order "
+                      "(std::less<Price>), detail::Bid needs descending order "
+                      "(std::greater<Price>)");
+    }
     if (!detail::bps_thresholds_valid<Side>(bps_thresholds)) {
         return std::unexpected(std::errc::invalid_argument);
     }
