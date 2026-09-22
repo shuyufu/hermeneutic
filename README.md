@@ -8,8 +8,10 @@ book over gRPC (`SubscribeL2Diff`/`SubscribeBbo`, plus a `ListBooks` query
 RPC for discovering which books a given instance serves) so downstream consumers
 never have to speak to an exchange directly. `hermeneutic_aggregator_client`
 is a minimal example consumer of that stream. See "Aggregator service"
-below for how the two run together, and `docs/ingestion_design.md` (中文)
-for the full design history and open questions.
+below for how the two run together, `docs/ingestion_design.md` (中文)
+for the full design history and open questions, and
+`docs/api_protocol_design.md` for the gRPC API/wire-protocol
+contract and how to extend it (new venues, new market types, new RPCs).
 
 ## Technical decisions
 
