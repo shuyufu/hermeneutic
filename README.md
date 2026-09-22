@@ -297,10 +297,12 @@ knob for this, the `command:` list is already the one place that
 controls it:
 
 ```yaml
-aggregator-client-volume-bands:
-  command: ["aggregator-service:50051", "volume-bands", "0",
-            "--volume-thresholds=1000000,5000000,10000000,25000000,50000000",
-            "BTC_USDT.SPOT"]
+# Only the command: line changes - <<: *client-base, image:, and every
+# other key on aggregator-client-volume-bands: stay exactly as they
+# already are in docker-compose.yml.
+command: ["aggregator-service:50051", "volume-bands", "0",
+          "--volume-thresholds=1000000,5000000,10000000,25000000,50000000",
+          "BTC_USDT.SPOT"]
 ```
 
 To watch all four containers' stdout, either stay in that same foreground

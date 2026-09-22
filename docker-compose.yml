@@ -81,8 +81,10 @@ services:
   # of "the service", so they're gated behind a profile: `docker compose up`
   # alone starts none of them, `docker compose --profile client up` starts
   # all three alongside aggregator-service. Each is
-  # `<address> <bbo|volume-bands|price-bands> <duration_seconds> <book...>`
-  # - see client_main.cpp / README.md's "Aggregator service" section.
+  # `<address> <bbo|volume-bands|price-bands> [--volume-thresholds=...]
+  # [--price-bps=...] <duration_seconds> <book...>` - see client_main.cpp /
+  # README.md's "Aggregator service" section (and the per-service comments
+  # below, for the two band-override flags specifically).
   aggregator-client-bbo:
     <<: *client-base
     image: aggregator-client-bbo
