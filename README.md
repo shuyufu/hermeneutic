@@ -192,16 +192,25 @@ past that point:
 
 ```sh
 cmake --build build-vcpkg --target hermeneutic_aggregator_client
-# <address> <bbo|volume-bands|price-bands> <duration_seconds> <book1> [book2 ...]
+# <address> <bbo|volume-bands|price-bands> [--volume-thresholds=<n1,n2,...>]
+#           [--price-bps=<b1,b2,...>] <duration_seconds> <book1> [book2 ...]
 # duration_seconds <= 0 runs until interrupted or the server ends the stream.
+# flags may appear anywhere on the command line.
 #   bbo:          subscribes to SubscribeBbo, prints best bid/ask
 #   volume-bands: subscribes to SubscribeL2Diff, prints the VWAP needed to
-#                 fill 1M/5M/10M/25M/50M+ notional on each side
+#                 fill 1M/5M/10M/25M/50M+ notional (default) on each side -
+#                 override via --volume-thresholds= (comma-separated,
+#                 ascending, strictly positive integers, no decimals/
+#                 scientific notation)
 #   price-bands:  subscribes to SubscribeL2Diff, prints depth within
-#                 50/100/200/500/1000+ bps of BBO on each side
+#                 50/100/200/500/1000+ bps (default) of BBO on each side -
+#                 override via --price-bps= (comma-separated, ascending,
+#                 in [0, 10000))
 ./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 bbo 60 BTC_USDT.SPOT BTC_USDT.PERP
 ./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 volume-bands 60 BTC_USDT.SPOT
 ./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 price-bands 60 BTC_USDT.SPOT
+./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 volume-bands \
+    --volume-thresholds=1000000,5000000,10000000,25000000,50000000 60 BTC_USDT.SPOT
 
 # <address> list - calls ListBooks and prints every book the server was
 # started with, one per line, then exits (no duration/book arguments).
