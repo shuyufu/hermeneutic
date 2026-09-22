@@ -230,6 +230,104 @@ TEST(SubscriberQueueTest, DropOldestOverflowKeepsNewestWithoutClosing) {
     EXPECT_EQ(out[1]->bbo().book_seq(), 3u);
 }
 
+// Fanout<T> itself, isolated from the SubscriberQueueTest cases above (each
+// of which drives one SubscriberQueue directly) and from every other test
+// in this file (which only ever exercises Fanout incidentally, through a
+// full gRPC fixture). `int` stands in for T - nothing here depends on it
+// being an L2Update/BboUpdate.
+//
+// broadcast() only pushes and reports which queues to wake - mirrors what
+// SymbolBook actually does with it (push under its own mutex_, notify()
+// each returned queue only after releasing it) so these tests drive the
+// exact call shape production code uses, not a shortcut that skips
+// notify() entirely.
+void broadcast_and_notify(Fanout<int>& fanout, int value) {
+    for (auto& queue : fanout.broadcast(std::make_shared<const int>(value))) queue->notify();
+}
+
+std::vector<int> dereferenced(const std::vector<std::shared_ptr<const int>>& ptrs) {
+    std::vector<int> values;
+    values.reserve(ptrs.size());
+    for (const auto& ptr : ptrs) values.push_back(*ptr);
+    return values;
+}
+
+TEST(FanoutTest, BroadcastDeliversToEverySubscriber) {
+    Fanout<int> fanout(4, OverflowPolicy::Close);
+    auto a = fanout.subscribe();
+    auto b = fanout.subscribe();
+
+    broadcast_and_notify(fanout, 1);
+    broadcast_and_notify(fanout, 2);
+
+    std::vector<std::shared_ptr<const int>> out;
+    EXPECT_EQ(a->wait_and_drain(std::chrono::milliseconds(10), out), SubscriberQueue<int>::DrainResult::Drained);
+    EXPECT_EQ(dereferenced(out), (std::vector<int>{1, 2}));
+
+    out.clear();
+    EXPECT_EQ(b->wait_and_drain(std::chrono::milliseconds(10), out), SubscriberQueue<int>::DrainResult::Drained);
+    EXPECT_EQ(dereferenced(out), (std::vector<int>{1, 2}));
+}
+
+TEST(FanoutTest, UnsubscribeStopsFutureBroadcastsToThatSubscriberOnly) {
+    Fanout<int> fanout(4, OverflowPolicy::Close);
+    auto a = fanout.subscribe();
+    auto b = fanout.subscribe();
+
+    broadcast_and_notify(fanout, 1);
+    fanout.unsubscribe(a);
+    broadcast_and_notify(fanout, 2);
+
+    std::vector<std::shared_ptr<const int>> out;
+    EXPECT_EQ(a->wait_and_drain(std::chrono::milliseconds(10), out), SubscriberQueue<int>::DrainResult::Drained);
+    EXPECT_EQ(dereferenced(out), (std::vector<int>{1}));  // unsubscribed before the second broadcast
+
+    out.clear();
+    EXPECT_EQ(b->wait_and_drain(std::chrono::milliseconds(10), out), SubscriberQueue<int>::DrainResult::Drained);
+    EXPECT_EQ(dereferenced(out), (std::vector<int>{1, 2}));
+}
+
+TEST(FanoutTest, UnsubscribingAQueueNeverRegisteredIsANoOp) {
+    Fanout<int> fanout(4, OverflowPolicy::Close);
+    auto a = fanout.subscribe();
+    auto stray = std::make_shared<SubscriberQueue<int>>(4, OverflowPolicy::Close);
+
+    fanout.unsubscribe(stray);  // never registered with this Fanout
+    broadcast_and_notify(fanout, 1);
+
+    std::vector<std::shared_ptr<const int>> out;
+    EXPECT_EQ(a->wait_and_drain(std::chrono::milliseconds(10), out), SubscriberQueue<int>::DrainResult::Drained);
+    EXPECT_EQ(dereferenced(out), (std::vector<int>{1}));
+}
+
+TEST(FanoutTest, OverflowClosesOneSubscriberWithoutAffectingAnother) {
+    Fanout<int> fanout(2, OverflowPolicy::Close);
+    auto steady = fanout.subscribe();
+    auto slow = fanout.subscribe();
+    steady->end_bootstrap();  // capacity/OverflowPolicy only apply after this
+    slow->end_bootstrap();
+
+    // `steady` drains between broadcasts (mirrors an actively-reading
+    // subscriber); `slow` never does, so its queue - not `steady`'s - is
+    // the one that overflows past capacity 2, proving overflow is a
+    // per-subscriber-queue outcome, not something Fanout applies globally.
+    std::vector<std::shared_ptr<const int>> drained;
+    for (int i = 0; i < 5; ++i) {
+        broadcast_and_notify(fanout, i);
+        steady->wait_and_drain(std::chrono::milliseconds(10), drained);
+    }
+    // `steady` actually received every broadcast value, in order - not
+    // just that its queue ends up empty (which a dropped/duplicated/
+    // reordered value would also produce, since draining a shorter or
+    // reshuffled sequence to nothing still leaves nothing queued).
+    EXPECT_EQ(dereferenced(drained), (std::vector<int>{0, 1, 2, 3, 4}));
+
+    std::vector<std::shared_ptr<const int>> out;
+    EXPECT_EQ(slow->wait_and_drain(std::chrono::milliseconds(10), out), SubscriberQueue<int>::DrainResult::Closed);
+    EXPECT_EQ(steady->wait_and_drain(std::chrono::milliseconds(10), out),
+              SubscriberQueue<int>::DrainResult::TimedOut);  // alive and empty, not closed
+}
+
 class AggregatorServiceTest : public ::testing::Test {
   protected:
     static BookId TestBook() { return BookId{BaseQuote{{"BTC"}, {"USDT"}}, MarketType::Spot}; }
@@ -753,6 +851,59 @@ TEST_F(AggregatorServiceTest, StuckSubscriberDoesNotBlockIngestionOrOtherSubscri
     updates_.wait_for(kUpdates);
 
     stuck_context.TryCancel();
+}
+
+// The other side of StuckSubscriberDoesNotBlockIngestionOrOtherSubscribers
+// above: that test deliberately stays under kSubscriberQueueCapacity so it
+// never has to depend on exactly when a non-draining subscriber's Write()
+// actually blocks, and already owns the "doesn't block other subscribers"
+// guarantee at a controlled volume - this test doesn't repeat that check
+// (a second copy of it here would only add another way for the same burst
+// to be flaky) and focuses purely on the actual client-visible contract - a
+// real RESOURCE_EXHAUSTED status - that no other test drives end-to-end.
+// gRPC's per-stream HTTP/2 flow control only grants the server more send
+// window as the client's transport processes ReadMessage completions, not
+// merely as bytes land on the wire - unlike Boost.Beast's WS-level ping,
+// which run_fake_ws_server's own comment (venue_session_test.cpp) notes
+// gets auto-answered independent of application-level reads. So a client
+// that truly never calls Read() stalls the server's Write() deterministically
+// once its share of the window (and any OS socket buffering beneath it) is
+// exhausted; from that point on, every further broadcast can only queue
+// (Fanout::broadcast() never blocks on Write()), and kUpdates is chosen
+// large enough to comfortably clear both that stall point and
+// kSubscriberQueueCapacity (256) on top of it - verified non-flaky over
+// repeated local runs, but stuck_context's deadline below is the actual
+// safety net: if a future gRPC/HTTP2 default ever grants a large enough
+// window that this burst doesn't stall Write() after all, this test fails
+// on DEADLINE_EXCEEDED instead of hanging forever. gRPC requires a
+// deadline to be set before the call starts, so it necessarily also
+// covers the burst loop's own (normally sub-100ms, all in-process, no
+// I/O) execution time below, not just the drain/Finish() phase after it -
+// generous on purpose, so that inherent overlap doesn't eat meaningfully
+// into the margin this is actually meant to give the RESOURCE_EXHAUSTED
+// path room to appear even on a slow/loaded CI runner.
+TEST_F(AggregatorServiceTest, OverflowingSubscriberIsClosedWithResourceExhaustedStatus) {
+    updates_.wait_for(0);  // initial snapshot for the fixture's own (fast) subscriber
+
+    grpc::ClientContext stuck_context;
+    stuck_context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(30));
+    auto stuck_reader = stub_->SubscribeL2Diff(&stuck_context, subscribe_l2_diff_request(TestBook()));
+
+    constexpr int kUpdates = 5000;
+    for (int i = 0; i < kUpdates; ++i) {
+        ASSERT_TRUE(apply_one(book(), kBinance, Side::Bid, Price(1.0 + i * 0.0001), Size(1.0)).has_value());
+    }
+
+    // Only now does this test ever call Read() on the stuck reader - draining
+    // whatever was actually delivered before the server closed the stream
+    // (some prefix of the burst, however far the writer thread got before
+    // the queue closed under it) and, once Read() finally returns false,
+    // the real RPC outcome via Finish().
+    L2Update update;
+    while (stuck_reader->Read(&update)) {
+    }
+    grpc::Status status = stuck_reader->Finish();
+    EXPECT_EQ(status.error_code(), grpc::StatusCode::RESOURCE_EXHAUSTED);
 }
 
 TEST_F(AggregatorServiceTest, SubscribeBboOnEmptyBookHasNeitherSide) {

@@ -19,6 +19,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <ranges>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -295,12 +296,8 @@ int main(int argc, char** argv) {
     // process starts and listens normally, and the operator only
     // discovers the gap when that venue's book quietly never receives an
     // update.
-    std::vector<std::string> unwired_venues;
-    for (const auto& [venue_id, group] : groups) {
-        if (!wired_venue_ids.contains(venue_id)) {
-            unwired_venues.push_back(bobby::hermeneutic::symbol::to_string(venue_id));
-        }
-    }
+    auto unwired_venues =
+        bobby::hermeneutic::symbol::venues_missing_from(std::views::keys(groups), wired_venue_ids);
     if (fail_on_bad_venues(unwired_venues, "subscription config",
                             "this binary has no wire_venue<>() call for (they would silently receive zero "
                             "ingestion)")) {
@@ -312,12 +309,8 @@ int main(int argc, char** argv) {
     // actually subscribed would otherwise parse successfully and silently
     // do nothing, leaving an operator believing their tuning took effect
     // when it didn't.
-    std::vector<std::string> unused_overrides;
-    for (const auto& [venue_id, timeout] : idle_timeout_config->overrides) {
-        if (!wired_venue_ids.contains(venue_id)) {
-            unused_overrides.push_back(bobby::hermeneutic::symbol::to_string(venue_id));
-        }
-    }
+    auto unused_overrides = bobby::hermeneutic::symbol::venues_missing_from(
+        std::views::keys(idle_timeout_config->overrides), wired_venue_ids);
     if (fail_on_bad_venues(unused_overrides, "venue_idle_timeout_overrides",
                             "not present in \"books\" (the override would silently do nothing)")) {
         return 1;

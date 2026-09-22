@@ -3,8 +3,11 @@
 #include <cstddef>
 #include <functional>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <string_view>
+#include <unordered_set>
+#include <vector>
 
 // This project's own symbol domain model: what a book is (a base/quote
 // pair plus which market it covers) and how that identity maps to each
@@ -297,3 +300,37 @@ struct std::hash<bobby::hermeneutic::symbol::VenueId> {
         return seed;
     }
 };
+
+namespace bobby::hermeneutic::symbol {
+
+// Returns to_string()'d entries of `candidates` absent from `wired` - a
+// plain VenueId set difference with no dependency on anything above this
+// tier (e.g. apps/aggregator/server_main.cpp's "config named a venue
+// nothing actually wired" checks: an unwired "books" entry, or a
+// venue_idle_timeout_overrides entry naming a venue outside "books" -
+// see book_subscription.hpp). Lives here, not in whichever config-parsing
+// header first needed it, so a future consumer with no reason to parse
+// JSON (a health check, a metrics reporter, another binary) never has to
+// pull in simdjson.h just to reuse a set-difference helper. Templated on
+// any VenueId range, not just std::vector<VenueId>, so a caller can pass
+// std::views::keys() of its own map directly instead of first copying its
+// keys into a vector purely to satisfy this function. Declared after
+// std::hash<VenueId> above (not next to to_string(VenueId)) because its
+// std::unordered_set<VenueId> parameter is a non-dependent type: naming it
+// here forces an implicit instantiation of std::unordered_set<VenueId>
+// on the spot, which needs that specialization to already be visible -
+// declaring this earlier would silently bind to the primary (deleted)
+// std::hash<VenueId> instead, a class of bug the standard leaves as
+// ill-formed, no diagnostic required rather than a guaranteed compile
+// error.
+template <std::ranges::input_range VenueIdRange>
+inline std::vector<std::string> venues_missing_from(VenueIdRange&& candidates,
+                                                     const std::unordered_set<VenueId>& wired) {
+    std::vector<std::string> missing;
+    for (const auto& venue_id : candidates) {
+        if (!wired.contains(venue_id)) missing.push_back(to_string(venue_id));
+    }
+    return missing;
+}
+
+}  // namespace bobby::hermeneutic::symbol

@@ -120,20 +120,13 @@ TEST(Notional, DivideByNegativeSizeReturnsArgumentOutOfDomain) {
     EXPECT_EQ(price.error(), std::errc::argument_out_of_domain);
 }
 
-TEST(Notional, RoundDivNearestAwayRoundsTiesAwayFromZero) {
-    EXPECT_EQ(detail::round_div_nearest_away(14, 10), 1);   // 1.4 -> down
-    EXPECT_EQ(detail::round_div_nearest_away(15, 10), 2);   // 1.5 -> away from zero (up)
-    EXPECT_EQ(detail::round_div_nearest_away(16, 10), 2);   // 1.6 -> up
-    EXPECT_EQ(detail::round_div_nearest_away(-14, 10), -1);
-    EXPECT_EQ(detail::round_div_nearest_away(-15, 10), -2);  // -1.5 -> away from zero (down)
-    EXPECT_EQ(detail::round_div_nearest_away(-16, 10), -2);
-    EXPECT_EQ(detail::round_div_nearest_away(0, 10), 0);
-}
-
-// The same tie behavior, reached through the actual public operator rather
-// than the helper directly: 1,000,000 / 128 = 7812.5 exactly (verified:
-// 128 * 7812 = 999,936, remainder 64 = exactly half of 128), so this must
-// round up to 7813, not down to 7812.
+// round_div_nearest_away() itself is tested directly in
+// tests/core/rounding_test.cpp, next to the header it now lives in
+// (rounding.hpp, split out of this file's own notional.hpp). This test
+// covers the same tie behavior as reached through the actual public
+// operator rather than the helper directly: 1,000,000 / 128 = 7812.5
+// exactly (verified: 128 * 7812 = 999,936, remainder 64 = exactly half of
+// 128), so this must round up to 7813, not down to 7812.
 TEST(Notional, DivideByPriceRoundsAnExactTieAwayFromZero) {
     Notional notional = Notional::from_raw(1);
     Price price = Price::from_raw(128);

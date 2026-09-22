@@ -2,7 +2,10 @@
 
 #include <gtest/gtest.h>
 
+#include <ranges>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace bobby::hermeneutic::symbol {
 namespace {
@@ -142,6 +145,38 @@ TEST(NativeSymbol, OkxUsesDashAndSwapSuffix) {
     BaseQuote btc_usdt{{"BTC"}, {"USDT"}};
     EXPECT_EQ(native_symbol(Exchange::Okx, btc_usdt, MarketType::Spot), "BTC-USDT");
     EXPECT_EQ(native_symbol(Exchange::Okx, btc_usdt, MarketType::Perp), "BTC-USDT-SWAP");
+}
+
+TEST(VenuesMissingFrom, EmptyWhenEveryCandidateIsWired) {
+    VenueId binance_spot{Exchange::Binance, MarketType::Spot};
+    VenueId okx_perp{Exchange::Okx, MarketType::Perp};
+    EXPECT_TRUE(venues_missing_from(std::vector<VenueId>{binance_spot, okx_perp}, {binance_spot, okx_perp}).empty());
+}
+
+TEST(VenuesMissingFrom, ReportsCandidatesAbsentFromWired) {
+    VenueId binance_spot{Exchange::Binance, MarketType::Spot};
+    VenueId okx_perp{Exchange::Okx, MarketType::Perp};
+    auto missing = venues_missing_from(std::vector<VenueId>{binance_spot, okx_perp}, {binance_spot});
+    ASSERT_EQ(missing.size(), 1u);
+    EXPECT_EQ(missing[0], to_string(okx_perp));
+}
+
+TEST(VenuesMissingFrom, EmptyWhenCandidatesAreEmpty) {
+    VenueId binance_spot{Exchange::Binance, MarketType::Spot};
+    EXPECT_TRUE(venues_missing_from(std::vector<VenueId>{}, {binance_spot}).empty());
+}
+
+// Confirms the templated venues_missing_from() actually accepts a lazy
+// range like std::views::keys(), not just a materialized std::vector -
+// server_main.cpp's whole reason for taking a range instead of requiring
+// each call site to first copy a map's keys into one.
+TEST(VenuesMissingFrom, AcceptsAKeysViewDirectly) {
+    VenueId binance_spot{Exchange::Binance, MarketType::Spot};
+    VenueId okx_perp{Exchange::Okx, MarketType::Perp};
+    std::unordered_map<VenueId, int> configured{{binance_spot, 1}, {okx_perp, 2}};
+    auto missing = venues_missing_from(std::views::keys(configured), {binance_spot});
+    ASSERT_EQ(missing.size(), 1u);
+    EXPECT_EQ(missing[0], to_string(okx_perp));
 }
 
 }  // namespace

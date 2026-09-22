@@ -164,6 +164,7 @@ if(HERMENEUTIC_BUILD_TESTS)
     add_executable(hermeneutic_tests
         tests/core/fixed_point_test.cpp
         tests/core/notional_test.cpp
+        tests/core/rounding_test.cpp
         tests/book/l2_order_book_test.cpp
         tests/book/aggregate_order_book_test.cpp
         tests/book/price_bands_test.cpp

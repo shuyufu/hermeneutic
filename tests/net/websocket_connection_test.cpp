@@ -197,5 +197,39 @@ TEST(WebSocketConnectionTest, ReadFailsAfterPeerAbruptlyClosesConnection) {
     EXPECT_THROW(std::rethrow_exception(thrown), beast::system_error);
 }
 
+// idle_timeout.hpp's own comment: kMaxIdleTimeout is meant to stay
+// comfortably below the point where converting a seconds count to
+// websocket::stream_base::duration (a nanosecond-resolution,
+// int64 steady_clock::duration - see connect()'s own use of it above)
+// overflows and silently wraps into a near-zero or negative value. Until
+// now only book_subscription.hpp's independent seconds-count range check
+// was tested (ParseIdleTimeoutConfig.AcceptsDefaultExactlyAtMax/
+// RejectsDefaultAboveMax) - the two assignments below are the same
+// operation, on the same two types, as connect()'s own
+// `timeout_opt.idle_timeout = idle_timeout;` (this class's own code,
+// above): not a parallel re-implementation that could quietly drift from
+// it, since there's no custom conversion logic in either place for the two
+// to disagree on - both are exactly what std::chrono::duration's own
+// converting assignment does for these types. Driven at kMaxIdleTimeout
+// itself and at a value one second short of the real overflow point
+// (duration::max(), ~292 years) - kMaxIdleTimeout (24h) alone is ~5 orders
+// of magnitude below that point, nowhere near where a subtler overflow bug
+// (an intermediate narrower multiply, a unit-mismatch factor upstream of
+// this assignment) would actually surface. Deliberately no case that
+// actually overflows: that conversion's overflow behavior is unspecified/
+// UB, not a defined wraparound worth asserting on.
+TEST(WebSocketConnectionTest, KMaxIdleTimeoutDoesNotOverflowBeastsTimeoutDuration) {
+    websocket::stream_base::duration converted = kMaxIdleTimeout;
+    EXPECT_GT(converted.count(), 0);
+    EXPECT_EQ(std::chrono::duration_cast<std::chrono::seconds>(converted), kMaxIdleTimeout);
+
+    auto near_overflow_boundary =
+        std::chrono::duration_cast<std::chrono::seconds>(websocket::stream_base::duration::max()) -
+        std::chrono::seconds(1);
+    websocket::stream_base::duration near_boundary_converted = near_overflow_boundary;
+    EXPECT_GT(near_boundary_converted.count(), 0);
+    EXPECT_EQ(std::chrono::duration_cast<std::chrono::seconds>(near_boundary_converted), near_overflow_boundary);
+}
+
 }  // namespace
 }  // namespace bobby::hermeneutic::ingestion

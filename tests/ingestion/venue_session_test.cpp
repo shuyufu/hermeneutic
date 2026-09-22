@@ -317,6 +317,33 @@ net::awaitable<void> run_flaky_ws_server(net::ip::tcp::acceptor acceptor, std::a
     }
 }
 
+// Like run_fake_ws_server above (sends one message, then holds a pending
+// read for the rest of the test - the read that lets Beast's own machinery
+// auto-answer an incoming idle ping, see that function's own comment), but
+// counts connections and accepts forever instead of just once -
+// IdleTimeoutDoesNotForceReconnectOnAQuietButResponsiveConnection uses
+// `connect_count` to prove idle_timeout never tears this connection down:
+// a second connection would only ever arrive if it had.
+net::awaitable<void> run_fake_ws_server_counting_connections(net::ip::tcp::acceptor acceptor,
+                                                              std::string depth_message,
+                                                              std::atomic<int>* connect_count) {
+    while (true) {
+        auto socket = co_await acceptor.async_accept(net::use_awaitable);
+        connect_count->fetch_add(1);
+        websocket::stream<net::ip::tcp::socket> ws(std::move(socket));
+        co_await ws.async_accept(net::use_awaitable);
+
+        beast::flat_buffer buffer;
+        co_await ws.async_read(buffer, net::use_awaitable);  // the SUBSCRIBE message; content unchecked
+
+        co_await ws.async_write(net::buffer(depth_message), net::use_awaitable);
+
+        beast::flat_buffer idle_buffer;
+        boost::system::error_code ec;
+        co_await ws.async_read(idle_buffer, net::redirect_error(net::use_awaitable, ec));
+    }
+}
+
 // Like run_fake_ws_server above, but sends two messages in sequence
 // rather than one - what SnapshotPushedAsFirstMessage... below needs to
 // prove both halves of the WS-push-snapshot path: the pushed snapshot
@@ -1236,6 +1263,102 @@ TEST(VenueSessionTest, IdleTimeoutForcesReconnectOnSilentConnection) {
     ASSERT_TRUE(second_snapshot.has_diff());
     ASSERT_EQ(second_snapshot.diff().bids_size(), 1);
     EXPECT_EQ(second_snapshot.diff().bids(0).size_raw(), Size(9.0).raw());
+
+    context.TryCancel();
+    if (reader_thread.joinable()) reader_thread.join();
+    server->Shutdown();
+}
+
+// The inverse of IdleTimeoutForcesReconnectOnSilentConnection above: a
+// connection that keeps answering Beast's own WS-level idle pings, but
+// whose application simply has no new book update to send during a
+// genuinely quiet market, must not be torn down and reconnected just
+// because idle_timeout has elapsed with nothing new. See
+// websocket_connection.hpp's connect() own comment - idle_timeout measures
+// transport responsiveness, not application-data freshness, a distinction
+// that until now had only been checked once, manually, against a real
+// venue (Binance Futures CTKUSDT), not by any automated regression test.
+TEST(VenueSessionTest, IdleTimeoutDoesNotForceReconnectOnAQuietButResponsiveConnection) {
+    std::vector<std::string> symbols{"BTCUSDT"};
+    AggregatorService service(std::vector<BookId>{TestBookId()});
+
+    grpc::ServerBuilder builder;
+    int grpc_port = 0;
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &grpc_port);
+    builder.RegisterService(&service);
+    auto server = builder.BuildAndStart();
+    ASSERT_NE(server, nullptr);
+
+    auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(grpc_port),
+                                        grpc::InsecureChannelCredentials());
+    auto stub = bobby::hermeneutic::aggregator::Aggregator::NewStub(channel);
+    grpc::ClientContext context;
+    bobby::hermeneutic::aggregator::SubscribeL2DiffRequest request;
+    fill_wire_book_id(request.mutable_book(), TestBookId());
+    auto reader = stub->SubscribeL2Diff(&context, request);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<L2Update> updates;
+    std::thread reader_thread([&] {
+        L2Update update;
+        while (reader->Read(&update)) {
+            std::lock_guard lock(mutex);
+            updates.push_back(update);
+            cv.notify_all();
+        }
+    });
+    struct ReaderThreadGuard {
+        grpc::ClientContext& context;
+        std::thread& thread;
+        ~ReaderThreadGuard() {
+            context.TryCancel();
+            if (thread.joinable()) thread.join();
+        }
+    } reader_guard{context, reader_thread};
+
+    auto wait_for = [&](std::size_t index) -> L2Update {
+        std::unique_lock lock(mutex);
+        cv.wait_for(lock, std::chrono::seconds(5), [&] { return updates.size() > index; });
+        return updates.at(index);
+    };
+    wait_for(0);  // initial (empty) snapshot
+
+    net::io_context io;
+    net::ip::tcp::acceptor ws_acceptor(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    unsigned short ws_port = ws_acceptor.local_endpoint().port();
+    std::atomic<int> connect_count{0};
+    net::co_spawn(io,
+                  run_fake_ws_server_counting_connections(std::move(ws_acceptor),
+                                                           "SNAPSHOT:BTCUSDT:100:100.0:5.0", &connect_count),
+                  fail_test_on_exception("ws server"));
+
+    FakeFeedNoRest feed(std::to_string(ws_port));
+    SymbolRegistry<SymbolBook> registry;
+    registry.add("BTCUSDT", service.book(TestBookId()));
+    // Same short idle_timeout as IdleTimeoutForcesReconnectOnSilentConnection
+    // above - what's under test here is that this connection, unlike that
+    // one, never trips it, not the specific timeout value.
+    VenueSession<FakeFeedNoRest, BybitSequencePolicy, beast::tcp_stream, SymbolBook> session(
+        std::move(feed), kFakeVenue, symbols, std::move(registry), io.get_executor(),
+        /*ssl_ctx=*/nullptr, /*idle_timeout=*/std::chrono::seconds(1));
+    session.start(fail_test_on_exception("session"));
+
+    // Comfortably longer than several idle_timeout (1s) windows - if
+    // idle_timeout ever regressed into firing on application silence alone,
+    // this gives it several chances to do so.
+    io.run_for(std::chrono::seconds(5));
+
+    // seq 1: ApplySnapshot from the one and only connection.
+    L2Update first_snapshot = wait_for(1);
+    ASSERT_TRUE(first_snapshot.has_diff());
+    ASSERT_EQ(first_snapshot.diff().bids_size(), 1);
+    EXPECT_EQ(first_snapshot.diff().bids(0).size_raw(), Size(5.0).raw());
+
+    // The real assertion: exactly one connection was ever made - no
+    // idle-timeout-forced (or any other) reconnect happened despite five
+    // seconds of application silence on a connection with a 1s idle_timeout.
+    EXPECT_EQ(connect_count.load(), 1);
 
     context.TryCancel();
     if (reader_thread.joinable()) reader_thread.join();

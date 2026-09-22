@@ -489,5 +489,39 @@ TEST(AggregateOrderBook, ApplySnapshotSinkFiresForRemovalsAndAdditions) {
               changes.end());
 }
 
+TEST(AggregateOrderBook, ApplySnapshotReportsAllRemovalsBeforeAnyAddition) {
+    AggregateOrderBook book;
+    apply_one(book, kBinance, Side::Bid, Price(100.0), Size(1.0));
+    apply_one(book, kBinance, Side::Bid, Price(99.0), Size(2.0));
+    apply_one(book, kBinance, Side::Bid, Price(97.0), Size(4.0));
+
+    // 100 and 97 are dropped, 99 stays, 96 and 95 are brand new - two
+    // removals and two additions in one apply_snapshot() call, enough that
+    // an accidental interleaving (unlike ApplySnapshotSinkFiresForRemovals
+    // AndAdditions above, whose single removal/single addition can't tell
+    // "always before" apart from "happens to land first") would be caught
+    // here. resync_side()'s own doc comment: every removal is reported
+    // before any addition, regardless of price order.
+    const std::array snapshot = {std::pair{Price(99.0), Size(2.0)}, std::pair{Price(96.0), Size(5.0)},
+                                  std::pair{Price(95.0), Size(6.0)}};
+    std::vector<std::pair<Price, Size>> changes;
+    book.apply_snapshot(kBinance, snapshot, {},
+                         [&](Price price, Size new_size) { changes.emplace_back(price, new_size); },
+                         [](Price, Size) {});
+
+    ASSERT_EQ(changes.size(), 4u);
+    // The first two entries are the two removals (100, 97), the last two
+    // the two additions (96, 95) - not a value-based rule (a genuine size-0
+    // addition is possible in general; see l2_order_book.hpp's
+    // is_valid_level()), just what this fixture's own chosen sizes happen
+    // to produce, used here only to tell "removal" and "addition" apart in
+    // the assertions below without re-deriving each price's identity.
+    // A removal's reported size is always 0 (nobody else held that price).
+    EXPECT_EQ(changes[0].second, Size(0.0));
+    EXPECT_EQ(changes[1].second, Size(0.0));
+    EXPECT_NE(changes[2].second, Size(0.0));
+    EXPECT_NE(changes[3].second, Size(0.0));
+}
+
 }  // namespace
 }  // namespace bobby::hermeneutic
