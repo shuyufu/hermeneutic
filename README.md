@@ -209,8 +209,10 @@ cmake --build build-vcpkg --target hermeneutic_aggregator_client
 ./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 bbo 60 BTC_USDT.SPOT BTC_USDT.PERP
 ./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 volume-bands 60 BTC_USDT.SPOT
 ./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 price-bands 60 BTC_USDT.SPOT
+# A non-default example, to show the flag actually changing the bands
+# printed (2M/10M/20M/50M/100M+ instead of the 1M/5M/10M/25M/50M+ default):
 ./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 volume-bands \
-    --volume-thresholds=1000000,5000000,10000000,25000000,50000000 60 BTC_USDT.SPOT
+    --volume-thresholds=2000000,10000000,20000000,50000000,100000000 60 BTC_USDT.SPOT
 
 # <address> list - calls ListBooks and prints every book the server was
 # started with, one per line, then exits (no duration/book arguments).
@@ -301,7 +303,7 @@ controls it:
 # other key on aggregator-client-volume-bands: stay exactly as they
 # already are in docker-compose.yml.
 command: ["aggregator-service:50051", "volume-bands", "0",
-          "--volume-thresholds=1000000,5000000,10000000,25000000,50000000",
+          "--volume-thresholds=2000000,10000000,20000000,50000000,100000000",
           "BTC_USDT.SPOT"]
 ```
 

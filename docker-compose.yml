@@ -94,9 +94,10 @@ services:
   # 1M/5M/10M/25M/50M+, add a "--volume-thresholds=<n1,n2,...>" element to
   # the command: list below - client_main.cpp accepts it anywhere on the
   # command line (see its print_usage()/README.md's "Aggregator service"
-  # section for the exact syntax), e.g.:
+  # section for the exact syntax), e.g. (2M/10M/20M/50M/100M+, a genuinely
+  # different set from the default above, not just the default repeated):
   #   command: ["aggregator-service:50051", "volume-bands", "0",
-  #             "--volume-thresholds=1000000,5000000,10000000,25000000,50000000",
+  #             "--volume-thresholds=2000000,10000000,20000000,50000000,100000000",
   #             "BTC_USDT.SPOT"]
   aggregator-client-volume-bands:
     <<: *client-base
