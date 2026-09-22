@@ -22,6 +22,7 @@
 #include <list>
 #include <optional>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -50,12 +51,18 @@ using bobby::hermeneutic::VenueId;
 // Shared by VenueSession's own snapshot-fetch handler and
 // VenueSessionAdapter's start() handler (ingestion_runner.hpp) rather than
 // each repeating the same rethrow/catch.
+// Builds the whole line before the one std::cerr call below: with
+// io_context::run() driven by more than one thread (see server_main.cpp's
+// io_threads config), two concurrent calls here would otherwise interleave
+// their chained << operators into a garbled line.
 inline void log_exception(std::string_view component, std::string_view action, std::exception_ptr e) {
     if (!e) return;
     try {
         std::rethrow_exception(e);
     } catch (const std::exception& ex) {
-        std::cerr << "[" << component << "] " << action << ": " << ex.what() << '\n';
+        std::ostringstream line;
+        line << "[" << component << "] " << action << ": " << ex.what() << '\n';
+        std::cerr << line.str();
     }
 }
 
@@ -501,9 +508,15 @@ class VenueSession {
         // outermost caller below - not duplicated into SymbolSync itself.
         // Logged here, not inside the visitor, to keep I/O out of it (see
         // log_exception).
-        std::cerr << "[venue_session] " << symbol
-                  << ": rejected level(s) from this venue (malformed data) - invalidating and "
-                     "resyncing\n";
+        // Single std::cerr call, same reasoning as log_exception() above:
+        // two VenueSessions on different io_threads can hit this at once.
+        {
+            std::ostringstream line;
+            line << "[venue_session] " << symbol
+                 << ": rejected level(s) from this venue (malformed data) - invalidating and "
+                    "resyncing\n";
+            std::cerr << line.str();
+        }
         // Recurses into execute_action() exactly one level deep, not
         // further: on_disconnected() only ever returns {InvalidateVenue{}},
         // whose own branch above never sets apply_failed. Routed through

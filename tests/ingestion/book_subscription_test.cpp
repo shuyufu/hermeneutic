@@ -306,5 +306,71 @@ TEST(LoadIdleTimeoutConfig, RejectsAMissingFile) {
     EXPECT_NE(result.error().find("failed to read subscription config"), std::string::npos);
 }
 
+TEST(ParseIoThreads, DefaultsToOneWhenAbsent) {
+    auto result = parse_io_threads(R"({"books": []})");
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_EQ(*result, 1);
+}
+
+TEST(ParseIoThreads, ParsesCustomValue) {
+    auto result = parse_io_threads(R"({"io_threads": 4})");
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_EQ(*result, 4);
+}
+
+TEST(ParseIoThreads, RejectsZeroOrNegative) {
+    for (auto* json : {R"({"io_threads": 0})", R"({"io_threads": -3})"}) {
+        auto result = parse_io_threads(json);
+        ASSERT_FALSE(result.has_value()) << json;
+        EXPECT_NE(result.error().find("positive"), std::string::npos) << json;
+    }
+}
+
+TEST(ParseIoThreads, RejectsAboveMax) {
+    auto result = parse_io_threads(R"({"io_threads": 65})");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().find("no more than"), std::string::npos);
+}
+
+TEST(ParseIoThreads, AcceptsExactlyAtMax) {
+    auto result = parse_io_threads(R"({"io_threads": 64})");
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_EQ(*result, 64);
+}
+
+// A wrong-typed (not absent, but present-and-wrong) value must name
+// "io_threads" specifically, not fall through to the generic "malformed
+// subscription config" message - same reasoning as
+// ParseIdleTimeoutConfig.RejectsWrongTypedDefault above.
+TEST(ParseIoThreads, RejectsWrongTypedValue) {
+    auto result = parse_io_threads(R"({"io_threads": "4"})");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().find("\"io_threads\""), std::string::npos);
+}
+
+TEST(ParseIoThreads, RejectsMalformedJson) {
+    auto result = parse_io_threads("{not json");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().find("malformed subscription config"), std::string::npos);
+}
+
+TEST(LoadIoThreads, ReadsAndParsesARealFile) {
+    std::string path = testing::TempDir() + "io_threads_test_valid.json";
+    {
+        std::ofstream file(path);
+        file << R"({"io_threads": 3})";
+    }
+
+    auto result = load_io_threads(path);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_EQ(*result, 3);
+}
+
+TEST(LoadIoThreads, RejectsAMissingFile) {
+    auto result = load_io_threads(testing::TempDir() + "io_threads_test_does_not_exist.json");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().find("failed to read subscription config"), std::string::npos);
+}
+
 }  // namespace
 }  // namespace bobby::hermeneutic::ingestion

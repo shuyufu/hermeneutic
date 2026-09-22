@@ -146,6 +146,16 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Same config file, a separate (optional) field - see
+    // book_subscription.hpp's parse_io_threads() for the document shape,
+    // why an absent field keeps single-thread behavior, and the one
+    // lock-contention tradeoff N>1 introduces.
+    auto io_threads = bobby::hermeneutic::ingestion::parse_io_threads(std::string_view(config_json));
+    if (!io_threads) {
+        std::cerr << "invalid subscription config: " << io_threads.error() << '\n';
+        return 1;
+    }
+
     // AggregatorService's book set is keyed by symbol::BookId - deduplicated
     // here, in first-seen order, since several subscriptions (one per venue)
     // share the same book_id and AggregatorService requires unique entries.
@@ -371,7 +381,15 @@ int main(int argc, char** argv) {
     signals.async_wait(on_signal);
 
     runner.start_all();
-    std::thread io_thread([&io] { io.run(); });
+    // One thread when *io_threads == 1 (the default, and every existing
+    // deployment's behavior), N when the config asked for more - see
+    // parse_io_threads()'s own comment for why calling io.run() from
+    // several threads on this one shared io_context is safe.
+    std::vector<std::thread> io_threads_pool;
+    io_threads_pool.reserve(*io_threads);
+    for (int i = 0; i < *io_threads; ++i) {
+        io_threads_pool.emplace_back([&io] { io.run(); });
+    }
 
     std::cout << "hermeneutic_aggregator_service listening on " << address << " for " << book_symbols.size()
               << " book(s):";
@@ -414,7 +432,7 @@ int main(int argc, char** argv) {
     });
 
     runner.stop_all();
-    io_thread.join();
+    for (auto& t : io_threads_pool) t.join();
 
     {
         std::lock_guard lock(shutdown_mutex);

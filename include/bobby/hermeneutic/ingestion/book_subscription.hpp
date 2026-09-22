@@ -336,4 +336,70 @@ inline std::expected<IdleTimeoutConfig, std::string> load_idle_timeout_config(st
     return parse_idle_timeout_config(std::string_view(json));
 }
 
+// The number of threads that should call io_context::run() concurrently -
+// see server_main.cpp. Optional top-level field on the same config
+// document, e.g. {"books": [...], "io_threads": 4}; absent means 1, the
+// same single-thread behavior this binary always had, so every existing
+// config/deployment is unaffected by this field's mere existence.
+//
+// io_context::run() is documented as safe to call concurrently from
+// multiple threads (the standard Boost.Asio thread-pool pattern), and
+// every VenueSession is strand-confined (see venue_session.hpp), so N>1
+// is correct. The one thing N>1 actually changes: two different
+// VenueSessions that feed the *same* SymbolBook (aggregation across
+// venues for one book) can now genuinely contend on SymbolBook::mutex_ at
+// the same instant, instead of being serialized for free by a single
+// thread today. Still correct - the mutex still protects it - just real
+// lock contention where there was none before, on top of the
+// already-known hot-symbol broadcast-under-lock cost (see memory
+// hermeneutic_thread_model.md). Not addressed here; only the config knob
+// and venue_session.hpp's two now-fixed unsynchronized std::cerr sites
+// (the actual correctness gap for N>1) are in scope.
+inline std::expected<int, std::string> parse_io_threads(std::string_view json_text) {
+    constexpr int64_t kMaxIoThreads = 64;
+
+    try {
+        simdjson::padded_string padded(json_text);
+        simdjson::ondemand::parser parser;
+        simdjson::ondemand::document doc = parser.iterate(padded);
+
+        auto io_threads_range_error = [] {
+            return std::unexpected("\"io_threads\" must be a positive integer, no more than " +
+                                    std::to_string(kMaxIoThreads));
+        };
+
+        std::optional<int64_t> io_threads;
+        try {
+            io_threads = doc["io_threads"].get_int64();
+        } catch (const simdjson::simdjson_error& e) {
+            // Same reasoning as parse_idle_timeout_config()'s own
+            // "idle_timeout_seconds" try/catch above: NO_SUCH_FIELD alone
+            // means "absent, keep the default", INCORRECT_TYPE gets the
+            // same targeted message as an out-of-range value, and
+            // anything else is document corruption, rethrown below.
+            if (e.error() == simdjson::INCORRECT_TYPE) return io_threads_range_error();
+            if (e.error() != simdjson::NO_SUCH_FIELD) throw;
+        }
+        if (!io_threads) return 1;
+        if (*io_threads <= 0 || *io_threads > kMaxIoThreads) return io_threads_range_error();
+        return static_cast<int>(*io_threads);
+    } catch (const simdjson::simdjson_error& e) {
+        return std::unexpected("malformed subscription config: " + std::string(e.what()));
+    }
+}
+
+// Reads `path` and parses its optional "io_threads" field - see
+// parse_io_threads() above for the document shape. Mirrors
+// load_book_subscriptions()'s own error handling for a missing/unreadable
+// file.
+inline std::expected<int, std::string> load_io_threads(std::string_view path) {
+    simdjson::padded_string json;
+    auto error = simdjson::padded_string::load(path).get(json);
+    if (error) {
+        return std::unexpected("failed to read subscription config \"" + std::string(path) +
+                                "\": " + std::string(simdjson::error_message(error)));
+    }
+    return parse_io_threads(std::string_view(json));
+}
+
 }  // namespace bobby::hermeneutic::ingestion
