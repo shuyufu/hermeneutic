@@ -11,7 +11,6 @@
 #include <deque>
 #include <memory>
 #include <mutex>
-#include <numeric>
 #include <string>
 #include <thread>
 #include <utility>
@@ -117,6 +116,22 @@ std::unique_ptr<BboSubscription> subscribe_bbo(Aggregator::Stub& stub, const Boo
         while (raw->reader->Read(&update)) raw->updates.push(update);
     });
     return sub;
+}
+
+// Opens a brand-new SubscribeL2Diff subscription, reads just its initial
+// snapshot, and cancels - used by two different tests below to see the
+// book's current state from a fresh subscriber's point of view. Factored
+// out once needed twice, mirroring subscribe_bbo() above. A failed Read()
+// leaves snapshot_msg default-constructed (has_snapshot() false), which
+// every caller already asserts on, so this doesn't need its own
+// ASSERT_TRUE - callers see the same failure signal either way.
+L2Update read_fresh_snapshot(Aggregator::Stub& stub, const BookId& book_id) {
+    grpc::ClientContext context;
+    auto reader = stub.SubscribeL2Diff(&context, subscribe_l2_diff_request(book_id));
+    L2Update snapshot_msg;
+    reader->Read(&snapshot_msg);
+    context.TryCancel();
+    return snapshot_msg;
 }
 
 TEST(SubscriberQueueTest, DrainsInFifoOrderAndReportsResultKind) {
@@ -568,12 +583,7 @@ TEST_F(AggregatorServiceTest, SnapshotOrderingMatchesBookConvention) {
     // A second, independent subscriber joining now must see the book's own
     // ordering directly in its initial snapshot: bids descending, asks
     // ascending.
-    grpc::ClientContext second_context;
-    auto second_reader = stub_->SubscribeL2Diff(&second_context, subscribe_l2_diff_request(TestBook()));
-    L2Update snapshot_msg;
-    ASSERT_TRUE(second_reader->Read(&snapshot_msg));
-    second_context.TryCancel();
-
+    L2Update snapshot_msg = read_fresh_snapshot(*stub_, TestBook());
     ASSERT_TRUE(snapshot_msg.has_snapshot());
     const auto& snapshot = snapshot_msg.snapshot();
     ASSERT_EQ(snapshot.bids_size(), 3);
@@ -857,14 +867,20 @@ TEST_F(AggregatorServiceTest, ConcurrentApplyBatchFromEveryVenueProducesGapFreeS
     // the queue and turn a scheduling fluke into a spurious failure here.
     static_assert(kTotal < 256);
 
-    std::vector<std::vector<bool>> ok(kVenues.size(), std::vector<bool>(kItersPerVenue, false));
+    // std::vector<char>, not std::vector<bool>: this is written
+    // concurrently across threads (each thread only ever touches its own
+    // row, so it's already race-free), but proving that shouldn't require
+    // reasoning about vector<bool>'s bit-packed specialization in a test
+    // whose whole point is to be a trustworthy TSAN reference.
+    std::vector<std::vector<char>> ok(kVenues.size(), std::vector<char>(static_cast<std::size_t>(kItersPerVenue), 0));
+    SymbolBook& shared_book = book();
     std::vector<std::thread> threads;
     for (std::size_t i = 0; i < kVenues.size(); ++i) {
-        threads.emplace_back([this, i, venue = kVenues[i], &ok] {
+        threads.emplace_back([&shared_book, i, venue = kVenues[i], &ok] {
             Price price = Price(100.0 + static_cast<double>(i));
             for (int j = 1; j <= kItersPerVenue; ++j) {
                 ok[i][static_cast<std::size_t>(j - 1)] =
-                    apply_one(book(), venue, Side::Bid, price, Size(static_cast<double>(j))).has_value();
+                    apply_one(shared_book, venue, Side::Bid, price, Size(static_cast<double>(j))).has_value();
             }
         });
     }
@@ -877,40 +893,38 @@ TEST_F(AggregatorServiceTest, ConcurrentApplyBatchFromEveryVenueProducesGapFreeS
     }
 
     // Drain exactly kTotal diffs (indices 1..kTotal; index 0 was the
-    // initial empty snapshot already consumed above) and check the
-    // resulting book_seq multiset is exactly {1, ..., kTotal} - no gaps,
-    // no duplicates. Either would mean two threads' apply_batch() calls
-    // interleaved unsafely around mutex_/seq_/the fanout broadcast: a
-    // dropped or doubled seq bump, or a message lost/duplicated on the
-    // wire.
-    std::vector<std::uint64_t> seqs;
-    seqs.reserve(static_cast<std::size_t>(kTotal));
+    // initial empty snapshot already consumed above) in delivery order and
+    // check book_seq is exactly 1, 2, ..., kTotal in that same order - not
+    // merely the same set (sorting first would hide any reordering, the
+    // one thing this is meant to catch). Any of a dropped seq bump, a
+    // doubled one, or a message lost/reordered/duplicated on the wire
+    // would break this.
     for (int i = 1; i <= kTotal; ++i) {
         L2Update update = updates_.wait_for(static_cast<std::size_t>(i));
         ASSERT_TRUE(update.has_diff()) << "message #" << i;
-        seqs.push_back(update.diff().book_seq());
+        EXPECT_EQ(update.diff().book_seq(), static_cast<std::uint64_t>(i)) << "message #" << i;
     }
-    std::sort(seqs.begin(), seqs.end());
-    std::vector<std::uint64_t> expected(static_cast<std::size_t>(kTotal));
-    std::iota(expected.begin(), expected.end(), std::uint64_t{1});
-    EXPECT_EQ(seqs, expected);
 
     // Final aggregate state: a fresh subscriber's initial snapshot must
     // show exactly one level per venue's own exclusive price, each at that
-    // venue's own last-written size - concurrent writers didn't corrupt,
-    // drop, or cross-contaminate each other's level.
-    grpc::ClientContext second_context;
-    auto second_reader = stub_->SubscribeL2Diff(&second_context, subscribe_l2_diff_request(TestBook()));
-    L2Update snapshot_msg;
-    ASSERT_TRUE(second_reader->Read(&snapshot_msg));
-    second_context.TryCancel();
-
+    // venue's own last-written size, in the book's own descending-bid
+    // order - concurrent writers didn't corrupt, drop, or
+    // cross-contaminate one venue's level with another's (checking size
+    // alone wouldn't catch that: every venue converges to the same size
+    // here, so a level attached to the wrong price would pass a
+    // size-only check).
+    L2Update snapshot_msg = read_fresh_snapshot(*stub_, TestBook());
     ASSERT_TRUE(snapshot_msg.has_snapshot());
     const auto& snapshot = snapshot_msg.snapshot();
     EXPECT_EQ(snapshot.book_seq(), static_cast<std::uint64_t>(kTotal));
     ASSERT_EQ(snapshot.bids_size(), static_cast<int>(kVenues.size()));
-    for (const auto& level : snapshot.bids()) {
-        EXPECT_EQ(level.size_raw(), Size(static_cast<double>(kItersPerVenue)).raw());
+    for (int k = 0; k < snapshot.bids_size(); ++k) {
+        // Bids are descending and venue i owns price 100+i, so the
+        // highest-indexed venue's price comes first.
+        std::size_t venue_index = kVenues.size() - 1 - static_cast<std::size_t>(k);
+        Price expected_price = Price(100.0 + static_cast<double>(venue_index));
+        EXPECT_EQ(snapshot.bids(k).price_raw(), expected_price.raw()) << "level " << k;
+        EXPECT_EQ(snapshot.bids(k).size_raw(), Size(static_cast<double>(kItersPerVenue)).raw()) << "level " << k;
     }
 }
 
