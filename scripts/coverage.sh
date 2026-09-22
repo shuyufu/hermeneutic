@@ -247,11 +247,29 @@ print(bd.replace("${sourceDir}", "."))
 # wiping on mismatch - what this block used to do, and what the
 # pre-presets version of this script did too), `--fresh` sidesteps the
 # question entirely by always reconfiguring from a clean CMake cache -
-# needs CMake >=3.24, well under this project's >=3.28 floor. It does
-# NOT wipe the rest of the build tree: vcpkg's own vcpkg_installed/ under
-# a coverage-*-service binaryDir survives untouched (verified: same
-# vcpkg_installed/ mtime before and after, ~3s reconfigure, not a vcpkg
-# rebuild), so this doesn't turn a cheap rerun into a slow one.
+# needs CMake >=3.24, well under this project's >=3.28 floor.
+#
+# `--fresh` does remove <binaryDir>/CMakeCache.txt and
+# <binaryDir>/CMakeFiles/ (CMake's own documented behavior), and this
+# project's own compiled objects live under exactly that path
+# (CMakeFiles/hermeneutic_tests.dir/...), so they - unlike vcpkg's
+# vcpkg_installed/, an entirely separate directory `--fresh` never
+# touches - do NOT survive a reconfigure and get rebuilt from scratch
+# every run (verified: 25 -> 7 .o files under CMakeFiles/ after --fresh,
+# then 18 "Building CXX object" lines on the next `cmake --build`).
+# FetchContent'd googletest/simdjson happen to survive anyway: each is
+# add_subdirectory()'d into its own _deps/<name>-build/CMakeFiles/,
+# physically outside the top-level CMakeFiles/ this flag clears - not
+# because `--fresh` treats them specially. So the real cost of
+# unconditional --fresh is "recompile this project's own coverage-
+# instrumented sources every run", not zero - it's just small enough at
+# this project's current size to fold into the total run times already
+# verified end-to-end for this script (~10-25s for --no-service, ~2-3.5
+# min for the default vcpkg-linked build - no "-service" flag exists;
+# --no-service's absence is what selects it - the latter dominated by
+# test execution, including venue_session_test's real-timer waits, not
+# by recompiling this project's own sources, and nowhere near vcpkg/
+# gRPC's own from-scratch build time).
 echo "== coverage scope: $SCOPE_NOTE"
 echo "== configuring $BUILD_DIR (preset: $PRESET)"
 cmake --preset="$PRESET" --fresh
