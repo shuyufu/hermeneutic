@@ -7,5 +7,6 @@
     "venue_idle_timeout_overrides": [
         {"venue": "OKX", "type": "SPOT", "seconds": 120},
         {"venue": "OKX", "type": "PERP", "seconds": 120}
-    ]
+    ],
+    "io_threads": 1
 }
