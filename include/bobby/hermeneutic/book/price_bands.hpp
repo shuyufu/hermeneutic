@@ -14,15 +14,17 @@
 
 namespace bobby::hermeneutic {
 
-// Depth within `bps` basis points of BBO on one side of the book.
-// `boundary_price` is an inward-rounded Price representation of that
-// boundary, used only for reporting (logging/UI/API) -- not to Price's
-// own precision, it's exact only to the mathematical boundary. Membership
-// is determined exactly by detail::within_bps(), not by comparing against
-// `boundary_price`. If the book has a BBO but runs out of depth before a
-// boundary, `cumulative_size`/`cumulative_notional` report the whole
-// book's depth (a valid answer, not a failure); an empty side has no BBO
-// to offset from and produces no bands at all.
+// Depth within `bps` basis points of a reference price (a side's own BBO,
+// or another anchor such as last trade price or midprice -- see
+// price_band_depth()) on one side of the book. `boundary_price` is an
+// inward-rounded Price representation of that boundary, used only for
+// reporting (logging/UI/API) -- not to Price's own precision, it's exact
+// only to the mathematical boundary. Membership is determined exactly by
+// detail::within_bps(), not by comparing against `boundary_price`. If
+// there's depth but it runs out before a boundary, `cumulative_size`/
+// `cumulative_notional` report the whole book's depth (a valid answer, not
+// a failure); bid_price_band_depths()/ask_price_band_depths() report no
+// bands at all for an empty side, having no BBO to offset from.
 struct PriceBand {
     int bps;
     Price boundary_price;
@@ -84,11 +86,11 @@ constexpr bool within_bps(Price price, Price best_price, int signed_bps, bool ge
 // round_down/ge booleans are derived, so a caller states its side once
 // (Ask:: or Bid::) instead of re-deriving both booleans from a signed bps
 // value by hand and risking getting one of them backwards. "reference"
-// here is whatever Price the caller passes in - this side's own best
-// price in price_band_depth's use below, never a midprice (this file
-// doesn't compute one). Each type takes an unsigned `bps` and applies its
-// side's sign internally, rather than making the caller pre-multiply by
-// +1/-1.
+// here is whatever Price the caller passes in - price_band_depth() below
+// takes it as a parameter rather than computing one itself, so it's free
+// to be a side's own best price, a midprice, or any other anchor the
+// caller wants. Each type takes an unsigned `bps` and applies its side's
+// sign internally, rather than making the caller pre-multiply by +1/-1.
 //
 // round_away (the boundary that overstates reach, rounding outward instead
 // of inward) has no caller today and is deliberately not implemented here --
@@ -111,19 +113,53 @@ struct Bid {
     }
 };
 
+// Validates bps_thresholds' shape for `Side`: sorted ascending,
+// non-negative, and (bid only) strictly under 10000. Split out from
+// price_band_depth() so bid_price_band_depths()/ask_price_band_depths()
+// can run the same check on their own empty-book fast path below, without
+// duplicating it inline.
+template <typename Side>
+constexpr bool bps_thresholds_valid(std::span<const int> bps_thresholds) noexcept {
+    constexpr bool kBidUpperBoundApplies = std::is_same_v<Side, Bid>;
+    return std::ranges::is_sorted(bps_thresholds) &&
+           std::ranges::all_of(bps_thresholds, [](int bps) { return bps >= 0; }) &&
+           (!kBidUpperBoundApplies ||
+            std::ranges::all_of(bps_thresholds, [](int bps) { return bps < 10'000; }));
+}
+
+// Applies bid_price_band_depths()/ask_price_band_depths()'s shared
+// "empty side -> no bands at all" contract: still validates
+// bps_thresholds (so a malformed list fails the same way whether or not
+// the book happens to be empty), then returns an empty result rather than
+// calling price_band_depth() at all, since there's no BBO to derive a
+// reference from.
+template <typename Side>
+std::expected<std::vector<PriceBand>, std::errc> empty_side_bands(
+    std::span<const int> bps_thresholds) {
+    if (!bps_thresholds_valid<Side>(bps_thresholds)) {
+        return std::unexpected(std::errc::invalid_argument);
+    }
+    return std::vector<PriceBand>{};
+}
+
 }  // namespace detail
 
 // Walks `levels` (best price first -- a precondition, not checked) and,
 // for each threshold in `bps_thresholds` (sorted ascending, non-negative,
 // and strictly under 10000 for the bid side), reports the depth within
-// that many bps of `levels`' own best price. `best_price` is taken from
-// `levels` itself rather than passed separately, so it can't mismatch the
-// map it's derived from. `Side` (detail::Ask or detail::Bid) is a template
-// parameter rather than a runtime flag because every real caller already
-// knows its side at compile time -- bid_price_band_depths/
-// ask_price_band_depths below hardcode it, and so does every caller of
-// those two. A level exactly at a boundary counts as within it.
-// O(levels + bps_thresholds).
+// that many bps of `reference`. `reference` is caller-supplied rather than
+// derived from `levels` itself, so it can be a side's own best price (as
+// bid_price_band_depths/ask_price_band_depths below use it), or any other
+// anchor an application wants band depth reported against instead -- last
+// trade price, midprice, a mark price. `levels` and `reference` are
+// independent: this function never checks that `reference` relates to
+// `levels`' contents, so an empty `levels` still produces well-defined
+// zero-depth bands anchored at `reference` (unlike the BBO-derived
+// wrappers below, which have no reference to fall back on for an empty
+// side and report no bands at all instead). `Side` (detail::Ask or
+// detail::Bid) is a template parameter rather than a runtime flag because
+// every real caller already knows its side at compile time. A level
+// exactly at a boundary counts as within it. O(levels + bps_thresholds).
 //
 // Fails with std::errc::invalid_argument if `bps_thresholds` itself isn't
 // sorted/non-negative/(for bids) under 10000 - checked at runtime, since
@@ -132,17 +168,19 @@ struct Bid {
 // single monotonically-increasing index (`next`), so an unsorted input
 // would silently compute wrong band boundaries rather than failing loudly.
 //
-// Also fails with std::errc::argument_out_of_domain if any level has a
-// non-positive price or negative size, checked as each level is walked:
-// `levels` is the caller's own book, not something this function
-// controls, so a malformed level is a runtime condition to reject, not an
-// assert()-only precondition. This is why offset_by_bps()/within_bps()
-// (reached through Side::round_inner()/Side::within()) can stay
-// assert()-only for their own price>0 precondition - this function
-// upholds it before ever calling them, so it's never checked twice.
+// Also fails with std::errc::argument_out_of_domain if `reference` itself
+// is non-positive, or if any level has a non-positive price or negative
+// size, checked as each level is walked: both `reference` and `levels`
+// come from the caller (e.g. a live venue's BBO/last-trade/mark price, and
+// the caller's own book) rather than something this function controls, so
+// a malformed value is a runtime condition to reject, not an assert()-only
+// precondition. This is why offset_by_bps()/within_bps() (reached through
+// Side::round_inner()/Side::within()) can stay assert()-only for their own
+// price>0 precondition - this function upholds it before ever calling
+// them, so it's never checked twice.
 //
 // Also fails with std::errc::result_out_of_range if a boundary computed
-// from a validated-in-range bps threshold against an unbounded level
+// from a validated-in-range bps threshold against an unbounded reference
 // price doesn't fit back into Price (see offset_by_bps()'s own comment),
 // or if the running cum_notional total itself overflows while
 // accumulating across levels - each individual price*size can be
@@ -150,23 +188,16 @@ struct Bid {
 // catch (see Notional::from_raw_safe()'s own comment).
 template <typename Side, typename Map>
 std::expected<std::vector<PriceBand>, std::errc> price_band_depth(
-    const Map& levels, std::span<const int> bps_thresholds) {
+    const Map& levels, Price reference, std::span<const int> bps_thresholds) {
     static_assert(std::is_same_v<Side, detail::Ask> || std::is_same_v<Side, detail::Bid>,
                   "Side must be detail::Ask or detail::Bid");
-    constexpr bool kBidUpperBoundApplies = std::is_same_v<Side, detail::Bid>;
-    if (!std::ranges::is_sorted(bps_thresholds) ||
-        !std::ranges::all_of(bps_thresholds, [](int bps) { return bps >= 0; }) ||
-        (kBidUpperBoundApplies &&
-         !std::ranges::all_of(bps_thresholds, [](int bps) { return bps < 10'000; }))) {
+    if (!detail::bps_thresholds_valid<Side>(bps_thresholds)) {
         return std::unexpected(std::errc::invalid_argument);
     }
+    if (reference.raw() <= 0) return std::unexpected(std::errc::argument_out_of_domain);
 
     std::vector<PriceBand> result;
     result.reserve(bps_thresholds.size());
-    if (levels.empty()) return result;  // no BBO to offset from -> no bands
-    // best_price is levels.begin()->first, which the loop below validates
-    // on its own first iteration (no separate check needed here).
-    Price best_price = levels.begin()->first;
 
     Size cum_size{};
     Notional cum_notional{};
@@ -177,8 +208,8 @@ std::expected<std::vector<PriceBand>, std::errc> price_band_depth(
 
         while (next < bps_thresholds.size()) {
             int bps = bps_thresholds[next];
-            if (Side::within(price, best_price, bps)) break;
-            auto boundary = Side::round_inner(best_price, bps);
+            if (Side::within(price, reference, bps)) break;
+            auto boundary = Side::round_inner(reference, bps);
             if (!boundary) return std::unexpected(boundary.error());
             result.push_back({bps_thresholds[next], *boundary, cum_size, cum_notional});
             ++next;
@@ -198,7 +229,7 @@ std::expected<std::vector<PriceBand>, std::errc> price_band_depth(
     }
 
     while (next < bps_thresholds.size()) {
-        auto boundary = Side::round_inner(best_price, bps_thresholds[next]);
+        auto boundary = Side::round_inner(reference, bps_thresholds[next]);
         if (!boundary) return std::unexpected(boundary.error());
         result.push_back({bps_thresholds[next], *boundary, cum_size, cum_notional});
         ++next;
@@ -207,14 +238,35 @@ std::expected<std::vector<PriceBand>, std::errc> price_band_depth(
     return result;
 }
 
-inline std::expected<std::vector<PriceBand>, std::errc> bid_price_band_depths(
-    const L2OrderBook& book, std::span<const int> bps_thresholds) {
-    return price_band_depth<detail::Bid>(book.bids, bps_thresholds);
+namespace detail {
+
+// Shared dispatch behind bid_price_band_depths()/ask_price_band_depths():
+// an empty side has no BBO to offset from, so it reports no bands at all
+// (via empty_side_bands(), still validating bps_thresholds along the way)
+// rather than calling price_band_depth() with a reference pulled out of
+// thin air; a non-empty side derives `reference` from its own best price
+// and delegates to price_band_depth() directly.
+template <typename Side, typename Map>
+std::expected<std::vector<PriceBand>, std::errc> bbo_price_band_depths(
+    const Map& levels, std::span<const int> bps_thresholds) {
+    if (levels.empty()) return empty_side_bands<Side>(bps_thresholds);
+    return price_band_depth<Side>(levels, levels.begin()->first, bps_thresholds);
 }
 
+}  // namespace detail
+
+// Convenience wrapper that reports band depth against the book's own best
+// bid, matching every existing caller's expectation. See
+// detail::bbo_price_band_depths() for the empty-side behavior.
+inline std::expected<std::vector<PriceBand>, std::errc> bid_price_band_depths(
+    const L2OrderBook& book, std::span<const int> bps_thresholds) {
+    return detail::bbo_price_band_depths<detail::Bid>(book.bids, bps_thresholds);
+}
+
+// Ask-side mirror of bid_price_band_depths() above.
 inline std::expected<std::vector<PriceBand>, std::errc> ask_price_band_depths(
     const L2OrderBook& book, std::span<const int> bps_thresholds) {
-    return price_band_depth<detail::Ask>(book.asks, bps_thresholds);
+    return detail::bbo_price_band_depths<detail::Ask>(book.asks, bps_thresholds);
 }
 
 }  // namespace bobby::hermeneutic

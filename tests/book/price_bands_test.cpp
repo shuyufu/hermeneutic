@@ -396,5 +396,59 @@ TEST(PriceBands, CumulativeNotionalOverflowReportsOutOfRangeInsteadOfWrapping) {
     EXPECT_EQ(result.error(), std::errc::result_out_of_range);
 }
 
+// price_band_depth() takes `reference` as a caller-supplied parameter
+// rather than deriving it from `levels`, precisely so a caller can anchor
+// bands at something other than the side's own best price. This picks a
+// reference (99.5) below the actual best ask (100.0) -- one
+// bid_price_band_depths()/ask_price_band_depths() would never produce on
+// their own, since they always derive it from book.asks.begin()->first --
+// to prove the boundary and membership math are computed off `reference`,
+// not off the book's own BBO.
+TEST(PriceBands, AcceptsAnExplicitReferencePriceOtherThanTheBooksOwnBbo) {
+    L2OrderBook book;
+    book.asks[Price(100.0)] = Size(5.0);
+    book.asks[Price(101.0)] = Size(4.0);
+
+    Price reference = Price(99.5);
+    auto result = price_band_depth<detail::Ask>(book.asks, reference, std::array{100});
+    ASSERT_TRUE(result.has_value());
+    const auto& bands = *result;
+
+    ASSERT_EQ(bands.size(), 1u);
+    // 100bps above 99.5 is 100.495 (inclusive), which covers the 100.0
+    // level but not the 101.0 one.
+    EXPECT_EQ(bands[0].boundary_price, Price(100.495));
+    EXPECT_EQ(bands[0].cumulative_size, Size(5.0));
+}
+
+// Unlike bid_price_band_depths()/ask_price_band_depths() (which have no
+// BBO to fall back on for an empty book and report no bands at all, see
+// PriceBands.EmptyBookReturnsNoBands), calling price_band_depth() directly
+// with an explicit reference still produces well-defined, zero-depth bands
+// over an empty book -- useful for e.g. a mark-price band that should be
+// reportable even when a venue's book is temporarily empty.
+TEST(PriceBands, ExplicitReferenceStillProducesZeroDepthBandsOverAnEmptyBook) {
+    L2OrderBook book;
+
+    auto result = price_band_depth<detail::Ask>(book.asks, Price(100.0), std::array{50, 100});
+    ASSERT_TRUE(result.has_value());
+    const auto& bands = *result;
+
+    ASSERT_EQ(bands.size(), 2u);
+    EXPECT_EQ(bands[0].boundary_price, Price(100.5));
+    EXPECT_EQ(bands[0].cumulative_size, Size(0.0));
+    EXPECT_EQ(bands[1].boundary_price, Price(101.0));
+    EXPECT_EQ(bands[1].cumulative_size, Size(0.0));
+}
+
+TEST(PriceBands, NonPositiveReferenceIsRejected) {
+    L2OrderBook book;
+    book.asks[Price(100.0)] = Size(1.0);
+
+    auto result = price_band_depth<detail::Ask>(book.asks, Price::from_raw(0), std::array{50});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), std::errc::argument_out_of_domain);
+}
+
 }  // namespace
 }  // namespace bobby::hermeneutic

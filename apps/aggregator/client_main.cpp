@@ -178,9 +178,10 @@ std::string format_volume_bands(const std::vector<VolumeBand>& bands) {
     return out.str();
 }
 
-// price_band_depth() returns an empty vector for a side with no BBO at all
-// (see its own comment) rather than one entry per threshold - the only
-// case where `bands.size()` doesn't match kPriceBandLabels.size().
+// bid_price_band_depths()/ask_price_band_depths() return an empty vector
+// for a side with no BBO at all (see their own comments) rather than one
+// entry per threshold - the only case where `bands.size()` doesn't match
+// kPriceBandLabels.size().
 std::string format_price_bands(const std::vector<PriceBand>& bands) {
     if (bands.empty()) return "(no bbo)";
     std::ostringstream out;
