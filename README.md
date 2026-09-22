@@ -8,10 +8,9 @@ book over gRPC (`SubscribeL2Diff`/`SubscribeBbo`, plus a `ListBooks` query
 RPC for discovering which books a given instance serves) so downstream consumers
 never have to speak to an exchange directly. `hermeneutic_aggregator_client`
 is a minimal example consumer of that stream. See "Aggregator service"
-below for how the two run together, `docs/ingestion_design.md` (中文)
-for the full design history and open questions, and
-`docs/api_protocol_design.md` for the gRPC API/wire-protocol
-contract and how to extend it (new venues, new market types, new RPCs).
+below for how the two run together, and `docs/api_protocol_design.md`
+for the gRPC API/wire-protocol contract and how to extend it (new
+venues, new market types, new RPCs).
 
 ## Technical decisions
 
@@ -21,12 +20,10 @@ The project-level decisions with the most day-to-day impact:
   `{base, quote, market}` end-to-end - over the wire, in
   `AggregatorService`'s book map, and in the client's CLI parsing - rather
   than a concatenated string like `"BTC_USDT.SPOT"` that has to be
-  re-parsed at every boundary. `docs/ingestion_design.md` 第10節第10項
-  covers why the wire format moved off the string key.
+  re-parsed at every boundary.
 - **Spot and perp are always separate books**, even on venues (OKX) whose
   WebSocket channel is protocol-identical for both: mixing their liquidity
   into one book would silently blend two different instruments' prices.
-  See `docs/ingestion_design.md`'s OKX section.
 - **Ingestion and the gRPC surface are two independently reusable layers.**
   `hermeneutic::ingestion` (`VenueSession`/`IngestionRunner`) never mentions
   `aggregator::SymbolBook` or protobuf by name - it's templated on any
@@ -41,9 +38,9 @@ The project-level decisions with the most day-to-day impact:
   is there - see `apps/aggregator/subscriptions.example.json` and
   `server_main.cpp`'s comment on this.
 - **Real market-data code is exercised against the real exchanges**, not
-  just fixtures, before being trusted: `docs/ingestion_design.md` records
-  live verification runs (and the bugs they caught, e.g. a `SymbolSync`
-  empty-buffer case) that fixture-only tests would have missed.
+  just fixtures, before being trusted: live verification runs have caught
+  real bugs (e.g. a `SymbolSync` empty-buffer case) that fixture-only tests
+  would have missed.
 
 Containerization-specific decisions (multi-stage build, why the runtime
 image needs `libssl3` but not vcpkg, etc.) are covered in "Running with
@@ -85,6 +82,47 @@ cmake -B build -DHERMENEUTIC_BUILD_SERVICE=OFF
 cmake --build build --target hermeneutic_tests
 ```
 
+## Test coverage
+
+```sh
+scripts/coverage.sh              # full build (needs VCPKG_ROOT, default ~/vcpkg): includes net/, ingestion/, aggregator service/client
+scripts/coverage.sh --no-service # vcpkg-free: skips net/**, venue_session.hpp/ingestion_runner.hpp, and the aggregator service/client (ingestion/book_subscription.hpp stays in scope either way)
+scripts/coverage.sh --html       # also writes an HTML report to build-coverage/coverage-html
+```
+
+Clang source-based coverage only (`-fprofile-instr-generate -fcoverage-mapping`,
+gated behind `-DHERMENEUTIC_COVERAGE=ON`; no GCC/gcov path, since this project
+has no Linux CI or `lcov`/`gcovr` to run one against). The script configures
+`build-coverage/` (wiping it first only if the cached `CMAKE_TOOLCHAIN_FILE`
+or compiler doesn't match what was requested - the two settings CMake locks
+in after a directory's first configure; every other flag, like
+`HERMENEUTIC_BUILD_SERVICE`, updates freely on a plain reconfigure), builds
+every test binary, runs each one directly and once, in parallel (not through
+`ctest`, which registers one entry per gtest `TEST()` via
+`gtest_discover_tests()` - running through it would relaunch the same binary
+hundreds of times and clobber a fixed profile path), merges the profiles,
+and prints a per-file report scoped to every `.hpp`/`.cpp` under `include/`
+and `apps/` (an allowlist, not an exclusion list - a new top-level source
+directory would need adding there to ever appear in the report).
+
+Three things that look like bugs but aren't:
+- A `warning: N functions have mismatched data` from `llvm-cov report` is
+  expected: this project is almost entirely header-only, so the same inline
+  function gets compiled slightly differently across separate test binaries'
+  translation units, and `llvm-cov` flags (but doesn't fail on) that mismatch
+  when merging profiles from multiple binaries.
+- `llvm-cov` only reports on template specializations actually instantiated
+  by the tests, e.g. `BasicFixedPoint<9>` (this project's `Notional`) showing
+  coverage while other widths don't - that reflects which specializations ran,
+  not a hole in the report.
+- A header with no coverage mapping at all (nothing in it compiles to an
+  instrumented region - a pure alias/traits header, or one no instrumented
+  test binary happens to include, like `apps/aggregator/client_main.cpp`/
+  `server_main.cpp`, which only build into the non-test service/client
+  executables) is silently missing from the table entirely, not listed at
+  0%. Compare the table's row count against `find include apps -name
+  '*.hpp' -o -name '*.cpp'` if a file's absence needs explaining.
+
 ## Building the gRPC-based service targets
 
 ### Adding a `.proto`
@@ -113,10 +151,7 @@ Which venues feed which book is driven by a JSON subscription config (see
 `apps/aggregator/subscriptions.example.json` and
 `bobby/hermeneutic/ingestion/book_subscription.hpp` for the document shape);
 its `"symbol"` field is the same `"BASE_QUOTE"` spelling (`"BTC_USDT"`) as the
-`BookId` a client subscribes with - see `docs/ingestion_design.md`'s 第10節
-第10項 for why the wire format moved from a concatenated string key to a
-structured message, and its OKX section for why perp and spot aren't merged
-into one book. It only wraps the book(s) and broadcasts to subscribers —
+`BookId` a client subscribes with. It only wraps the book(s) and broadcasts to subscribers —
 feeding real market data (`SymbolBook::apply_batch`/`apply_snapshot`/
 `invalidate_venue`, reached via `AggregatorService::book(BookId)`) is up to
 the caller. The unary `ListBooks` RPC returns that fixed book set directly,
@@ -131,8 +166,8 @@ cmake --build build-vcpkg --target hermeneutic_aggregator_service
 
 `hermeneutic_aggregator_client` (`apps/aggregator/client_main.cpp`) is a
 minimal example client for the service above - not a throwaway (unlike this
-project's earlier live-verification programs, see `docs/ingestion_design.md`),
-kept around as a starting point for consuming `AggregatorService`'s output
+project's earlier live-verification programs), kept around as a starting
+point for consuming `AggregatorService`'s output
 and for manually poking at a running instance. It subscribes one or more
 books (one thread per book) and publishes a chosen view of the order book to
 stdout on every update; `volume-bands`/`price-bands` check `SubscribeL2Diff`'s

@@ -49,19 +49,17 @@ endif()
 
 # Reproducible, one-flag sanitizer builds - the previous way to run
 # ASan/UBSan against this project was a manually-created, one-off
-# build-asan directory (see docs/ingestion_design.md's OKX
-# verification section), not something `cmake -B build
+# build-asan directory, not something `cmake -B build
 # -DHERMENEUTIC_ASAN=ON` could reproduce on demand. Applied the same
 # way as the warning flags above (via hermeneutic::core, so it reaches
 # this project's own code but not vcpkg's prebuilt gRPC/Protobuf
 # static libraries, which aren't ASan-instrumented) - a translation
-# unit built with ASan that links against one built without it is
-# exactly the mismatch docs/ingestion_design.md's OKX section hit
-# (a container-overflow false positive from libc++'s container
-# annotations disagreeing between the two), worked around there with
-# `ASAN_OPTIONS=detect_container_overflow=0` at run time - the same
-# workaround still applies here, this option does not remove the need
-# for it.
+# unit built with ASan that links against one built without it can hit
+# a container-overflow false positive from libc++'s container
+# annotations disagreeing between the two (seen during OKX
+# verification), worked around with
+# `ASAN_OPTIONS=detect_container_overflow=0` at run time - this option
+# does not remove the need for it.
 option(HERMENEUTIC_ASAN "Build with AddressSanitizer (implies -fno-omit-frame-pointer)" OFF)
 option(HERMENEUTIC_UBSAN "Build with UndefinedBehaviorSanitizer (implies -fno-omit-frame-pointer)" OFF)
 if(HERMENEUTIC_ASAN)
@@ -88,6 +86,32 @@ option(HERMENEUTIC_TSAN "Build with ThreadSanitizer (implies -fno-omit-frame-poi
 if(HERMENEUTIC_TSAN)
     target_compile_options(hermeneutic_core INTERFACE -fsanitize=thread -fno-omit-frame-pointer)
     target_link_options(hermeneutic_core INTERFACE -fsanitize=thread)
+endif()
+
+# Source-based coverage instrumentation, driven end-to-end by
+# scripts/coverage.sh (configure/build/run/report). Clang-only, applied
+# via hermeneutic_core the same way as the sanitizer options above: only
+# this project's own code (and anything linking hermeneutic::core) gets
+# instrumented, not vcpkg's prebuilt gRPC/Protobuf. Deliberately doesn't
+# add -O0 here (unlike the sanitizer options, which only add
+# -fno-omit-frame-pointer): an INTERFACE compile option is appended
+# after CMAKE_CXX_FLAGS_<CONFIG>, so baking in an optimization level
+# here would silently override whatever CMAKE_BUILD_TYPE the coverage
+# build was configured with - scripts/coverage.sh sets
+# -DCMAKE_BUILD_TYPE=Debug itself instead. No GCC/gcov branch: this
+# project has no lcov/gcovr and no Linux CI to run one, so an untested
+# fallback path would just rot - configuring under GCC fails loudly
+# below rather than silently producing bad numbers.
+option(HERMENEUTIC_COVERAGE "Instrument for source-based test coverage (Clang only; see scripts/coverage.sh)" OFF)
+if(HERMENEUTIC_COVERAGE)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR
+            "HERMENEUTIC_COVERAGE only supports Clang's source-based coverage "
+            "(CMAKE_CXX_COMPILER_ID=${CMAKE_CXX_COMPILER_ID}); build with "
+            "clang/clang++ instead.")
+    endif()
+    target_compile_options(hermeneutic_core INTERFACE -fprofile-instr-generate -fcoverage-mapping)
+    target_link_options(hermeneutic_core INTERFACE -fprofile-instr-generate -fcoverage-mapping)
 endif()
 
 # This project's own symbol/venue naming rules (BASE_QUOTE splitting, book
