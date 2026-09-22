@@ -105,7 +105,7 @@ services:
     command: ["aggregator-service:50051", "volume-bands", "0", "BTC_USDT.SPOT"]
 
   # Same idea for price-bands' bps thresholds, via "--price-bps=<b1,b2,...>"
-  # in place of client_main.cpp's default 50/100/200/500/1000+.
+  # in place of client_main.cpp's default 50bps/100bps/200bps/500bps/1000bps+.
   aggregator-client-price-bands:
     <<: *client-base
     image: aggregator-client-price-bands
