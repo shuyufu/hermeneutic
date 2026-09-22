@@ -203,9 +203,9 @@ cmake --build build-vcpkg --target hermeneutic_aggregator_client
 #                 ascending, strictly positive integers, no decimals/
 #                 scientific notation)
 #   price-bands:  subscribes to SubscribeL2Diff, prints depth within
-#                 50/100/200/500/1000+ bps (default) of BBO on each side -
-#                 override via --price-bps= (comma-separated, ascending,
-#                 in [0, 10000))
+#                 50bps/100bps/200bps/500bps/1000bps+ (default) of BBO on
+#                 each side - override via --price-bps= (comma-separated,
+#                 ascending, in [0, 10000))
 ./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 bbo 60 BTC_USDT.SPOT BTC_USDT.PERP
 ./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 volume-bands 60 BTC_USDT.SPOT
 ./build-vcpkg/hermeneutic_aggregator_client 0.0.0.0:50051 price-bands 60 BTC_USDT.SPOT
