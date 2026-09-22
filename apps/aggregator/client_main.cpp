@@ -1,10 +1,10 @@
 // Example/diagnostic client for hermeneutic_aggregator_service: subscribes
 // to one or more books and publishes a chosen view of the order book to
-// stdout. Unlike the throwaway live-verification programs referenced in
-// docs/ingestion_design.md (written, run once, then deleted), this one is
-// meant to stay - a starting point for whatever actually consumes the
-// aggregator's output next, and a manual way to poke at a running
-// aggregator instance during development.
+// stdout. Unlike this project's earlier throwaway live-verification
+// programs (written, run once, then deleted), this one is meant to stay -
+// a starting point for whatever actually consumes the aggregator's output
+// next, and a manual way to poke at a running aggregator instance during
+// development.
 //
 // Three publisher modes plus one query mode, selected on the command line:
 //   bbo           best bid/offer - subscribes to SubscribeBbo only.

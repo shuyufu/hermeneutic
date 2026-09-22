@@ -30,8 +30,8 @@ namespace beast = boost::beast;
 namespace websocket = beast::websocket;
 
 // Thin, venue-agnostic WebSocket connection: connect/send/read/close only.
-// Knows nothing about symbols, resync, or any particular exchange - see
-// docs/ingestion_design.md for what owns that (VenueSession).
+// Knows nothing about symbols, resync, or any particular exchange - that's
+// VenueSession's job.
 //
 // Templated on the underlying stream so production code (wss://, a TLS
 // stream) and tests (a plain TCP stream against a local server, avoiding
