@@ -73,6 +73,23 @@ if(HERMENEUTIC_UBSAN)
     target_link_options(hermeneutic_core INTERFACE -fsanitize=undefined)
 endif()
 
+# One-flag ThreadSanitizer build, added alongside ASan/UBSan above for the
+# same on-demand-reproducibility reason - the concrete motivation here is
+# verifying apps/aggregator/server_main.cpp's io_threads config (multiple
+# threads calling io_context::run() on one shared io_context) doesn't race
+# anywhere this project's own static audit missed. Mutually exclusive with
+# HERMENEUTIC_ASAN (can't combine -fsanitize=address and -fsanitize=thread
+# in one binary); this project doesn't enforce that at configure time, same
+# as it doesn't for ASan/UBSan above. Same vcpkg gRPC/Protobuf-is-not-
+# instrumented caveat as HERMENEUTIC_ASAN's own comment: TSan can't see
+# (and won't report on) races inside those prebuilt libraries, only in this
+# project's own code - which is exactly what this option exists to check.
+option(HERMENEUTIC_TSAN "Build with ThreadSanitizer (implies -fno-omit-frame-pointer)" OFF)
+if(HERMENEUTIC_TSAN)
+    target_compile_options(hermeneutic_core INTERFACE -fsanitize=thread -fno-omit-frame-pointer)
+    target_link_options(hermeneutic_core INTERFACE -fsanitize=thread)
+endif()
+
 # This project's own symbol/venue naming rules (BASE_QUOTE splitting, book
 # keys, per-venue native symbol formats - see symbol.hpp's own class
 # comment): zero dependency beyond the standard library, so any future

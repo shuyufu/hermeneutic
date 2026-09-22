@@ -120,22 +120,29 @@ std::unique_ptr<BboSubscription> subscribe_bbo(Aggregator::Stub& stub, const Boo
 TEST(SubscriberQueueTest, DrainsInFifoOrderAndReportsResultKind) {
     SubscriberQueue<L2Update> queue(4, OverflowPolicy::Close);
 
-    std::vector<L2Update> out;
+    std::vector<std::shared_ptr<const L2Update>> out;
     EXPECT_EQ(queue.wait_and_drain(std::chrono::milliseconds(10), out),
               SubscriberQueue<L2Update>::DrainResult::TimedOut);
     EXPECT_TRUE(out.empty());
 
-    L2Update first, second;
-    first.mutable_heartbeat()->set_ts_ns(1);
-    second.mutable_heartbeat()->set_ts_ns(2);
-    EXPECT_TRUE(queue.push_or_close(first));
-    EXPECT_TRUE(queue.push_or_close(second));
+    auto first = std::make_shared<const L2Update>([] {
+        L2Update u;
+        u.mutable_heartbeat()->set_ts_ns(1);
+        return u;
+    }());
+    auto second = std::make_shared<const L2Update>([] {
+        L2Update u;
+        u.mutable_heartbeat()->set_ts_ns(2);
+        return u;
+    }());
+    EXPECT_EQ(queue.push_or_close(first), SubscriberQueue<L2Update>::PushResult::Pushed);
+    EXPECT_EQ(queue.push_or_close(second), SubscriberQueue<L2Update>::PushResult::Pushed);
 
     EXPECT_EQ(queue.wait_and_drain(std::chrono::milliseconds(10), out),
               SubscriberQueue<L2Update>::DrainResult::Drained);
     ASSERT_EQ(out.size(), 2u);
-    EXPECT_EQ(out[0].heartbeat().ts_ns(), 1u);
-    EXPECT_EQ(out[1].heartbeat().ts_ns(), 2u);
+    EXPECT_EQ(out[0]->heartbeat().ts_ns(), 1u);
+    EXPECT_EQ(out[1]->heartbeat().ts_ns(), 2u);
 }
 
 TEST(SubscriberQueueTest, BootstrappingAllowsAHigherCapacityThanSteadyState) {
@@ -152,16 +159,16 @@ TEST(SubscriberQueueTest, BootstrappingAllowsAHigherCapacityThanSteadyState) {
     // capacity-2 queue must all still succeed here, even though the same
     // burst would have closed a steady-state (post-end_bootstrap())
     // queue after just 2.
-    L2Update update;
+    auto update = std::make_shared<const L2Update>();
     for (int i = 0; i < 8; ++i) {
-        EXPECT_TRUE(queue.push_or_close(update));
+        EXPECT_EQ(queue.push_or_close(update), SubscriberQueue<L2Update>::PushResult::Pushed);
     }
 
     // The 9th push exceeds even the bootstrap ceiling - the queue must
     // still close rather than grow further.
-    EXPECT_FALSE(queue.push_or_close(update));
+    EXPECT_EQ(queue.push_or_close(update), SubscriberQueue<L2Update>::PushResult::ClosedNow);
 
-    std::vector<L2Update> out;
+    std::vector<std::shared_ptr<const L2Update>> out;
     EXPECT_EQ(queue.wait_and_drain(std::chrono::milliseconds(10), out),
               SubscriberQueue<L2Update>::DrainResult::Closed);
     EXPECT_TRUE(out.empty());  // closed, so the 8 successfully queued updates were discarded
@@ -171,18 +178,18 @@ TEST(SubscriberQueueTest, CloseOverflowClosesAndDiscardsEverythingQueued) {
     SubscriberQueue<L2Update> queue(2, OverflowPolicy::Close);
     queue.end_bootstrap();  // capacity/OverflowPolicy only apply after this
 
-    L2Update update;
-    ASSERT_TRUE(queue.push_or_close(update));
-    ASSERT_TRUE(queue.push_or_close(update));
+    auto update = std::make_shared<const L2Update>();
+    ASSERT_EQ(queue.push_or_close(update), SubscriberQueue<L2Update>::PushResult::Pushed);
+    ASSERT_EQ(queue.push_or_close(update), SubscriberQueue<L2Update>::PushResult::Pushed);
     // Third push finds the queue already at capacity: closes it instead of
     // dropping the oldest entry, since a gap in an L2Diff stream leaves the
     // subscriber's book genuinely wrong - only a fresh snapshot recovers it,
     // so there's nothing worth keeping once it's fallen this far behind.
-    EXPECT_FALSE(queue.push_or_close(update));
+    EXPECT_EQ(queue.push_or_close(update), SubscriberQueue<L2Update>::PushResult::ClosedNow);
     // Pushes after closing are also rejected, not re-queued.
-    EXPECT_FALSE(queue.push_or_close(update));
+    EXPECT_EQ(queue.push_or_close(update), SubscriberQueue<L2Update>::PushResult::AlreadyClosed);
 
-    std::vector<L2Update> out;
+    std::vector<std::shared_ptr<const L2Update>> out;
     EXPECT_EQ(queue.wait_and_drain(std::chrono::milliseconds(10), out),
               SubscriberQueue<L2Update>::DrainResult::Closed);
     EXPECT_TRUE(out.empty());  // the two successfully queued updates were discarded, not delivered
@@ -192,24 +199,35 @@ TEST(SubscriberQueueTest, DropOldestOverflowKeepsNewestWithoutClosing) {
     SubscriberQueue<BboUpdate> queue(2, OverflowPolicy::DropOldest);
     queue.end_bootstrap();  // capacity/OverflowPolicy only apply after this
 
-    BboUpdate first, second, third;
-    first.mutable_bbo()->set_book_seq(1);
-    second.mutable_bbo()->set_book_seq(2);
-    third.mutable_bbo()->set_book_seq(3);
+    auto first = std::make_shared<const BboUpdate>([] {
+        BboUpdate u;
+        u.mutable_bbo()->set_book_seq(1);
+        return u;
+    }());
+    auto second = std::make_shared<const BboUpdate>([] {
+        BboUpdate u;
+        u.mutable_bbo()->set_book_seq(2);
+        return u;
+    }());
+    auto third = std::make_shared<const BboUpdate>([] {
+        BboUpdate u;
+        u.mutable_bbo()->set_book_seq(3);
+        return u;
+    }());
 
-    ASSERT_TRUE(queue.push_or_close(first));
-    ASSERT_TRUE(queue.push_or_close(second));
+    ASSERT_EQ(queue.push_or_close(first), SubscriberQueue<BboUpdate>::PushResult::Pushed);
+    ASSERT_EQ(queue.push_or_close(second), SubscriberQueue<BboUpdate>::PushResult::Pushed);
     // Third push overflows capacity 2: drops the oldest (seq 1) instead of
     // closing, since a stale Bbo costs nothing to skip - each one is a
     // complete, self-contained state, not a delta.
-    EXPECT_TRUE(queue.push_or_close(third));
+    EXPECT_EQ(queue.push_or_close(third), SubscriberQueue<BboUpdate>::PushResult::Pushed);
 
-    std::vector<BboUpdate> out;
+    std::vector<std::shared_ptr<const BboUpdate>> out;
     EXPECT_EQ(queue.wait_and_drain(std::chrono::milliseconds(10), out),
               SubscriberQueue<BboUpdate>::DrainResult::Drained);
     ASSERT_EQ(out.size(), 2u);
-    EXPECT_EQ(out[0].bbo().book_seq(), 2u);
-    EXPECT_EQ(out[1].bbo().book_seq(), 3u);
+    EXPECT_EQ(out[0]->bbo().book_seq(), 2u);
+    EXPECT_EQ(out[1]->bbo().book_seq(), 3u);
 }
 
 class AggregatorServiceTest : public ::testing::Test {

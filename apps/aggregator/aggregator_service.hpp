@@ -66,37 +66,64 @@ class SubscriberQueue {
   public:
     enum class DrainResult { TimedOut, Drained, Closed };
 
+    // What one push_or_close() call actually did, so a caller broadcasting
+    // to many queues at once (see Fanout::broadcast()) can tell "this
+    // queue needs waking" (Pushed, ClosedNow) apart from "nothing changed,
+    // don't bother" (AlreadyClosed - a prior call already woke anyone
+    // waiting on the close).
+    enum class PushResult { Pushed, ClosedNow, AlreadyClosed };
+
     SubscriberQueue(std::size_t capacity, OverflowPolicy overflow_policy)
         : capacity_(capacity), overflow_policy_(overflow_policy) {}
 
-    // Non-blocking. False means this push found the queue already closed,
-    // or (Close policy only) just closed it by overflowing its effective
-    // capacity. While bootstrapping (see end_bootstrap() below), that
-    // effective capacity is `capacity_ * kBootstrapCapacityMultiplier`,
-    // not `capacity_` itself: a newly subscribed queue is registered for
-    // broadcast before its caller's own initial Write() has completed, so
-    // an ordinary burst landing before draining starts must not trip the
-    // same tight threshold a genuinely slow, already-draining subscriber
-    // would. Still a real ceiling, not unlimited: a client that stops
-    // reading and stalls Write() indefinitely must not be able to drive
-    // unbounded memory growth here.
-    bool push_or_close(T update) {
+    // Non-blocking, and does NOT wake wait_and_drain() - call notify()
+    // afterward once that's safe (see notify()'s own comment for why
+    // Fanout::broadcast() defers it rather than calling it inline here).
+    // AlreadyClosed means this push found the queue already closed;
+    // ClosedNow (Close policy only) means this call just closed it by
+    // overflowing its effective capacity. While bootstrapping (see
+    // end_bootstrap() below), that effective capacity is
+    // `capacity_ * kBootstrapCapacityMultiplier`, not `capacity_` itself:
+    // a newly subscribed queue is registered for broadcast before its
+    // caller's own initial Write() has completed, so an ordinary burst
+    // landing before draining starts must not trip the same tight
+    // threshold a genuinely slow, already-draining subscriber would.
+    // Still a real ceiling, not unlimited: a client that stops reading and
+    // stalls Write() indefinitely must not be able to drive unbounded
+    // memory growth here.
+    //
+    // Takes a shared_ptr<const T>, not a T by value: every subscriber of
+    // one broadcast() shares the same payload (a refcount bump) instead of
+    // each getting its own deep copy of a protobuf message with repeated
+    // fields - see Fanout::broadcast()'s own comment.
+    PushResult push_or_close(std::shared_ptr<const T> update) {
         std::lock_guard lock(mutex_);
-        if (closed_) return false;
+        if (closed_) return PushResult::AlreadyClosed;
         std::size_t effective_capacity = bootstrapping_ ? capacity_ * kBootstrapCapacityMultiplier : capacity_;
         if (queue_.size() >= effective_capacity) {
             if (overflow_policy_ == OverflowPolicy::Close) {
                 closed_ = true;
                 queue_.clear();
-                cv_.notify_one();
-                return false;
+                return PushResult::ClosedNow;
             }
             queue_.pop_front();
         }
         queue_.push_back(std::move(update));
-        cv_.notify_one();
-        return true;
+        return PushResult::Pushed;
     }
+
+    // Wakes wait_and_drain(), if anything is currently blocked there -
+    // harmless (just a wasted syscall, never a correctness issue) to call
+    // when nothing is waiting, since wait_and_drain() always re-checks its
+    // own predicate rather than trusting the wake alone. Deliberately
+    // doesn't take mutex_: the state change it's reporting already
+    // happened-before under push_or_close()'s own lock_guard, and
+    // condition_variable::notify_one() needs no lock held to be safe to
+    // call. Split out from push_or_close() so Fanout::broadcast() can push
+    // into every subscriber's queue first and only notify afterward, once
+    // its own caller (SymbolBook::mutex_) has released its lock - see that
+    // method's own comment for why.
+    void notify() { cv_.notify_one(); }
 
     // Ends the bootstrap window above, switching push_or_close() back to
     // normal capacity/policy enforcement. Called exactly once, by the
@@ -111,7 +138,7 @@ class SubscriberQueue {
     // priority over whatever's queued, though push_or_close() never leaves
     // anything queued alongside a close. Returns Drained with `out`
     // populated, or TimedOut/Closed with `out` left untouched.
-    DrainResult wait_and_drain(std::chrono::milliseconds timeout, std::vector<T>& out) {
+    DrainResult wait_and_drain(std::chrono::milliseconds timeout, std::vector<std::shared_ptr<const T>>& out) {
         std::unique_lock lock(mutex_);
         cv_.wait_for(lock, timeout, [this] { return !queue_.empty() || closed_; });
         if (closed_) return DrainResult::Closed;
@@ -130,7 +157,7 @@ class SubscriberQueue {
 
     std::mutex mutex_;
     std::condition_variable cv_;
-    std::deque<T> queue_;
+    std::deque<std::shared_ptr<const T>> queue_;
     std::size_t capacity_;
     OverflowPolicy overflow_policy_;
     bool closed_ = false;
@@ -177,8 +204,32 @@ class Fanout {
     // Non-blocking: pushes `update` into every subscriber's own queue. The
     // actual Write() happens later, off this thread, on that subscriber's
     // own handler thread. Must be called with the caller's mutex_ held.
-    void broadcast(const T& update) {
-        for (auto& [ptr, queue] : subscribers_) queue->push_or_close(update);
+    //
+    // Takes a shared_ptr<const T>, built once by the caller and shared
+    // across every subscriber (a refcount bump per push, not a deep copy
+    // of a protobuf message with repeated fields).
+    //
+    // Deliberately does NOT call SubscriberQueue::notify() itself - only
+    // push_or_close(), which never blocks or wakes a scheduler. Returns
+    // the subscriber queues that actually changed state (were pushed to,
+    // or were just closed by this call) so the caller can call notify()
+    // on each of them once it has released its own mutex_ (SymbolBook's,
+    // shared by every venue and stream for one symbol). Doing the wake
+    // here, inline, while that lock is still held would extend a
+    // contended critical section by O(N subscribers) worth of
+    // notify_one() calls for no ordering reason: only the enqueue itself
+    // has to happen before the lock is released (that's what fixes each
+    // update's relative seq order), a late wake is harmless because
+    // wait_and_drain() has its own timeout as a backstop.
+    std::vector<std::shared_ptr<SubscriberQueue<T>>> broadcast(const std::shared_ptr<const T>& update) {
+        std::vector<std::shared_ptr<SubscriberQueue<T>>> to_notify;
+        to_notify.reserve(subscribers_.size());
+        for (auto& [ptr, queue] : subscribers_) {
+            if (queue->push_or_close(update) != SubscriberQueue<T>::PushResult::AlreadyClosed) {
+                to_notify.push_back(queue);
+            }
+        }
+        return to_notify;
     }
 
   private:
@@ -233,13 +284,16 @@ class SymbolBook {
             if (!is_valid_level(price, size)) return std::unexpected(std::errc::invalid_argument);
         }
 
-        std::lock_guard lock(mutex_);
+        std::expected<void, std::errc> result;
+        NotifyList to_notify;
+        {
+            std::lock_guard lock(mutex_);
 
-        SideChanges changes;
-        auto result = book_.apply_snapshot(venue, bids, asks, changes.bids, changes.asks);
-        if (!result) return result;
-
-        publish(collect_changes(changes));
+            SideChanges changes;
+            result = book_.apply_snapshot(venue, bids, asks, changes.bids, changes.asks);
+            if (result) to_notify = publish(collect_changes(changes));
+        }
+        notify_all(to_notify);
         return result;
     }
 
@@ -265,18 +319,22 @@ class SymbolBook {
             if (!is_valid_level(price, size)) return std::unexpected(std::errc::invalid_argument);
         }
 
-        std::lock_guard lock(mutex_);
+        NotifyList to_notify;
+        {
+            std::lock_guard lock(mutex_);
 
-        // book_.apply_batch() re-validates on its own (it must hold that
-        // guarantee for callers that skip this class's pre-check), so
-        // this can only fail on allocation here, given the same bids/asks
-        // already passed the check above.
-        SideChanges changes;
-        if (auto result = book_.apply_batch(venue, bids, asks, changes.bids, changes.asks); !result) {
-            return result;
+            // book_.apply_batch() re-validates on its own (it must hold
+            // that guarantee for callers that skip this class's
+            // pre-check), so this can only fail on allocation here, given
+            // the same bids/asks already passed the check above.
+            SideChanges changes;
+            if (auto result = book_.apply_batch(venue, bids, asks, changes.bids, changes.asks); !result) {
+                return result;
+            }
+
+            to_notify = publish(collect_changes(changes));
         }
-
-        publish(collect_changes(changes));
+        notify_all(to_notify);
         return {};
     }
 
@@ -285,12 +343,16 @@ class SymbolBook {
     // so a plain SideChanges is safe here - a mid-report allocation
     // failure in the Sink can't corrupt book_'s already-committed state.
     void invalidate_venue(const VenueId& venue) {
-        std::lock_guard lock(mutex_);
+        NotifyList to_notify;
+        {
+            std::lock_guard lock(mutex_);
 
-        SideChanges changes;
-        book_.invalidate_venue(venue, changes.bids, changes.asks);
+            SideChanges changes;
+            book_.invalidate_venue(venue, changes.bids, changes.asks);
 
-        publish(collect_changes(changes));
+            to_notify = publish(collect_changes(changes));
+        }
+        notify_all(to_notify);
     }
 
     // Broadcasts a liveness signal to every subscriber of this symbol (both
@@ -305,24 +367,30 @@ class SymbolBook {
     // apply_batch()/invalidate_venue() and report a venue as live that
     // was invalidated a moment earlier, or vice versa.
     void send_heartbeat() {
-        std::lock_guard lock(mutex_);
-        auto ts_ns = now_ns();
+        NotifyList to_notify;
+        {
+            std::lock_guard lock(mutex_);
+            auto ts_ns = now_ns();
 
-        L2Update l2_update;
-        auto* l2_heartbeat = l2_update.mutable_heartbeat();
-        l2_heartbeat->set_ts_ns(ts_ns);
-        // Walked once here; bbo_heartbeat below copies the resulting
-        // RepeatedPtrField wholesale instead of re-deriving the same list.
-        for (const auto& [venue, venue_book] : book_.venues()) {
-            l2_heartbeat->add_live_venues(symbol::to_string(venue));
+            L2Update l2_update;
+            auto* l2_heartbeat = l2_update.mutable_heartbeat();
+            l2_heartbeat->set_ts_ns(ts_ns);
+            for (const auto& [venue, venue_book] : book_.venues()) {
+                l2_heartbeat->add_live_venues(symbol::to_string(venue));
+            }
+            auto l2_ptr = std::make_shared<const L2Update>(std::move(l2_update));
+            to_notify.l2 = l2_fanout_.broadcast(l2_ptr);
+
+            BboUpdate bbo_update;
+            auto* bbo_heartbeat = bbo_update.mutable_heartbeat();
+            bbo_heartbeat->set_ts_ns(ts_ns);
+            // Copies from l2_ptr's own live_venues, not the now-moved-from
+            // l2_update/l2_heartbeat above, since building l2_ptr moved
+            // l2_update's contents into the shared payload just broadcast.
+            *bbo_heartbeat->mutable_live_venues() = l2_ptr->heartbeat().live_venues();
+            to_notify.bbo = bbo_fanout_.broadcast(std::make_shared<const BboUpdate>(std::move(bbo_update)));
         }
-        l2_fanout_.broadcast(l2_update);
-
-        BboUpdate bbo_update;
-        auto* bbo_heartbeat = bbo_update.mutable_heartbeat();
-        bbo_heartbeat->set_ts_ns(ts_ns);
-        *bbo_heartbeat->mutable_live_venues() = l2_heartbeat->live_venues();
-        bbo_fanout_.broadcast(bbo_update);
+        notify_all(to_notify);
     }
 
     // Writes the initial snapshot to `writer` and, if that succeeds,
@@ -437,6 +505,21 @@ class SymbolBook {
         ChangeCollector<std::less<Price>> asks;
     };
 
+    // What publish()/send_heartbeat() hand back to their own callers: the
+    // subscriber queues each Fanout<T>::broadcast() call says need waking,
+    // kept apart from the broadcast itself so the caller can release
+    // mutex_ first and call notify_all() only afterward - see
+    // Fanout::broadcast()'s own comment for why.
+    struct NotifyList {
+        std::vector<std::shared_ptr<SubscriberQueue<L2Update>>> l2;
+        std::vector<std::shared_ptr<SubscriberQueue<BboUpdate>>> bbo;
+    };
+
+    static void notify_all(const NotifyList& to_notify) {
+        for (auto& queue : to_notify.l2) queue->notify();
+        for (auto& queue : to_notify.bbo) queue->notify();
+    }
+
     // Flattens an already-populated SideChanges into the single Change
     // sequence publish() wants - bids first, then asks. Reads only its
     // own argument, so unlike most other private helpers here, this one
@@ -511,13 +594,16 @@ class SymbolBook {
         return update;
     }
 
-    // Must be called with mutex_ held. No-op if `changed` is empty, so seq_
-    // only advances on an observable change. Also emits a Bbo, sharing this
+    // Must be called with mutex_ held, and returns the resulting
+    // NotifyList for the caller to notify_all() only after releasing that
+    // lock - see Fanout::broadcast()'s own comment for why. No-op
+    // (returns an empty NotifyList) if `changed` is empty, so seq_ only
+    // advances on an observable change. Also emits a Bbo, sharing this
     // same (already-bumped) seq_ value, but only when the best bid or ask
     // actually changed - a deep-book change produces an L2Diff but no Bbo,
     // which is why Bbo.book_seq is allowed to skip values.
-    void publish(const std::vector<Change>& changed) {
-        if (changed.empty()) return;
+    NotifyList publish(const std::vector<Change>& changed) {
+        if (changed.empty()) return {};
 
         L2Update update;
         auto* diff = update.mutable_diff();
@@ -532,15 +618,17 @@ class SymbolBook {
             }
         }
 
-        l2_fanout_.broadcast(update);
+        NotifyList to_notify;
+        to_notify.l2 = l2_fanout_.broadcast(std::make_shared<const L2Update>(std::move(update)));
 
         auto bid = best_bid();
         auto ask = best_ask();
         if (bid != last_bbo_bid_ || ask != last_bbo_ask_) {
             last_bbo_bid_ = bid;
             last_bbo_ask_ = ask;
-            bbo_fanout_.broadcast(build_bbo());
+            to_notify.bbo = bbo_fanout_.broadcast(std::make_shared<const BboUpdate>(build_bbo()));
         }
+        return to_notify;
     }
 
     std::mutex mutex_;
@@ -608,7 +696,7 @@ class AggregatorService final : public Aggregator::Service {
         // or a new update queued"; the 50ms timeout only re-checks
         // IsCancelled() - an actual push wakes this thread immediately via
         // SubscriberQueue's condition variable.
-        std::vector<L2Update> batch;
+        std::vector<std::shared_ptr<const L2Update>> batch;
         while (true) {
             batch.clear();
             auto result = queue->wait_and_drain(std::chrono::milliseconds(50), batch);
@@ -619,7 +707,7 @@ class AggregatorService final : public Aggregator::Service {
                                      "snapshot");
             }
             for (auto& update : batch) {
-                if (!writer->Write(update)) {
+                if (!writer->Write(*update)) {
                     target->unsubscribe(queue);
                     return grpc::Status::OK;
                 }
@@ -651,7 +739,7 @@ class AggregatorService final : public Aggregator::Service {
         // DrainResult::Closed is unreachable here (DropOldest never
         // closes) but kept for exhaustiveness, and returns OK rather than
         // RESOURCE_EXHAUSTED: a BBO subscriber has no resync obligation.
-        std::vector<BboUpdate> batch;
+        std::vector<std::shared_ptr<const BboUpdate>> batch;
         while (true) {
             batch.clear();
             auto result = queue->wait_and_drain(std::chrono::milliseconds(50), batch);
@@ -660,7 +748,7 @@ class AggregatorService final : public Aggregator::Service {
                 return grpc::Status::OK;
             }
             for (auto& update : batch) {
-                if (!writer->Write(update)) {
+                if (!writer->Write(*update)) {
                     target->unsubscribe_bbo(queue);
                     return grpc::Status::OK;
                 }
