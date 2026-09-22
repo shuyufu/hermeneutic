@@ -85,25 +85,37 @@ cmake --build build --target hermeneutic_tests
 ## Test coverage
 
 ```sh
-scripts/coverage.sh              # full build (needs VCPKG_ROOT, default ~/vcpkg): includes net/, ingestion/, aggregator service/client
-scripts/coverage.sh --no-service # vcpkg-free: skips net/**, venue_session.hpp/ingestion_runner.hpp, and the aggregator service/client (ingestion/book_subscription.hpp stays in scope either way)
-scripts/coverage.sh --html       # also writes an HTML report to build-coverage/coverage-html
+scripts/coverage.sh                    # full build (needs VCPKG_ROOT, default ~/vcpkg): includes net/, ingestion/, aggregator service/client
+scripts/coverage.sh --no-service       # vcpkg-free: skips net/**, venue_session.hpp/ingestion_runner.hpp, and the aggregator service/client (ingestion/book_subscription.hpp stays in scope either way)
+scripts/coverage.sh --html             # also writes an HTML report to build-coverage-<clang|gcc>[-service]/coverage-html
+scripts/coverage.sh --gcc --no-service # GCC/gcov coverage (via gcovr) instead of Clang's source-based coverage
 ```
 
-Clang source-based coverage only (`-fprofile-instr-generate -fcoverage-mapping`,
-gated behind `-DHERMENEUTIC_COVERAGE=ON`; no GCC/gcov path, since this project
-has no Linux CI or `lcov`/`gcovr` to run one against). The script configures
-`build-coverage/` (wiping it first only if the cached `CMAKE_TOOLCHAIN_FILE`
-or compiler doesn't match what was requested - the two settings CMake locks
-in after a directory's first configure; every other flag, like
-`HERMENEUTIC_BUILD_SERVICE`, updates freely on a plain reconfigure), builds
-every test binary, runs each one directly and once, in parallel (not through
-`ctest`, which registers one entry per gtest `TEST()` via
-`gtest_discover_tests()` - running through it would relaunch the same binary
-hundreds of times and clobber a fixed profile path), merges the profiles,
-and prints a per-file report scoped to every `.hpp`/`.cpp` under `include/`
-and `apps/` (an allowlist, not an exclusion list - a new top-level source
-directory would need adding there to ever appear in the report).
+Two toolchains: Clang source-based coverage (`-fprofile-instr-generate
+-fcoverage-mapping`, read by `llvm-profdata`/`llvm-cov`, the default) or, with
+`--gcc`, GCC's gcov coverage (`--coverage`, read by `gcov`/`gcovr` - needs
+`gcovr` installed). This project's usual macOS dev machine has no real GCC
+(`/usr/bin/g++` there is an Apple Clang shim), so `--gcc` was verified in an
+`ubuntu:24.04` container with `gcc-14`/`g++-14`/`gcovr` installed (matching
+`docker/Dockerfile`'s own toolchain) rather than on that machine directly.
+Both toolchains are gated behind `-DHERMENEUTIC_COVERAGE=ON`.
+
+Configure/build/report is driven by the named presets in
+`CMakePresets.json` (`coverage-clang[-service]`, `coverage-gcc[-service]`) -
+one `binaryDir` per compiler/scope combination (`build-coverage-clang`,
+`build-coverage-clang-service`, `build-coverage-gcc`,
+`build-coverage-gcc-service`), so switching between `--gcc`/`--no-service`
+combinations never mixes a stale cached compiler or toolchain into a
+directory configured for a different one - each combination just gets its
+own directory. The script builds every test binary, runs each one directly
+and once, in parallel (not through `ctest`, which registers one entry per
+gtest `TEST()` via `gtest_discover_tests()` - running through it would
+relaunch the same binary hundreds of times and clobber/accumulate a fixed
+profile path), merges the profiles (Clang) or reads the `.gcda` counters
+directly (GCC), and prints a per-file report scoped to every `.hpp`/`.cpp`
+under `include/` and `apps/` (an allowlist, not an exclusion list - a new
+top-level source directory would need adding there to ever appear in the
+report).
 
 Three things that look like bugs but aren't:
 - A `warning: N functions have mismatched data` from `llvm-cov report` is

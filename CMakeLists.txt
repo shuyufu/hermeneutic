@@ -88,30 +88,41 @@ if(HERMENEUTIC_TSAN)
     target_link_options(hermeneutic_core INTERFACE -fsanitize=thread)
 endif()
 
-# Source-based coverage instrumentation, driven end-to-end by
-# scripts/coverage.sh (configure/build/run/report). Clang-only, applied
-# via hermeneutic_core the same way as the sanitizer options above: only
-# this project's own code (and anything linking hermeneutic::core) gets
-# instrumented, not vcpkg's prebuilt gRPC/Protobuf. Deliberately doesn't
-# add -O0 here (unlike the sanitizer options, which only add
-# -fno-omit-frame-pointer): an INTERFACE compile option is appended
-# after CMAKE_CXX_FLAGS_<CONFIG>, so baking in an optimization level
-# here would silently override whatever CMAKE_BUILD_TYPE the coverage
-# build was configured with - scripts/coverage.sh sets
-# -DCMAKE_BUILD_TYPE=Debug itself instead. No GCC/gcov branch: this
-# project has no lcov/gcovr and no Linux CI to run one, so an untested
-# fallback path would just rot - configuring under GCC fails loudly
-# below rather than silently producing bad numbers.
-option(HERMENEUTIC_COVERAGE "Instrument for source-based test coverage (Clang only; see scripts/coverage.sh)" OFF)
+# Coverage instrumentation, driven end-to-end by scripts/coverage.sh
+# (configure/build/run/report). Applied via hermeneutic_core the same way
+# as the sanitizer options above: only this project's own code (and
+# anything linking hermeneutic::core) gets instrumented, not vcpkg's
+# prebuilt gRPC/Protobuf. Deliberately doesn't add -O0 here (unlike the
+# sanitizer options, which only add -fno-omit-frame-pointer): an INTERFACE
+# compile option is appended after CMAKE_CXX_FLAGS_<CONFIG>, so baking in
+# an optimization level here would silently override whatever
+# CMAKE_BUILD_TYPE the coverage build was configured with -
+# scripts/coverage.sh sets -DCMAKE_BUILD_TYPE=Debug itself instead.
+#
+# Two flavors, picked by CMAKE_CXX_COMPILER_ID: Clang's source-based
+# coverage (-fprofile-instr-generate/-fcoverage-mapping, read by
+# llvm-profdata/llvm-cov) or GCC's gcov instrumentation (--coverage, read
+# by gcov/gcovr). scripts/coverage.sh drives both, gated by its --gcc flag
+# (default Clang); verified manually in an ubuntu:24.04 container with
+# gcc-14/g++-14 (this project's own docker/Dockerfile toolchain) since
+# there's no CI running it yet - see that script's own comments for the
+# identity-verification gate this implies (a Homebrew/Xcode shim named
+# g++ that is actually Clang would otherwise silently take this branch
+# and instrument nothing gcov can read).
+option(HERMENEUTIC_COVERAGE "Instrument for test coverage (Clang: source-based; GCC: gcov. See scripts/coverage.sh)" OFF)
 if(HERMENEUTIC_COVERAGE)
-    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        target_compile_options(hermeneutic_core INTERFACE -fprofile-instr-generate -fcoverage-mapping)
+        target_link_options(hermeneutic_core INTERFACE -fprofile-instr-generate -fcoverage-mapping)
+    elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(hermeneutic_core INTERFACE --coverage)
+        target_link_options(hermeneutic_core INTERFACE --coverage)
+    else()
         message(FATAL_ERROR
-            "HERMENEUTIC_COVERAGE only supports Clang's source-based coverage "
-            "(CMAKE_CXX_COMPILER_ID=${CMAKE_CXX_COMPILER_ID}); build with "
-            "clang/clang++ instead.")
+            "HERMENEUTIC_COVERAGE only supports Clang's source-based coverage or "
+            "GCC's gcov coverage (CMAKE_CXX_COMPILER_ID=${CMAKE_CXX_COMPILER_ID}); "
+            "build with clang/clang++ or gcc/g++ instead.")
     endif()
-    target_compile_options(hermeneutic_core INTERFACE -fprofile-instr-generate -fcoverage-mapping)
-    target_link_options(hermeneutic_core INTERFACE -fprofile-instr-generate -fcoverage-mapping)
 endif()
 
 # This project's own symbol/venue naming rules (BASE_QUOTE splitting, book

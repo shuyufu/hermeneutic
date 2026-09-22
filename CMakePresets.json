@@ -1,10 +1,63 @@
 {
   "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
   "configurePresets": [
     {
       "name": "vcpkg",
       "displayName": "vcpkg toolchain (gRPC service build)",
       "binaryDir": "${sourceDir}/build-vcpkg",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "HERMENEUTIC_BUILD_SERVICE": "ON"
+      }
+    },
+    {
+      "name": "coverage-base",
+      "hidden": true,
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "HERMENEUTIC_COVERAGE": "ON",
+        "HERMENEUTIC_BUILD_TESTS": "ON",
+        "HERMENEUTIC_BUILD_INGESTION": "ON"
+      }
+    },
+    {
+      "name": "coverage-clang",
+      "inherits": "coverage-base",
+      "displayName": "Clang source-based coverage, vcpkg-free",
+      "binaryDir": "${sourceDir}/build-coverage-clang",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "$env{CC}",
+        "CMAKE_CXX_COMPILER": "$env{CXX}",
+        "HERMENEUTIC_BUILD_SERVICE": "OFF"
+      }
+    },
+    {
+      "name": "coverage-clang-service",
+      "inherits": "coverage-clang",
+      "displayName": "Clang source-based coverage, full vcpkg build",
+      "binaryDir": "${sourceDir}/build-coverage-clang-service",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "HERMENEUTIC_BUILD_SERVICE": "ON"
+      }
+    },
+    {
+      "name": "coverage-gcc",
+      "inherits": "coverage-base",
+      "displayName": "GCC/gcov coverage, vcpkg-free",
+      "binaryDir": "${sourceDir}/build-coverage-gcc",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "$env{CC}",
+        "CMAKE_CXX_COMPILER": "$env{CXX}",
+        "HERMENEUTIC_BUILD_SERVICE": "OFF"
+      }
+    },
+    {
+      "name": "coverage-gcc-service",
+      "inherits": "coverage-gcc",
+      "displayName": "GCC/gcov coverage, full vcpkg build",
+      "binaryDir": "${sourceDir}/build-coverage-gcc-service",
       "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
       "cacheVariables": {
         "HERMENEUTIC_BUILD_SERVICE": "ON"
