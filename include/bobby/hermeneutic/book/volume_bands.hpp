@@ -96,10 +96,21 @@ constexpr std::expected<Price, std::errc> vwap_at_partial_fill(Notional cum_noti
 
     __int128 notional_price_product = vwap_notional_raw * price_raw;
     // Guards the *next* multiply (by kScale) from overflowing __int128
-    // itself -- fires only for a notional/price combination far beyond any
-    // real instrument.
-    assert(notional_price_product <= kInt128Max / kScale);
-    assert(notional_price_product >= -(kInt128Max / kScale));
+    // itself. Checked, not asserted (unlike this function's usual
+    // individually-generous-but-jointly-unbounded assumption): this used
+    // to fire only for a notional/price combination far beyond any real
+    // instrument, back when `remaining`/`cum_notional` were bounded by
+    // this project's own small hardcoded volume-band thresholds. Now that
+    // hermeneutic_aggregator_client's --volume-thresholds= flag (apps/
+    // aggregator/band_config.hpp) lets a caller pick a threshold up to
+    // Notional's own ~9.22e9 ceiling, a large threshold combined with an
+    // ordinary real-instrument price (already five or six figures for,
+    // e.g., BTC) can reach this bound - an assert here would compile out
+    // in a release build and let the next multiply silently overflow
+    // __int128 itself (undefined behavior), rather than fail cleanly.
+    if (notional_price_product > kInt128Max / kScale || notional_price_product < -(kInt128Max / kScale)) {
+        return std::unexpected(std::errc::result_out_of_range);
+    }
     __int128 numerator = notional_price_product * kScale;
 
     __int128 denominator = static_cast<__int128>(cum_size.raw()) * price_raw +

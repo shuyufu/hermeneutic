@@ -458,5 +458,27 @@ TEST(VolumeBands, CumulativeNotionalOverflowReportsOutOfRangeInsteadOfWrapping) 
     EXPECT_EQ(result.error(), std::errc::result_out_of_range);
 }
 
+// A caller (e.g. hermeneutic_aggregator_client's --volume-thresholds=
+// flag) can now pick a threshold up near Notional's own ~9.22e9 ceiling,
+// not just this project's small built-in defaults - a threshold that
+// large, crossed mid-level at an ordinary real-instrument price, reaches
+// detail::vwap_at_partial_fill()'s own joint notional*price overflow
+// guard against __int128 itself. That guard must fail cleanly here
+// (std::errc::result_out_of_range), not silently overflow in a release
+// build where a plain assert would have been compiled out.
+TEST(VolumeBands, LargeThresholdCrossedAtARealisticPriceReportsOutOfRangeInsteadOfOverflowing) {
+    L2OrderBook book;
+    // Level notional (20'000 * 455'000 = 9.1e9) lands just past the
+    // threshold, so the crossing is a genuine partial fill mid-level
+    // (remaining != level_notional), not the exact-boundary case.
+    book.asks[Price(20'000.0)] = Size(455'000.0);
+
+    std::vector<Notional> thresholds = {Notional(9e9)};
+    auto result = ask_volume_band_prices(book, thresholds);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), std::errc::result_out_of_range);
+}
+
 }  // namespace
 }  // namespace bobby::hermeneutic

@@ -32,6 +32,17 @@ struct PriceBand {
     Notional cumulative_notional;
 };
 
+// 1 bps = 1/kBpsDenominator (10000 bps = 100%). A bid-side bps threshold
+// must be strictly under this - a boundary at or past 10000 bps would be
+// zero or negative (see offset_by_bps()'s own comment) - which is what
+// bps_thresholds_valid<Bid>() below enforces. Exposed (not just a repeated
+// literal in this file) so an external caller that needs to pre-validate a
+// bps list before it ever reaches bid_price_band_depths() - e.g.
+// hermeneutic_aggregator_client's own --price-bps= flag - can check
+// against the same named bound this file itself validates against,
+// instead of keeping its own separate copy of the "10000" literal.
+constexpr int kBpsDenominator = 10'000;
+
 namespace detail {
 
 // Offsets `price` by `signed_bps` basis points, rounded *inward* (floor
@@ -56,11 +67,11 @@ constexpr std::expected<Price, std::errc> offset_by_bps(Price price, int signed_
     // overflow for signed_bps near INT_MIN/MAX. factor > 0 is required for
     // floor/ceil below to be correct, and for a bid boundary to stay
     // positive (needs bps < 10000).
-    const __int128 factor = static_cast<__int128>(10'000) + static_cast<__int128>(signed_bps);
+    const __int128 factor = static_cast<__int128>(kBpsDenominator) + static_cast<__int128>(signed_bps);
     assert(factor > 0);
 
     __int128 scaled_numerator = static_cast<__int128>(price.raw()) * factor;
-    constexpr __int128 denom = 10'000;
+    constexpr __int128 denom = kBpsDenominator;
     __int128 rounded = round_down ? scaled_numerator / denom
                                    : (scaled_numerator + denom - 1) / denom;
 
@@ -74,10 +85,10 @@ constexpr std::expected<Price, std::errc> offset_by_bps(Price price, int signed_
 constexpr bool within_bps(Price price, Price best_price, int signed_bps, bool ge) noexcept {
     assert(best_price.raw() > 0);
 
-    const __int128 factor = static_cast<__int128>(10'000) + static_cast<__int128>(signed_bps);
+    const __int128 factor = static_cast<__int128>(kBpsDenominator) + static_cast<__int128>(signed_bps);
     assert(factor > 0);
 
-    __int128 lhs = static_cast<__int128>(price.raw()) * 10'000;
+    __int128 lhs = static_cast<__int128>(price.raw()) * kBpsDenominator;
     __int128 rhs = static_cast<__int128>(best_price.raw()) * factor;
     return ge ? lhs >= rhs : lhs <= rhs;
 }
@@ -124,7 +135,7 @@ constexpr bool bps_thresholds_valid(std::span<const int> bps_thresholds) noexcep
     return std::ranges::is_sorted(bps_thresholds) &&
            std::ranges::all_of(bps_thresholds, [](int bps) { return bps >= 0; }) &&
            (!kBidUpperBoundApplies ||
-            std::ranges::all_of(bps_thresholds, [](int bps) { return bps < 10'000; }));
+            std::ranges::all_of(bps_thresholds, [](int bps) { return bps < kBpsDenominator; }));
 }
 
 // Applies bid_price_band_depths()/ask_price_band_depths()'s shared

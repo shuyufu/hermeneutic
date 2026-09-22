@@ -8,12 +8,13 @@
 //
 // Three publisher modes plus one query mode, selected on the command line:
 //   bbo           best bid/offer - subscribes to SubscribeBbo only.
-//   volume-bands  VWAP needed to fill 1M/5M/10M/25M/50M+ notional on each
-//                 side - subscribes to SubscribeL2Diff and maintains a
-//                 local order book.
-//   price-bands   depth within 50/100/200/500/1000+ bps of BBO on each
-//                 side - subscribes to SubscribeL2Diff and maintains a
-//                 local order book.
+//   volume-bands  VWAP needed to fill 1M/5M/10M/25M/50M+ notional (default,
+//                 overridable via --volume-thresholds=) on each side -
+//                 subscribes to SubscribeL2Diff and maintains a local
+//                 order book.
+//   price-bands   depth within 50/100/200/500/1000+ bps of BBO (default,
+//                 overridable via --price-bps=) on each side - subscribes
+//                 to SubscribeL2Diff and maintains a local order book.
 //   list          calls the unary ListBooks RPC and prints every book the
 //                 server was started with, then exits - unlike the other
 //                 three modes, this takes no duration/book arguments.
@@ -24,19 +25,19 @@
 // never checking it.
 #include <grpcpp/grpcpp.h>
 
+#include "apps/aggregator/band_config.hpp"
 #include "apps/aggregator/book_id.hpp"
 #include "apps/aggregator/client_book.hpp"
 #include "bobby/hermeneutic/aggregator/aggregator.grpc.pb.h"
 #include "bobby/hermeneutic/symbol/symbol.hpp"
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
-#include <iomanip>
+#include <functional>
 #include <iostream>
 #include <mutex>
 #include <optional>
@@ -62,17 +63,28 @@ using bobby::hermeneutic::bid_volume_band_prices;
 
 using bobby::hermeneutic::aggregator::Aggregator;
 using bobby::hermeneutic::aggregator::apply_levels;
+using bobby::hermeneutic::aggregator::BandConfig;
 using bobby::hermeneutic::aggregator::BboUpdate;
+using bobby::hermeneutic::aggregator::CliFlags;
+using bobby::hermeneutic::aggregator::extract_flags;
 using bobby::hermeneutic::aggregator::fill_wire_book_id;
+using bobby::hermeneutic::aggregator::format_bps_label;
+using bobby::hermeneutic::aggregator::format_fixed;
+using bobby::hermeneutic::aggregator::format_notional_label;
 using bobby::hermeneutic::aggregator::Heartbeat;
 using bobby::hermeneutic::aggregator::is_book_seq_gap;
+using bobby::hermeneutic::aggregator::kDefaultPriceBandBps;
+using bobby::hermeneutic::aggregator::kDefaultVolumeBandThresholds;
 using bobby::hermeneutic::aggregator::L2Update;
 using bobby::hermeneutic::aggregator::ListBooksRequest;
 using bobby::hermeneutic::aggregator::ListBooksResponse;
+using bobby::hermeneutic::aggregator::parse_price_bps;
+using bobby::hermeneutic::aggregator::parse_volume_thresholds;
 using bobby::hermeneutic::aggregator::PriceLevel;
 using bobby::hermeneutic::aggregator::SubscribeBboRequest;
 using bobby::hermeneutic::aggregator::SubscribeL2DiffRequest;
 using bobby::hermeneutic::aggregator::to_symbol_book_id;
+using bobby::hermeneutic::aggregator::build_labels;
 using bobby::hermeneutic::symbol::BookId;
 using bobby::hermeneutic::symbol::to_string;
 
@@ -86,35 +98,6 @@ std::optional<Mode> parse_mode(const std::string& token) {
     if (token == "price-bands") return Mode::PriceBands;
     if (token == "list") return Mode::List;
     return std::nullopt;
-}
-
-// Notional/bps thresholds are fixed by this tool, not caller-configurable.
-// Kept as two parallel arrays (values for volume_band_prices()/
-// price_band_depth(), labels for display) rather than a struct-of-two-
-// fields array, since std::span<const Notional>/std::span<const int> -
-// the shape those functions actually take - needs a contiguous run of
-// just the values.
-constexpr std::array<const char*, 5> kVolumeBandLabels = {"1M", "5M", "10M", "25M", "50M+"};
-constexpr std::array<Notional, 5> kVolumeBandThresholds = {
-    Notional(1e6), Notional(5e6), Notional(10e6), Notional(25e6), Notional(50e6),
-};
-
-constexpr std::array<int, 5> kPriceBandBps = {50, 100, 200, 500, 1000};
-constexpr std::array<const char*, 5> kPriceBandLabels = {"50bps", "100bps", "200bps", "500bps", "1000bps+"};
-
-// BasicFixedPoint's own operator<< streams to_double() through ostream's
-// default precision (6 significant digits) - fine for a Price/Size around
-// 80000.5, but a Notional in this tool's 1M-50M+ band range overflows
-// that into scientific notation. Precision is FixedPoint::decimals
-// (Price/Notional=9, Size=6), not a fixed "2": that's the exact number of
-// decimal digits the type's raw scale stores, so a small value (e.g. a
-// sub-cent VWAP) still prints losslessly while std::fixed keeps a large
-// Notional out of scientific notation.
-template <typename FixedPoint>
-std::string format_fixed(FixedPoint value) {
-    std::ostringstream out;
-    out << std::fixed << std::setprecision(FixedPoint::decimals) << value.to_double();
-    return out.str();
 }
 
 // Raw wire values reconstructed into their real fixed-point types before
@@ -163,15 +146,15 @@ void print_line(const std::string& line) {
 }
 
 // One band's worth of `label=value`. `bands` is expected to line up
-// index-for-index with kVolumeBandLabels (volume_band_prices() always
-// returns exactly one entry per input threshold, even for an empty/thin
-// book - see its own comment - so this always holds for a well-formed
-// result).
-std::string format_volume_bands(const std::vector<VolumeBand>& bands) {
+// index-for-index with `labels` (volume_band_prices() always returns
+// exactly one entry per input threshold, even for an empty/thin book -
+// see its own comment - so this always holds for a well-formed result,
+// given `labels` was itself built from that same threshold list).
+std::string format_volume_bands(const std::vector<VolumeBand>& bands, const std::vector<std::string>& labels) {
     std::ostringstream out;
-    for (std::size_t i = 0; i < bands.size() && i < kVolumeBandLabels.size(); ++i) {
+    for (std::size_t i = 0; i < bands.size() && i < labels.size(); ++i) {
         if (i) out << ' ';
-        out << kVolumeBandLabels[i] << '=';
+        out << labels[i] << '=';
         if (bands[i].vwap) out << format_fixed(*bands[i].vwap);
         else out << "NA(filled=" << format_fixed(bands[i].filled_notional) << ')';
     }
@@ -181,13 +164,13 @@ std::string format_volume_bands(const std::vector<VolumeBand>& bands) {
 // bid_price_band_depths()/ask_price_band_depths() return an empty vector
 // for a side with no BBO at all (see their own comments) rather than one
 // entry per threshold - the only case where `bands.size()` doesn't match
-// kPriceBandLabels.size().
-std::string format_price_bands(const std::vector<PriceBand>& bands) {
+// `labels.size()`.
+std::string format_price_bands(const std::vector<PriceBand>& bands, const std::vector<std::string>& labels) {
     if (bands.empty()) return "(no bbo)";
     std::ostringstream out;
-    for (std::size_t i = 0; i < bands.size() && i < kPriceBandLabels.size(); ++i) {
+    for (std::size_t i = 0; i < bands.size() && i < labels.size(); ++i) {
         if (i) out << ' ';
-        out << kPriceBandLabels[i] << '=' << format_fixed(bands[i].cumulative_size) << '@'
+        out << labels[i] << '=' << format_fixed(bands[i].cumulative_size) << '@'
             << format_fixed(bands[i].cumulative_notional);
     }
     return out.str();
@@ -403,7 +386,8 @@ bool list_books(const std::string& address) {
 // Shared by volume-bands and price-bands: both subscribe to SubscribeL2Diff
 // and maintain the same local L2OrderBook, differing only in which bands
 // get computed/printed from it on every update.
-void publish_l2_bands(Mode mode, const std::string& address, const BookId& book_id, std::atomic<bool>* stop) {
+void publish_l2_bands(Mode mode, const std::string& address, const BookId& book_id, std::atomic<bool>* stop,
+                       const BandConfig& band_config) {
     std::string label = to_string(book_id);
     auto stub = make_stub(address);
 
@@ -419,15 +403,23 @@ void publish_l2_bands(Mode mode, const std::string& address, const BookId& book_
         std::ostringstream line;
         line << "book_seq=" << book_seq;
         if (mode == Mode::VolumeBands) {
-            auto bids = bid_volume_band_prices(book, kVolumeBandThresholds);
-            auto asks = ask_volume_band_prices(book, kVolumeBandThresholds);
-            line << " bid[" << (bids.has_value() ? format_volume_bands(*bids) : std::string("ERROR")) << "]";
-            line << " ask[" << (asks.has_value() ? format_volume_bands(*asks) : std::string("ERROR")) << "]";
+            auto bids = bid_volume_band_prices(book, band_config.volume_thresholds);
+            auto asks = ask_volume_band_prices(book, band_config.volume_thresholds);
+            line << " bid["
+                 << (bids.has_value() ? format_volume_bands(*bids, band_config.volume_labels) : std::string("ERROR"))
+                 << "]";
+            line << " ask["
+                 << (asks.has_value() ? format_volume_bands(*asks, band_config.volume_labels) : std::string("ERROR"))
+                 << "]";
         } else {
-            auto bids = bid_price_band_depths(book, kPriceBandBps);
-            auto asks = ask_price_band_depths(book, kPriceBandBps);
-            line << " bid[" << (bids.has_value() ? format_price_bands(*bids) : std::string("ERROR")) << "]";
-            line << " ask[" << (asks.has_value() ? format_price_bands(*asks) : std::string("ERROR")) << "]";
+            auto bids = bid_price_band_depths(book, band_config.price_bps);
+            auto asks = ask_price_band_depths(book, band_config.price_bps);
+            line << " bid["
+                 << (bids.has_value() ? format_price_bands(*bids, band_config.price_labels) : std::string("ERROR"))
+                 << "]";
+            line << " ask["
+                 << (asks.has_value() ? format_price_bands(*asks, band_config.price_labels) : std::string("ERROR"))
+                 << "]";
         }
         std::string result = line.str();
         print_line("[" + label + " " + mode_tag + "] " + result);
@@ -495,30 +487,73 @@ void publish_l2_bands(Mode mode, const std::string& address, const BookId& book_
     print_line(done_line.str());
 }
 
+// Shared by main()'s --volume-thresholds=/--price-bps= override blocks,
+// which otherwise differ only in field/flag names and the hint text: on
+// no override, `*target` is left as whatever main() already defaulted it
+// to; on a present-but-malformed one, prints a single diagnostic line
+// naming `flag_name` and returns false (main() turns that into a non-zero
+// exit); on success, replaces `*target` with the parsed list.
+template <typename T, typename ParseFn>
+bool apply_band_override(const std::optional<std::string>& csv, ParseFn parse_fn, std::string_view flag_name,
+                          std::string_view hint, std::vector<T>* target) {
+    if (!csv) return true;
+    auto parsed = parse_fn(*csv);
+    if (!parsed) {
+        std::cerr << "invalid " << flag_name << "=\"" << *csv << "\" (" << hint << ")\n";
+        return false;
+    }
+    *target = *std::move(parsed);
+    return true;
+}
+
 void print_usage() {
     std::cerr << "usage: hermeneutic_aggregator_client <address> <bbo|volume-bands|price-bands> "
-                 "<duration_seconds> <book1> [book2 ...]\n"
+                 "[--volume-thresholds=<n1,n2,...>] [--price-bps=<b1,b2,...>]\n"
+                 "       <duration_seconds> <book1> [book2 ...]\n"
                  "       hermeneutic_aggregator_client <address> list\n"
                  "  duration_seconds <= 0 means run until interrupted or the server ends the stream\n"
                  "  books look like BTC_USDT.SPOT or BTC_USDT.PERP\n"
                  "  bbo:          subscribes to SubscribeBbo, prints best bid/ask on every update\n"
                  "  volume-bands: subscribes to SubscribeL2Diff, prints the VWAP needed to fill\n"
-                 "                1M/5M/10M/25M/50M+ notional on each side on every update\n"
+                 "                1M/5M/10M/25M/50M+ notional (default) on each side on every update\n"
                  "  price-bands:  subscribes to SubscribeL2Diff, prints depth within\n"
-                 "                50/100/200/500/1000+ bps of BBO on each side on every update\n"
+                 "                50/100/200/500/1000+ bps (default) of BBO on each side on every update\n"
                  "  list:         calls ListBooks and prints every book the server was started\n"
-                 "                with, one per line, then exits (no duration/book arguments)\n";
+                 "                with, one per line, then exits (no duration/book arguments)\n"
+                 "  --volume-thresholds=<n1,n2,...>  overrides volume-bands' notional thresholds\n"
+                 "                                    (comma-separated integers, ascending, strictly\n"
+                 "                                    positive - no decimals or scientific notation,\n"
+                 "                                    e.g. 1000000,5000000,10000000,25000000,50000000)\n"
+                 "  --price-bps=<b1,b2,...>           overrides price-bands' bps thresholds\n"
+                 "                                    (comma-separated, ascending, in [0, 10000),\n"
+                 "                                    e.g. 50,100,200,500,1000)\n"
+                 "  flags may appear anywhere on the command line; the last band in each list is\n"
+                 "  labeled with a trailing '+' (e.g. \"50M+\") to mark it as the highest/open-ended one\n";
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 3) {
+    // Flags are pulled out before any positional parsing below, so
+    // --volume-thresholds=/--price-bps= can appear anywhere on the command
+    // line and the remaining positional arguments - address, mode,
+    // duration, books - line up exactly as they did before these flags
+    // existed.
+    std::vector<std::string> args(argv + 1, argv + argc);
+    auto flags_result = extract_flags(args);
+    if (!flags_result) {
+        std::cerr << flags_result.error() << '\n';
         print_usage();
         return 1;
     }
-    std::string address = argv[1];
-    std::string mode_str = argv[2];
+    CliFlags flags = *std::move(flags_result);
+
+    if (args.size() < 2) {
+        print_usage();
+        return 1;
+    }
+    std::string address = args[0];
+    std::string mode_str = args[1];
 
     auto mode = parse_mode(mode_str);
     if (!mode) {
@@ -530,9 +565,10 @@ int main(int argc, char** argv) {
     // list takes no duration/book arguments and needs neither a stream nor
     // a background thread - handled here, before the duration/book parsing
     // the other three modes share below, and returns directly rather than
-    // falling into their thread-per-book dispatch.
+    // falling into their thread-per-book dispatch. It also takes neither
+    // band flag, since it never computes bands.
     if (*mode == Mode::List) {
-        if (argc != 3) {
+        if (args.size() != 2 || flags.volume_thresholds_csv || flags.price_bps_csv) {
             std::cerr << "list takes no further arguments\n";
             print_usage();
             return 1;
@@ -540,11 +576,49 @@ int main(int argc, char** argv) {
         return list_books(address) ? 0 : 1;
     }
 
-    if (argc < 5) {
+    // Band thresholds: this tool's own defaults unless overridden by
+    // --volume-thresholds=/--price-bps=, validated here at this program's
+    // own input boundary so a malformed flag is a clear startup error
+    // rather than a silent "ERROR" on every printed line once streaming
+    // starts. Only the flag matching `*mode` is applied - bbo never reads
+    // band_config at all, and volume-bands/price-bands each only read
+    // their own half of it - so an irrelevant flag (e.g. --price-bps= on
+    // a bbo run) can't abort a run it has no effect on; a non-fatal note
+    // below still surfaces that it was given and ignored, rather than
+    // leaving that silent.
+    BandConfig band_config;
+    band_config.volume_thresholds.assign(kDefaultVolumeBandThresholds.begin(), kDefaultVolumeBandThresholds.end());
+    band_config.price_bps.assign(kDefaultPriceBandBps.begin(), kDefaultPriceBandBps.end());
+    if (*mode == Mode::VolumeBands) {
+        if (!apply_band_override(flags.volume_thresholds_csv, parse_volume_thresholds, "--volume-thresholds",
+                                  "expected a comma-separated, ascending, strictly positive list of integers - "
+                                  "no decimals or scientific notation - e.g. 1000000,5000000,10000000,25000000,50000000",
+                                  &band_config.volume_thresholds)) {
+            print_usage();
+            return 1;
+        }
+    } else if (flags.volume_thresholds_csv) {
+        std::cerr << "note: --volume-thresholds= has no effect in " << mode_str << " mode (ignored)\n";
+    }
+    if (*mode == Mode::PriceBands) {
+        if (!apply_band_override(flags.price_bps_csv, parse_price_bps, "--price-bps",
+                                  "expected a comma-separated, ascending bps list in [0, 10000), "
+                                  "e.g. 50,100,200,500,1000",
+                                  &band_config.price_bps)) {
+            print_usage();
+            return 1;
+        }
+    } else if (flags.price_bps_csv) {
+        std::cerr << "note: --price-bps= has no effect in " << mode_str << " mode (ignored)\n";
+    }
+    band_config.volume_labels = build_labels(band_config.volume_thresholds, format_notional_label);
+    band_config.price_labels = build_labels(band_config.price_bps, format_bps_label);
+
+    if (args.size() < 4) {
         print_usage();
         return 1;
     }
-    std::string duration_str = argv[3];
+    std::string duration_str = args[2];
     int duration_s;
     try {
         std::size_t consumed = 0;
@@ -573,10 +647,10 @@ int main(int argc, char** argv) {
     // structured value, never the original string again. See
     // bobby::hermeneutic::symbol::parse_book_id's own comment.
     std::vector<BookId> books;
-    for (int i = 4; i < argc; ++i) {
-        auto book_id = bobby::hermeneutic::symbol::parse_book_id(argv[i]);
+    for (std::size_t i = 3; i < args.size(); ++i) {
+        auto book_id = bobby::hermeneutic::symbol::parse_book_id(args[i]);
         if (!book_id) {
-            std::cerr << "invalid book \"" << argv[i] << "\" (expected e.g. BTC_USDT.SPOT or BTC_USDT.PERP)\n";
+            std::cerr << "invalid book \"" << args[i] << "\" (expected e.g. BTC_USDT.SPOT or BTC_USDT.PERP)\n";
             return 1;
         }
         books.push_back(*book_id);
@@ -586,7 +660,14 @@ int main(int argc, char** argv) {
     std::vector<std::thread> threads;
     for (const auto& book_id : books) {
         if (*mode == Mode::Bbo) threads.emplace_back(publish_bbo, address, book_id, &stop);
-        else threads.emplace_back(publish_l2_bands, *mode, address, book_id, &stop);
+        // std::cref(), not a plain `band_config`: std::thread stores a
+        // decayed copy of every argument, so passing the struct itself
+        // would copy its four vectors (including the label strings) once
+        // per book thread, even though every thread reads the identical,
+        // never-mutated-after-this-point band_config for the run's entire
+        // duration - band_config outlives every thread (this loop's join()
+        // below runs before main() returns, so before it's destroyed).
+        else threads.emplace_back(publish_l2_bands, *mode, address, book_id, &stop, std::cref(band_config));
     }
 
     if (duration_s > 0) {

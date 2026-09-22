@@ -138,6 +138,11 @@ if(HERMENEUTIC_BUILD_TESTS)
         # test's FakeLevel stand-in is all that's required, same as every
         # other test in this target.
         tests/apps/aggregator/client_book_test.cpp
+        # apps/aggregator/band_config.hpp: --volume-thresholds=/--price-bps=
+        # CSV parsing/validation and CLI flag extraction, same reasoning as
+        # client_book.hpp above - only needs hermeneutic::core (Notional),
+        # not proto/gRPC.
+        tests/apps/aggregator/band_config_test.cpp
     )
     target_include_directories(hermeneutic_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(hermeneutic_tests PRIVATE
