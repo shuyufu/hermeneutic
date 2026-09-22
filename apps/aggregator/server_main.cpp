@@ -19,6 +19,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -368,7 +369,16 @@ int main(int argc, char** argv) {
     on_signal = [&server, &signals, &on_signal, &shutdown_requested, &grpc_shutdown_thread,
                  kGrpcShutdownDeadline](const boost::system::error_code& ec, int signal_number) {
         if (ec) return;  // e.g. the signal_set was cancelled/destroyed first
-        std::cerr << "received signal " << signal_number << ", shutting down\n";
+        // Single std::cerr call, same reasoning as venue_session.hpp's
+        // log_exception(): this handler runs on one of io_threads_pool's
+        // threads (it's delivered through `io`'s own event loop), so with
+        // io_threads > 1 it can now genuinely run at the same instant as a
+        // VenueSession's own logging on a different thread.
+        {
+            std::ostringstream line;
+            line << "received signal " << signal_number << ", shutting down\n";
+            std::cerr << line.str();
+        }
         if (shutdown_requested) {
             std::_Exit(1);
         }
@@ -425,8 +435,14 @@ int main(int argc, char** argv) {
     std::thread shutdown_watchdog([&] {
         std::unique_lock lock(shutdown_mutex);
         if (!shutdown_cv.wait_for(lock, kShutdownTimeout, [&] { return shutdown_complete; })) {
-            std::cerr << "runner.stop_all() did not drain within " << kShutdownTimeout.count()
-                      << "s - forcing io.stop() as a backstop\n";
+            // Single std::cerr call, same reasoning as on_signal's own
+            // comment above: this thread can still be racing an
+            // io_threads_pool thread's own VenueSession logging at this
+            // point, since io_threads_pool hasn't joined yet.
+            std::ostringstream line;
+            line << "runner.stop_all() did not drain within " << kShutdownTimeout.count()
+                 << "s - forcing io.stop() as a backstop\n";
+            std::cerr << line.str();
             io.stop();
         }
     });
