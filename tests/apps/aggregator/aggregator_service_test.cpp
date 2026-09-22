@@ -7,9 +7,11 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <string>
 #include <thread>
 #include <utility>
@@ -816,6 +818,100 @@ TEST_F(AggregatorServiceTest, ApplyBatchRejectsNonPositivePriceWithoutMutatingOr
     EXPECT_EQ(msg.diff().book_seq(), 1u);
     ASSERT_EQ(msg.diff().bids_size(), 1);
     EXPECT_EQ(msg.diff().bids(0).price_raw(), Price(100.0).raw());
+}
+
+// Every real venue this project ingests from, each given a bid price no
+// other venue ever touches, hammering one SymbolBook from real, distinct
+// std::thread instances (not just logically-concurrent calls) - the shape
+// server_main.cpp's io_threads_pool actually produces. Both the io_threads
+// multi-threading (482ea83) and the mutex_ broadcast critical-section
+// shrink (e40028b) were independently re-derived as correct by review, but
+// neither had a test that actually ran N OS threads against one
+// SymbolBook - this is that test, meant to be run under
+// -DHERMENEUTIC_TSAN=ON (see CMakeLists.txt's own comment on that option).
+//
+// Each thread strictly increases its own price's size every iteration, so
+// every apply_batch() call is guaranteed to be an observable change (never
+// a same-value no-op) and no two threads ever touch the same price - that
+// isolates this test to SymbolBook's own mutex_/seq_/broadcast
+// concurrency correctness, not AggregateOrderBook's per-price aggregation
+// (already covered by the single-threaded tests above), and makes the
+// resulting diff count/seq range fully deterministic instead of racy in
+// the assertion itself.
+TEST_F(AggregatorServiceTest, ConcurrentApplyBatchFromEveryVenueProducesGapFreeSeq) {
+    updates_.wait_for(0);  // initial snapshot
+
+    constexpr std::array<bobby::hermeneutic::VenueId, 6> kVenues{{
+        {Exchange::Binance, MarketType::Spot},
+        {Exchange::Binance, MarketType::Perp},
+        {Exchange::Okx, MarketType::Spot},
+        {Exchange::Okx, MarketType::Perp},
+        {Exchange::Bybit, MarketType::Spot},
+        {Exchange::Bybit, MarketType::Perp},
+    }};
+    constexpr int kItersPerVenue = 30;
+    constexpr int kTotal = static_cast<int>(kVenues.size()) * kItersPerVenue;
+    // 180 < SymbolBook's steady-state kSubscriberQueueCapacity (256, Close
+    // policy for L2Update) - comfortable margin so the fixture's reader
+    // thread draining this stream can't fall behind far enough to close
+    // the queue and turn a scheduling fluke into a spurious failure here.
+    static_assert(kTotal < 256);
+
+    std::vector<std::vector<bool>> ok(kVenues.size(), std::vector<bool>(kItersPerVenue, false));
+    std::vector<std::thread> threads;
+    for (std::size_t i = 0; i < kVenues.size(); ++i) {
+        threads.emplace_back([this, i, venue = kVenues[i], &ok] {
+            Price price = Price(100.0 + static_cast<double>(i));
+            for (int j = 1; j <= kItersPerVenue; ++j) {
+                ok[i][static_cast<std::size_t>(j - 1)] =
+                    apply_one(book(), venue, Side::Bid, price, Size(static_cast<double>(j))).has_value();
+            }
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    for (std::size_t i = 0; i < kVenues.size(); ++i) {
+        for (int j = 0; j < kItersPerVenue; ++j) {
+            EXPECT_TRUE(ok[i][static_cast<std::size_t>(j)]) << "venue " << i << " iteration " << j;
+        }
+    }
+
+    // Drain exactly kTotal diffs (indices 1..kTotal; index 0 was the
+    // initial empty snapshot already consumed above) and check the
+    // resulting book_seq multiset is exactly {1, ..., kTotal} - no gaps,
+    // no duplicates. Either would mean two threads' apply_batch() calls
+    // interleaved unsafely around mutex_/seq_/the fanout broadcast: a
+    // dropped or doubled seq bump, or a message lost/duplicated on the
+    // wire.
+    std::vector<std::uint64_t> seqs;
+    seqs.reserve(static_cast<std::size_t>(kTotal));
+    for (int i = 1; i <= kTotal; ++i) {
+        L2Update update = updates_.wait_for(static_cast<std::size_t>(i));
+        ASSERT_TRUE(update.has_diff()) << "message #" << i;
+        seqs.push_back(update.diff().book_seq());
+    }
+    std::sort(seqs.begin(), seqs.end());
+    std::vector<std::uint64_t> expected(static_cast<std::size_t>(kTotal));
+    std::iota(expected.begin(), expected.end(), std::uint64_t{1});
+    EXPECT_EQ(seqs, expected);
+
+    // Final aggregate state: a fresh subscriber's initial snapshot must
+    // show exactly one level per venue's own exclusive price, each at that
+    // venue's own last-written size - concurrent writers didn't corrupt,
+    // drop, or cross-contaminate each other's level.
+    grpc::ClientContext second_context;
+    auto second_reader = stub_->SubscribeL2Diff(&second_context, subscribe_l2_diff_request(TestBook()));
+    L2Update snapshot_msg;
+    ASSERT_TRUE(second_reader->Read(&snapshot_msg));
+    second_context.TryCancel();
+
+    ASSERT_TRUE(snapshot_msg.has_snapshot());
+    const auto& snapshot = snapshot_msg.snapshot();
+    EXPECT_EQ(snapshot.book_seq(), static_cast<std::uint64_t>(kTotal));
+    ASSERT_EQ(snapshot.bids_size(), static_cast<int>(kVenues.size()));
+    for (const auto& level : snapshot.bids()) {
+        EXPECT_EQ(level.size_raw(), Size(static_cast<double>(kItersPerVenue)).raw());
+    }
 }
 
 TEST_F(AggregatorServiceTest, StuckSubscriberDoesNotBlockIngestionOrOtherSubscribers) {
