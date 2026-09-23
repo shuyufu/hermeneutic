@@ -1,6 +1,7 @@
-# Runs the aggregator service (and, optionally, its diagnostic client) on a
-# single host. See README.md's "Running with Docker" section for the
-# reasoning behind the two-target Dockerfile this builds from.
+# Runs the aggregator and, via the `run-all` profile, its three client
+# services too, on a single host. See README.md's "Running with Docker"
+# section for the reasoning behind the two-target Dockerfile this builds
+# from.
 
 # Fixed project name: like the per-service `image:` names below, this
 # keeps container names (e.g. "hermeneutic-aggregator-service-1") stable
@@ -19,6 +20,11 @@ x-build-base: &build-base
 # binary, three concurrent invocations distinguished only by `command:`
 # (bbo/volume-bands/price-bands can't share a single Compose service - each
 # needs its own container and its own long-running foreground process).
+# Each is a real service, not a diagnostic extra - `profiles: ["run-all"]`
+# below isn't "opt-in/best-effort", it's this compose file's explicit,
+# named way to bring up the whole stack on one host in one command
+# (`docker compose --profile run-all up`), as opposed to `docker compose
+# up` alone, which starts only aggregator-service.
 x-client-base: &client-base
   build:
     <<: *build-base
@@ -26,7 +32,21 @@ x-client-base: &client-base
   depends_on:
     aggregator-service:
       condition: service_healthy
-  profiles: ["client"]
+  profiles: ["run-all"]
+  # client_main.cpp never resubscribes on a book_seq GAP or a
+  # server-ended stream - it deliberately just stops that book's thread
+  # and, once every book it was given has stopped, exits (see the "GAP:"
+  # comment in client_main.cpp) - "an operator's signal to restart it".
+  # `unless-stopped` is that restart, automated, instead of left to a
+  # human watching stdout.
+  restart: unless-stopped
+  # client_main.cpp installs no SIGTERM handler of its own. As each
+  # container's PID 1, the kernel gives it no default disposition for
+  # SIGTERM either, so without `init:` a plain `docker compose down`
+  # would have to wait out the full stop_grace_period and SIGKILL every
+  # client. `init: true` runs tini as PID 1 instead, which does apply
+  # SIGTERM's normal terminate-immediately default to its child.
+  init: true
 
 services:
   aggregator-service:
@@ -77,10 +97,9 @@ services:
       retries: 5
       start_period: 5s
 
-  # Diagnostic/example clients (apps/aggregator/client_main.cpp) - not part
-  # of "the service", so they're gated behind a profile: `docker compose up`
-  # alone starts none of them, `docker compose --profile client up` starts
-  # all three alongside aggregator-service. Each is
+  # Three client services (apps/aggregator/client_main.cpp), one per view -
+  # `docker compose --profile run-all up` starts all three alongside
+  # aggregator-service. Each is
   # `<address> <bbo|volume-bands|price-bands> [--volume-thresholds=...]
   # [--price-bps=...] <duration_seconds> <book...>` - see client_main.cpp /
   # README.md's "Aggregator service" section (and the per-service comments
