@@ -6,14 +6,14 @@ Audited against the actual source (not a design document), 2026-09-22, updated l
 
 ```mermaid
 flowchart TB
-    subgraph IO["io_threads_pool (configurable count, default 1)<br/>io.run() — server_main.cpp:398-402"]
+    subgraph IO["io_threads_pool (configurable count, default 1)<br/>io.run() — server_main.cpp:391-395"]
         direction TB
         B1["Binance spot / futures<br/>(strand)"]
         B2["Bybit spot / linear<br/>(strand)"]
         B3["OKX spot / perp<br/>(strand)"]
     end
 
-    subgraph HB["heartbeat_thread<br/>1s loop · server_main.cpp:208"]
+    subgraph HB["heartbeat_thread<br/>1s loop · server_main.cpp:209"]
         HBOP["send_heartbeat()"]
     end
 
@@ -57,7 +57,7 @@ flowchart TB
 The number of threads in `io_threads_pool` is set by the config file's optional `"io_threads"` field (`book_subscription.hpp`'s `parse_io_threads()`, capped at 64); unset means 1 — the behavior every existing deployment already has. The following first describes that default (1 thread): a single OS thread runs every venue's ingestion, fully serialized, writing into `SymbolBook` via `apply_batch`/`apply_snapshot`/`invalidate_venue`; `heartbeat_thread` only ever calls `send_heartbeat()`; the gRPC subscriber thread pool calls `subscribe`/`unsubscribe` on connect/disconnect. All three go through the `SymbolBook::mutex_` rendezvous point — but it is not the only cross-thread lock in the system:
 
 - Each subscriber's own `SubscriberQueue::mutex_`/`cv_` is a second-tier lock: while holding `SymbolBook::mutex_`, `Fanout::broadcast()` only calls `push_or_close()` (a non-blocking push that also reports whether this subscriber actually has something new to be woken for); the actual wakeup (`notify()`) is deferred until after `SymbolBook::mutex_` is released — the point being to shorten this hot-path lock's hold time, so waking N subscribers' worth of `notify_one()` calls doesn't add to time spent holding the lock. Actually draining messages out of the queue (`wait_and_drain`) is done by each gRPC subscriber thread on its own, guarded by that queue's own lock, unrelated to `SymbolBook::mutex_`.
-- `shutdown_mutex` / `shutdown_cv` (`server_main.cpp:432`) is a third cross-thread sync point dedicated to shutdown: once every thread in `io_threads_pool` has been joined, it notifies `shutdown_watchdog`. Off the data path, unrelated to the two locks above.
+- `shutdown_mutex` / `shutdown_cv` (`server_main.cpp:425-426`) is a third cross-thread sync point dedicated to shutdown: once every thread in `io_threads_pool` has been joined, it notifies `shutdown_watchdog`. Off the data path, unrelated to the two locks above.
 
 ### `io_threads > 1`: already supported, opt-in via config, not the default
 

@@ -100,10 +100,15 @@ See [`thread_model.md`](thread_model.md) for thread-level detail.
 
 ## Known architectural limits
 
-- **No real I/O parallelism by default**: `"io_threads"` defaults to 1 when unset (every existing deployment's behavior), so every venue shares a single thread; setting `"io_threads": N` (N>1) enables genuinely parallel ingestion, at the cost of real, previously-nonexistent lock contention on `SymbolBook::mutex_` — see [`thread_model.md`](thread_model.md) for detail.
-- **SymbolSync reconnects blast too wide a radius**: a live data gap on a single symbol forces the entire shared `VenueSession` to reconnect, dragging down other symbols on the same session (known, currently accepted rather than fixed). This triggers whenever the venue's `SequencePolicy::is_contiguous()` fails, which each venue's documented sequence-reset event hits differently: OKX's reset still chains correctly through its `prevSeqId` back-pointer, so `OkxSequencePolicy::is_contiguous()` never fails on it and it never reaches this path; Bybit's documented `u=1` mid-stream reset, by contrast, does fail `BybitSequencePolicy::is_contiguous()` and is treated exactly like an undocumented gap, triggering the same reconnect.
-- **SymbolSync's snapshot fetch has no dedup**: there's no per-symbol REST fetch cancellation or backoff when nothing is consuming it, which could in theory hammer the REST endpoint (known).
-- **The gRPC thread count is unbounded**: no `SetSyncServerOption` or `ResourceQuota` is configured, so the thread count grows linearly with the number of concurrently active streaming subscriptions.
+See README.md's "Known limitations" section (`SymbolSync` reconnect blast
+radius, no rate limiting against exchange APIs, unbounded gRPC thread
+count, no gRPC health-check service, `ListBooks` read-only) - kept there
+now, not duplicated here. `SymbolSync`'s snapshot-fetch dedup gap and the
+`Heartbeat.live_venues` version-skew caveat are API/protocol-level, not
+architectural, so they live in `api_protocol_design.md`'s own section 10
+instead. `io_threads` parallelism is covered as a "Technical decisions"
+entry instead, since the system genuinely supports it rather than merely
+lacking it.
 
 ## Related documents
 

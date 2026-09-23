@@ -498,6 +498,24 @@ if [[ "$COMPILER_KIND" == "clang" ]]; then
     # gtest binaries, but latent for any future build that reduces to one. The
     # `${arr[@]+"${arr[@]}"}` idiom below expands to nothing instead of erroring
     # when the array is empty.
+    # Three things in this report that look like bugs but aren't:
+    #   - `warning: N functions have mismatched data`: this project is
+    #     almost entirely header-only, so the same inline function gets
+    #     compiled slightly differently across separate test binaries'
+    #     translation units, and llvm-cov flags (but doesn't fail on) that
+    #     mismatch when merging profiles from multiple binaries.
+    #   - llvm-cov only reports on template specializations actually
+    #     instantiated by the tests, e.g. BasicFixedPoint<9> (this
+    #     project's Notional) showing coverage while other widths don't -
+    #     that reflects which specializations ran, not a hole in the report.
+    #   - A header with no coverage mapping at all (nothing in it compiles
+    #     to an instrumented region - a pure alias/traits header, or one no
+    #     instrumented test binary happens to include, like
+    #     apps/aggregator/client_main.cpp/server_main.cpp, which only build
+    #     into the non-test service/client executables) is silently missing
+    #     from the table entirely, not listed at 0%. Compare the table's row
+    #     count against `find include apps -name '*.hpp' -o -name '*.cpp'`
+    #     if a file's absence needs explaining.
     xcrun llvm-cov report "${TEST_BINARIES[0]}" ${OBJECT_ARGS[@]+"${OBJECT_ARGS[@]}"} \
         -instr-profile="$PROFILE_DIR/merged.profdata" \
         "${SOURCES[@]}"

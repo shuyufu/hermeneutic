@@ -560,11 +560,11 @@ like:
    same `std::atomic<bool>* stop` parameter.
 
 This client is positioned as a "starting point, not the only
-implementation" (see the README: "not a throwaway... a starting point for
-whatever actually consumes the aggregator's output next") - a fully
-independent new client (a different language, a different process) only
-needs to follow the protocol contract in sections 3 and 5, not build on
-top of this C++ program.
+implementation" (see `client_main.cpp`'s own top-of-file comment: "meant
+to stay - a starting point for whatever actually consumes the
+aggregator's output next") - a fully independent new client (a different
+language, a different process) only needs to follow the protocol contract
+in sections 3 and 5, not build on top of this C++ program.
 
 ## 10. Known limitations and unaddressed extension surfaces
 

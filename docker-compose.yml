@@ -1,7 +1,7 @@
 # Runs the aggregator and, via the `run-all` profile, its three client
-# services too, on a single host. See README.md's "Running with Docker"
-# section for the reasoning behind the two-target Dockerfile this builds
-# from.
+# services too, on a single host. See README.md's "Building and running
+# with Docker" section for the reasoning behind the two-target Dockerfile
+# this builds from.
 
 # Fixed project name: like the per-service `image:` names below, this
 # keeps container names (e.g. "hermeneutic-aggregator-service-1") stable
@@ -101,9 +101,9 @@ services:
   # `docker compose --profile run-all up` starts all three alongside
   # aggregator-service. Each is
   # `<address> <bbo|volume-bands|price-bands> [--volume-thresholds=...]
-  # [--price-bps=...] <duration_seconds> <book...>` - see client_main.cpp /
-  # README.md's "Aggregator service" section (and the per-service comments
-  # below, for the two band-override flags specifically).
+  # [--price-bps=...] <duration_seconds> <book...>` - see client_main.cpp's
+  # print_usage() (and the per-service comments below, for the two
+  # band-override flags specifically).
   aggregator-client-bbo:
     <<: *client-base
     image: aggregator-client-bbo
@@ -112,9 +112,9 @@ services:
   # To use custom notional thresholds instead of client_main.cpp's default
   # 1M/5M/10M/25M/50M+, add a "--volume-thresholds=<n1,n2,...>" element to
   # the command: list below - client_main.cpp accepts it anywhere on the
-  # command line (see its print_usage()/README.md's "Aggregator service"
-  # section for the exact syntax), e.g. (2M/10M/20M/50M/100M+, a genuinely
-  # different set from the default above, not just the default repeated):
+  # command line (see its print_usage() for the exact syntax), e.g.
+  # (2M/10M/20M/50M/100M+, a genuinely different set from the default
+  # above, not just the default repeated):
   #   command: ["aggregator-service:50051", "volume-bands", "0",
   #             "--volume-thresholds=2000000,10000000,20000000,50000000,100000000",
   #             "BTC_USDT.SPOT"]
