@@ -40,12 +40,13 @@ x-client-base: &client-base
   # `unless-stopped` is that restart, automated, instead of left to a
   # human watching stdout.
   restart: unless-stopped
-  # client_main.cpp installs no SIGTERM handler of its own. As each
-  # container's PID 1, the kernel gives it no default disposition for
-  # SIGTERM either, so without `init:` a plain `docker compose down`
-  # would have to wait out the full stop_grace_period and SIGKILL every
-  # client. `init: true` runs tini as PID 1 instead, which does apply
-  # SIGTERM's normal terminate-immediately default to its child.
+  # client_main.cpp now installs a real SIGINT/SIGTERM handler of its own
+  # (ShutdownSignalWatcher in client_main.cpp) and exits gracefully on
+  # either, even as a container's PID 1 - `init: true` is no longer load-
+  # bearing for that specific reason. Left in place anyway for tini's
+  # other PID-1 duties (reaping zombies, correctly forwarding signals to
+  # every descendant), which this container still benefits from
+  # regardless of client_main.cpp's own signal handling.
   init: true
 
 services:

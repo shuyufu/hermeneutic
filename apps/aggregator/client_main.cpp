@@ -35,12 +35,15 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <iostream>
 #include <mutex>
 #include <optional>
+#include <pthread.h>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -126,23 +129,34 @@ std::string format_live_venues(const Heartbeat& heartbeat) {
     return out.str();
 }
 
-// Guards stdout: each publish_bbo()/publish_l2_bands() call runs on its
-// own thread (one per book - see main()), and a bare `std::cout << a <<
-// b << c` is a sequence of independent stream operations, not one atomic
-// write - two threads' chains can interleave mid-line into a single
-// garbled, unparseable line. Callers build the complete line first (this
-// file already does, via ostringstream) and hand it here as one string so
-// the lock covers the entire write.
-void print_line(const std::string& line) {
-    static std::mutex out_mutex;
+// Guards a stream against interleaved writes from concurrent threads:
+// each publish_bbo()/publish_l2_bands() call runs on its own thread (one
+// per book - see main()), watch_for_shutdown_signal() runs on yet
+// another, and a bare `os << a << b << c` is a sequence of independent
+// stream operations, not one atomic write - two threads' chains can
+// interleave mid-line into a single garbled, unparseable line. Callers
+// build the complete line first (this file already does, via
+// ostringstream) and hand it here as one string so the lock covers the
+// entire write.
+void print_to(std::ostream& os, std::mutex& mutex, const std::string& line) {
     {
-        std::lock_guard lock(out_mutex);
-        std::cout << line << '\n';
+        std::lock_guard lock(mutex);
+        os << line << '\n';
     }
     // Flushed outside the lock: the write above is already complete once
     // the lock is released, so the flush syscall's cost doesn't serialize
     // across every symbol thread.
-    std::cout.flush();
+    os.flush();
+}
+
+void print_line(const std::string& line) {
+    static std::mutex out_mutex;
+    print_to(std::cout, out_mutex, line);
+}
+
+void print_err_line(const std::string& line) {
+    static std::mutex err_mutex;
+    print_to(std::cerr, err_mutex, line);
 }
 
 // One band's worth of `label=value`. `bands` is expected to line up
@@ -189,7 +203,11 @@ class StreamCanceller;
 // This registry's own mutex is held only briefly, for registration/
 // deregistration/notify-everyone bookkeeping - never while any canceller
 // thread is actually blocked waiting - so it introduces no new contention
-// on the wait path itself.
+// on the wait path itself. Plain function-local statics, not leaked
+// never-destroyed singletons: watch_for_shutdown_signal() runs on a
+// thread main() always cancels and joins before returning (see
+// ShutdownSignalWatcher below), so nothing can still be touching these
+// once main() returns and static destruction begins.
 std::mutex& canceller_registry_mutex() {
     static std::mutex m;
     return m;
@@ -281,6 +299,179 @@ void notify_all_of_stop() {
     for (StreamCanceller* canceller : canceller_registry()) canceller->notify_stop();
 }
 
+// `*stop = true` plus waking every registered StreamCanceller, as one
+// operation - both watch_for_shutdown_signal() and main()'s own
+// duration_s > 0 path need exactly this pair done together; a future
+// third thing that should happen on stop (a log line, a metric) then
+// only needs to be added here once instead of at both call sites.
+void request_stop(std::atomic<bool>* stop) {
+    *stop = true;
+    notify_all_of_stop();
+}
+
+// Used only to wake watch_for_shutdown_signal()'s thread out of
+// sigwait() from ShutdownSignalWatcher's destructor when main() is
+// tearing it down with no real shutdown ever requested (e.g. every
+// stream ended on its own) - see that class's own comment for why a
+// dedicated signal, not SIGINT/SIGTERM themselves, is used for this.
+// SIGUSR1 is a real, externally-sendable signal with no kernel-enforced
+// ownership - a `kill -USR1` from an operator or monitoring tool for
+// some unrelated reason is a genuine possibility, not a hypothetical -
+// see wait_for_real_signal()'s own comment for how that's told apart
+// from this object's own use of it.
+constexpr int kWatcherWakeupSignal = SIGUSR1;
+
+// SIGINT/SIGTERM plus kWatcherWakeupSignal, as one sigset_t: main() (to
+// block them on every thread) and watch_for_shutdown_signal() (to
+// sigwait() on them) need the exact same set, so it's built in one place
+// rather than two copies that could drift out of sync.
+sigset_t shutdown_signal_set() {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGTERM);
+    sigaddset(&set, kWatcherWakeupSignal);
+    return set;
+}
+
+// Unlike the server (server_main.cpp), this binary previously registered
+// no SIGINT/SIGTERM handler at all: with duration_seconds <= 0 (every
+// docker-compose client service), `stop`/notify_all_of_stop() were only
+// ever reachable from the timer path in main(), so a signal just hit the
+// OS's default disposition - immediate termination with no Finish()/join
+// (or, if this process is a container's PID 1, no effect whatsoever,
+// since the kernel skips default signal actions for PID 1 unless a
+// handler is installed).
+//
+// Run on its own thread via sigwait() rather than a signal handler:
+// main() blocks SIGINT/SIGTERM on every thread (via pthread_sigmask, done
+// before any thread - including this one - is spawned, so the mask is
+// inherited everywhere), which makes them pending-but-undelivered instead
+// of asynchronously interrupting whatever this process happens to be
+// doing. sigwait() then picks one up synchronously, so the rest of this
+// function runs like any other application code - no async-signal-safety
+// constraints.
+//
+// The first signal drives the same graceful stop the duration timer
+// path already does. A second one means that path is stuck - e.g. a
+// stream whose reader->Finish() is blocked on the server instead of on
+// `stop` (see the TryCancel() call added at the book_seq-gap `break` in
+// publish_l2_bands) - and hard-exits, mirroring server_main.cpp's own
+// signal handler.
+//
+// Blocks until a genuine SIGINT/SIGTERM arrives, transparently looping
+// past any kWatcherWakeupSignal delivery that *isn't* this object's own
+// teardown wakeup: SIGUSR1 is a real, deliverable signal with no kernel-
+// enforced ownership, so an operator or monitoring tool sending it for
+// an unrelated reason (a common ad hoc convention) is otherwise
+// indistinguishable from ShutdownSignalWatcher's own destructor - and
+// mistaking it for that would return from watch_for_shutdown_signal()
+// early, leaving nothing armed to catch a real signal afterward.
+// `*teardown_requested`, set only by that destructor immediately before
+// it sends the wakeup, is what actually disambiguates the two: this
+// function only ever treats kWatcherWakeupSignal as "stop waiting" when
+// that flag is already true, and otherwise just resumes waiting.
+//
+// Returns the real signal number, or -1 if this returned because
+// `*teardown_requested` became true instead - the caller must check for
+// that before treating the return value as a signal to log/act on.
+// Failure is via std::_Exit(1), not a return value: sigwait() reports it
+// via its return code (not errno) and leaves `signal_number` untouched,
+// so an unchecked call could fall through into treating a failure as
+// "received signal 0" and drive a shutdown nothing actually requested -
+// this can only fail with EINVAL against `set`, built fresh by the
+// caller and known valid, but that's exactly the kind of "impossible"
+// this project's own std::stoi/consumed check elsewhere still validates
+// rather than assumes.
+int wait_for_real_signal(const sigset_t& set, std::atomic<bool>* teardown_requested) {
+    for (;;) {
+        int signal_number = 0;
+        if (int err = sigwait(&set, &signal_number); err != 0) {
+            print_err_line(std::string("sigwait failed: ") + std::strerror(err));
+            std::_Exit(1);
+        }
+        if (signal_number != kWatcherWakeupSignal) return signal_number;
+        if (teardown_requested->load()) return -1;
+        // Else: some unrelated SIGUSR1 landed here - not a real shutdown
+        // signal and not our own teardown, so just keep waiting.
+    }
+}
+
+// kWatcherWakeupSignal (via `teardown_requested`) is checked at *both*
+// wait_for_real_signal() calls below, not just whichever one main()
+// usually reaches: after a real SIGINT/SIGTERM already fired, this
+// thread is parked in the *second* wait by the time main() tears it
+// down (see ShutdownSignalWatcher) - if that call didn't also recognize
+// the wakeup, it would fall into the "signal again" branch and hard-exit
+// with a nonzero code on every ordinary graceful shutdown, not just a
+// genuinely stuck one.
+void watch_for_shutdown_signal(std::atomic<bool>* stop, std::atomic<bool>* teardown_requested) {
+    sigset_t set = shutdown_signal_set();
+    int signal_number = wait_for_real_signal(set, teardown_requested);
+    if (signal_number < 0) return;  // torn down, no shutdown ever requested
+    print_err_line("received signal " + std::to_string(signal_number) + ", shutting down");
+    request_stop(stop);
+    signal_number = wait_for_real_signal(set, teardown_requested);
+    if (signal_number < 0) return;  // torn down after a graceful shutdown
+    print_err_line("received signal " + std::to_string(signal_number) + " again, forcing exit");
+    std::_Exit(1);
+}
+
+// Owns watch_for_shutdown_signal()'s background thread and guarantees it
+// is woken and joined before this object is destroyed - main() declares
+// one of these and lets scope handle it on every return path (including
+// the list-mode early return). This is what makes it safe for
+// canceller_registry_mutex()/canceller_registry() above to be plain
+// function-local statics rather than never-destroyed leaked singletons:
+// nothing can still be running on that thread, touching those objects,
+// once main() has returned and static destruction begins.
+//
+// pthread_kill() with a dedicated signal, not pthread_cancel(): sigwait()
+// is blocking and there is no way to wake it early short of delivering
+// an actual signal from its watched set. An earlier version of this
+// class used pthread_cancel() (sigwait() is a documented POSIX
+// cancellation point), verified empirically to interrupt it cleanly on
+// macOS - but pthread_cancel is a forced *unwind* on glibc/Linux (this
+// binary's actual deployment target, per docker/Dockerfile), and if this
+// function - or anything it calls - ever gains a `catch (...)` that
+// doesn't rethrow, that unwind hitting it aborts the process
+// ("FATAL: exception not rethrown"). Signalling instead sidesteps that
+// class of risk entirely: the thread always returns from
+// watch_for_shutdown_signal() normally, so join() can't hang on it and
+// pthread_kill()'s own return value is meaningfully checkable, unlike a
+// destructor built around a call that either works or the thread never
+// comes back.
+class ShutdownSignalWatcher {
+  public:
+    // teardown_requested_ declared (and therefore constructed) before
+    // thread_, not just listed first in the initializer list below: the
+    // spawned thread starts running as soon as thread_'s own constructor
+    // launches it, potentially before this constructor body even runs,
+    // so teardown_requested_ must already be fully initialized by then -
+    // C++ constructs members in declaration order regardless of
+    // initializer-list order.
+    explicit ShutdownSignalWatcher(std::atomic<bool>* stop)
+        : thread_(watch_for_shutdown_signal, stop, &teardown_requested_) {}
+
+    ~ShutdownSignalWatcher() {
+        // Set before sending the wakeup, not after - see
+        // wait_for_real_signal()'s own comment for what this
+        // disambiguates it from.
+        teardown_requested_ = true;
+        if (int err = pthread_kill(thread_.native_handle(), kWatcherWakeupSignal); err != 0) {
+            print_err_line(std::string("pthread_kill failed: ") + std::strerror(err));
+        }
+        thread_.join();
+    }
+
+    ShutdownSignalWatcher(const ShutdownSignalWatcher&) = delete;
+    ShutdownSignalWatcher& operator=(const ShutdownSignalWatcher&) = delete;
+
+  private:
+    std::atomic<bool> teardown_requested_{false};
+    std::thread thread_;
+};
+
 // Shared by publish_bbo()/publish_l2_bands()/list_books() so a future
 // change to how a channel is built (credentials, keepalive, message-size
 // limits) doesn't have to be made at three call sites in lockstep.
@@ -296,7 +487,6 @@ void publish_bbo(const std::string& address, const BookId& book_id, std::atomic<
     grpc::ClientContext context;
     SubscribeBboRequest request;
     fill_wire_book_id(request.mutable_book(), book_id);
-    auto reader = stub->SubscribeBbo(&context, request);
 
     BboUpdate update;
     long bbo_count = 0, heartbeat_count = 0;
@@ -304,8 +494,18 @@ void publish_bbo(const std::string& address, const BookId& book_id, std::atomic<
     // Printed only when it changes, not on every heartbeat (every second) -
     // see format_live_venues()'s own comment for why this is here at all.
     std::optional<std::string> last_live_venues;
+    std::unique_ptr<grpc::ClientReader<BboUpdate>> reader;
     {
+        // Constructed before stub->SubscribeBbo() below, not after: that
+        // call's own ClientReader constructor blocks until the request is
+        // actually written out, which needs a real connection - against
+        // an unresponsive address/black-holed network, this can block for
+        // as long as gRPC's own connect-attempt/backoff takes. Without a
+        // canceller already running, `stop` firing during that window has
+        // nothing to act on, and this stream doesn't react to a shutdown
+        // signal until the second-signal hard-exit backstop.
         StreamCanceller canceller(context, stop);
+        reader = stub->SubscribeBbo(&context, request);
         while (reader->Read(&update)) {
             if (update.has_bbo()) {
                 ++bbo_count;
@@ -334,25 +534,53 @@ void publish_bbo(const std::string& address, const BookId& book_id, std::atomic<
     print_line(done_line.str());
 }
 
-// Unlike publish_bbo()/publish_l2_bands(), this is a single blocking unary
-// call, not a stream, so it has no StreamCanceller/duration handling and
-// runs straight from main(). Given its own deadline below (list takes no
-// duration argument): without one, a server that accepts the connection
-// but never replies would hang this call forever. Returns false on a
-// non-OK status so main() can turn that into a non-zero exit code.
+// Given its own deadline below (list takes no duration argument):
+// without one, a server that accepts the connection but never replies
+// would hang this call for however long `stop` takes to fire (or
+// forever, before main() grew signal handling at all). Wrapped in a
+// StreamCanceller exactly like publish_bbo()/publish_l2_bands()'s
+// streams so a shutdown signal cuts this short too, rather than every
+// other mode reacting to one within milliseconds while this one still
+// sits out the rest of kListBooksTimeout. Returns false on a non-OK
+// status so main() can turn that into a non-zero exit code.
 constexpr std::chrono::seconds kListBooksTimeout{10};
 
-bool list_books(const std::string& address) {
+bool list_books(const std::string& address, std::atomic<bool>* stop) {
     auto stub = make_stub(address);
 
     grpc::ClientContext context;
     context.set_deadline(std::chrono::system_clock::now() + kListBooksTimeout);
     ListBooksRequest request;
     ListBooksResponse response;
-    auto status = stub->ListBooks(&context, request, &response);
+    grpc::Status status;
+    {
+        StreamCanceller canceller(context, stop);
+        status = stub->ListBooks(&context, request, &response);
+    }  // canceller destroyed here: joins its thread before this call's status is inspected below.
     if (!status.ok()) {
-        std::cerr << "ListBooks failed: grpc_status=" << status.error_code() << " (" << status.error_message()
-                   << ")\n";
+        // A CANCELLED status while `*stop` is set means this call's own
+        // StreamCanceller cut it short because a shutdown signal arrived
+        // mid-RPC - the operator asked list mode to stop, and it did.
+        // That's not a failure of the list query itself (a bad address,
+        // an actual server error) and shouldn't be reported as one: a
+        // script checking main()'s exit code needs to tell "you asked
+        // for this" apart from "something is actually wrong," and
+        // returning false here (main() exits 1) would make a deliberate
+        // Ctrl-C indistinguishable from a real ListBooks failure.
+        if (stop->load() && status.error_code() == grpc::StatusCode::CANCELLED) {
+            print_err_line("list cancelled by shutdown signal");
+            return true;
+        }
+        // print_err_line(), not a bare std::cerr chain - see its own
+        // comment: this now runs concurrently with
+        // watch_for_shutdown_signal()'s own stderr writes (list mode
+        // gained a StreamCanceller above, so a shutdown signal arriving
+        // while ListBooks is still in flight can land at the same
+        // instant this fires), and an unlocked multi-op chain here would
+        // reopen exactly the interleaving hazard those exist to close.
+        std::ostringstream line;
+        line << "ListBooks failed: grpc_status=" << status.error_code() << " (" << status.error_message() << ")";
+        print_err_line(line.str());
         return false;
     }
 
@@ -394,7 +622,6 @@ void publish_l2_bands(Mode mode, const std::string& address, const BookId& book_
     grpc::ClientContext context;
     SubscribeL2DiffRequest request;
     fill_wire_book_id(request.mutable_book(), book_id);
-    auto reader = stub->SubscribeL2Diff(&context, request);
 
     const char* mode_tag = mode == Mode::VolumeBands ? "VOLUME_BANDS" : "PRICE_BANDS";
     L2OrderBook book;
@@ -433,8 +660,14 @@ void publish_l2_bands(Mode mode, const std::string& address, const BookId& book_
     // Printed only when it changes, not on every heartbeat (every second) -
     // see format_live_venues()'s own comment for why this is here at all.
     std::optional<std::string> last_live_venues;
+    std::unique_ptr<grpc::ClientReader<L2Update>> reader;
     {
+        // See the identical comment in publish_bbo(): constructed before
+        // stub->SubscribeL2Diff() below so a `stop` firing while that
+        // call itself is still blocked (establishing the stream) has a
+        // canceller already running to act on it.
         StreamCanceller canceller(context, stop);
+        reader = stub->SubscribeL2Diff(&context, request);
         while (reader->Read(&update)) {
             if (update.has_snapshot()) {
                 ++snapshot_count;
@@ -462,6 +695,15 @@ void publish_l2_bands(Mode mode, const std::string& address, const BookId& book_
                               << (*last_seq + 1) << " got " << diff.book_seq()
                               << " - local book invalid, stopping this stream";
                     print_line(gap_line.str());
+                    // The RPC is still fully live here - Read() didn't
+                    // return false and the server hasn't ended the stream -
+                    // unlike a natural loop exit. `stop` itself was never
+                    // set, so StreamCanceller won't cancel on its own (see
+                    // its class comment); without this, reader->Finish()
+                    // below would block until the server independently ends
+                    // the call (its subscriber queue overflowing, or the
+                    // server shutting down).
+                    context.TryCancel();
                     break;
                 }
                 last_seq = diff.book_seq();
@@ -562,6 +804,36 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Set up before the list-mode early return just below, not after it
+    // (alongside the other three modes' own thread spawns further down):
+    // list_books() is a single blocking unary call with its own
+    // kListBooksTimeout deadline, but with no shutdown signal wired up
+    // yet, a slow/unresponsive server would still leave a signal with no
+    // effect until that deadline - list mode gets the exact same prompt
+    // shutdown the other three modes do, not "eventually, within 10s."
+    std::atomic<bool> stop{false};
+
+    // Blocked here, before any thread (including the watcher spawned
+    // right below) exists, so every thread this process ever creates
+    // inherits the same blocked mask - see watch_for_shutdown_signal()'s
+    // own comment for why that matters.
+    sigset_t blocked_signals = shutdown_signal_set();
+    // Checked, not fire-and-forget: an unnoticed failure here would leave
+    // SIGINT/SIGTERM unblocked on this thread and every thread spawned
+    // below, silently reproducing this binary's pre-fix behavior (default
+    // disposition - immediate termination with no Finish()/join, or none
+    // at all as a container's PID 1) with nothing in the output pointing
+    // at why.
+    if (int err = pthread_sigmask(SIG_BLOCK, &blocked_signals, nullptr); err != 0) {
+        print_err_line(std::string("pthread_sigmask failed: ") + std::strerror(err));
+        return 1;
+    }
+    // Declared (not detached) so its destructor - which cancels and
+    // joins the watcher thread, see ShutdownSignalWatcher's own comment -
+    // runs on every return path out of main() from here on, including
+    // the list-mode early return just below.
+    ShutdownSignalWatcher signal_watcher(&stop);
+
     // list takes no duration/book arguments and needs neither a stream nor
     // a background thread - handled here, before the duration/book parsing
     // the other three modes share below, and returns directly rather than
@@ -573,7 +845,7 @@ int main(int argc, char** argv) {
             print_usage();
             return 1;
         }
-        return list_books(address) ? 0 : 1;
+        return list_books(address, &stop) ? 0 : 1;
     }
 
     // Band thresholds: this tool's own defaults unless overridden by
@@ -656,7 +928,6 @@ int main(int argc, char** argv) {
         books.push_back(*book_id);
     }
 
-    std::atomic<bool> stop{false};
     std::vector<std::thread> threads;
     for (const auto& book_id : books) {
         if (*mode == Mode::Bbo) threads.emplace_back(publish_bbo, address, book_id, &stop);
@@ -671,13 +942,31 @@ int main(int argc, char** argv) {
     }
 
     if (duration_s > 0) {
-        std::this_thread::sleep_for(std::chrono::seconds(duration_s));
-        // `stop` itself is a plain atomic write; the lost-wakeup window is
-        // closed on the reader side instead (see StreamCanceller::
-        // notify_stop()) - writing `stop` under a lock here wouldn't help,
-        // since no single lock covers every canceller's own wait().
-        stop = true;
-        notify_all_of_stop();
+        // Polls `stop` on a short interval rather than a bare sleep_for()
+        // for the full duration: a signal reaching
+        // watch_for_shutdown_signal() while this is "asleep" must be able
+        // to cut this wait short, or a duration_s > 0 run would keep the
+        // whole process (not just its book-publisher threads, which do
+        // stop early via each stream's own StreamCanceller) alive until
+        // the timer expires even after being asked to shut down. A poll
+        // is simpler than a second mutex+condvar pair purely to wake this
+        // early, and the added latency (at most kPollInterval) is
+        // negligible next to the multi-second/full-duration hang this
+        // was fixed to close - this isn't even the deployed case anyway
+        // (every docker-compose client service uses duration_s <= 0).
+        constexpr auto kPollInterval = std::chrono::milliseconds(100);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(duration_s);
+        while (!stop.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(kPollInterval);
+        }
+        // Skipped, not called unconditionally, when the loop above exited
+        // because a shutdown signal already called this itself: harmless
+        // either way today (request_stop() is idempotent), but redundant
+        // work regardless - a second full canceller_registry() notify
+        // sweep over whatever's still registered - that only grows if
+        // request_stop() ever gains real work of its own, as its own
+        // comment anticipates.
+        if (!stop.load()) request_stop(&stop);
     }
     for (auto& t : threads) t.join();
     return 0;
