@@ -88,8 +88,8 @@ auto fail_test_on_exception(std::string_view label) {
 // `ws`/`socket` go out of scope - closing the connection - and returns for
 // good. Deliberately single-shot (not a loop): once this coroutine finishes,
 // it leaves no pending work behind on `io`, so once both VenueSessions in
-// StopAllLetsIoContextFinishWithoutIoStop below also finish, nothing keeps
-// io.run() from returning on its own.
+// the fixture below also finish, nothing keeps io.run() from returning on
+// its own.
 net::awaitable<void> run_single_shot_ws_server(net::ip::tcp::acceptor acceptor) {
     auto socket = co_await acceptor.async_accept(net::use_awaitable);
     websocket::stream<net::ip::tcp::socket> ws(std::move(socket));
@@ -98,50 +98,51 @@ net::awaitable<void> run_single_shot_ws_server(net::ip::tcp::acceptor acceptor) 
     co_await ws.async_read(buffer, net::use_awaitable);
 }
 
-// After stop_all(), io_thread.join() should return on its own - no
-// io.stop() needed - because
-// every session's own drain (cancel the in-flight read/backoff wait, wait
-// out any in-flight snapshot fetch) has actually finished. Uses two
-// *differently-typed* VenueSessionAdapter instantiations (FakeFeedA vs
-// FakeFeedB) behind the same IngestionRunner, since the whole point of this
-// layer is managing a heterogeneous group uniformly.
-TEST(IngestionRunnerTest, StopAllLetsIoContextFinishWithoutIoStop) {
+// Shared scaffolding for both stop_all()-driven tests below: an
+// io_context with two single-shot WS servers already spawned on it, and
+// an IngestionRunner wired with two *differently-typed* VenueSessionAdapter
+// instantiations (FakeFeedA vs FakeFeedB) against them - the whole point
+// of IngestionRunner is managing a heterogeneous group uniformly, so a
+// single-type test wouldn't exercise that. Construction only wires
+// things up; the caller still calls runner.start_all() itself (with or
+// without an on_all_drained callback - that's the one thing the two
+// tests below differ on) and spawns its own io_thread.
+struct TwoSessionSetup {
     net::io_context io;
-
-    net::ip::tcp::acceptor acceptor_a(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
-    unsigned short port_a = acceptor_a.local_endpoint().port();
-    net::co_spawn(io, run_single_shot_ws_server(std::move(acceptor_a)), fail_test_on_exception("venue_a server"));
-
-    net::ip::tcp::acceptor acceptor_b(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
-    unsigned short port_b = acceptor_b.local_endpoint().port();
-    net::co_spawn(io, run_single_shot_ws_server(std::move(acceptor_b)), fail_test_on_exception("venue_b server"));
-
-    std::vector<std::string> symbols{"BTCUSDT"};
-
     IngestionRunner runner;
-    runner.add<FakeFeedA, BinanceFuturesSequencePolicy, beast::tcp_stream, AggregateOrderBook>(
-        FakeFeedA(std::to_string(port_a)), kVenueA, symbols, SymbolRegistry<AggregateOrderBook>{},
-        io.get_executor());
-    runner.add<FakeFeedB, BinanceFuturesSequencePolicy, beast::tcp_stream, AggregateOrderBook>(
-        FakeFeedB(std::to_string(port_b)), kVenueB, symbols, SymbolRegistry<AggregateOrderBook>{},
-        io.get_executor());
-    runner.start_all();
 
-    std::thread io_thread([&io] { io.run(); });
+    TwoSessionSetup() {
+        net::ip::tcp::acceptor acceptor_a(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+        unsigned short port_a = acceptor_a.local_endpoint().port();
+        net::co_spawn(io, run_single_shot_ws_server(std::move(acceptor_a)), fail_test_on_exception("venue_a server"));
 
-    // Let both sessions connect, get closed on by the single-shot servers
-    // above, invalidate, and settle into their reconnect backoff wait
-    // (>=1s, per VenueSession::backoff()) before asking them to stop.
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        net::ip::tcp::acceptor acceptor_b(io.get_executor(), net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+        unsigned short port_b = acceptor_b.local_endpoint().port();
+        net::co_spawn(io, run_single_shot_ws_server(std::move(acceptor_b)), fail_test_on_exception("venue_b server"));
 
-    // Safety net only, in case a regression makes stop_all() not actually
-    // drain: without this, a hang here would hang the whole test binary.
-    // watchdog_fired staying false is itself part of what's being tested -
-    // see the assertion below.
+        std::vector<std::string> symbols{"BTCUSDT"};
+        runner.add<FakeFeedA, BinanceFuturesSequencePolicy, beast::tcp_stream, AggregateOrderBook>(
+            FakeFeedA(std::to_string(port_a)), kVenueA, symbols, SymbolRegistry<AggregateOrderBook>{},
+            io.get_executor());
+        runner.add<FakeFeedB, BinanceFuturesSequencePolicy, beast::tcp_stream, AggregateOrderBook>(
+            FakeFeedB(std::to_string(port_b)), kVenueB, symbols, SymbolRegistry<AggregateOrderBook>{},
+            io.get_executor());
+    }
+};
+
+// Calls runner.stop_all() and joins io_thread, guarded by a watchdog that
+// force io.stop()s after 3s and sets `watchdog_fired` - a safety net for
+// both tests below, not the thing either one is actually testing: in
+// case a regression makes stop_all() not actually drain, this keeps that
+// failure a fast, reported EXPECT_FALSE(watchdog_fired) instead of a
+// hung test binary. Shared because the two callers differ only in what
+// else they assert once this returns (a plain "did it drain" check vs.
+// also checking on_all_drained's own call count).
+void stop_all_and_join_with_watchdog(net::io_context& io, IngestionRunner& runner, std::thread& io_thread,
+                                      std::atomic<bool>& watchdog_fired) {
     std::mutex watchdog_mutex;
     std::condition_variable watchdog_cv;
     bool test_finished = false;
-    std::atomic<bool> watchdog_fired{false};
     std::thread watchdog([&] {
         std::unique_lock lock(watchdog_mutex);
         if (!watchdog_cv.wait_for(lock, std::chrono::seconds(3), [&] { return test_finished; })) {
@@ -151,7 +152,15 @@ TEST(IngestionRunnerTest, StopAllLetsIoContextFinishWithoutIoStop) {
     });
 
     runner.stop_all();
-    io_thread.join();  // the claim under test: this returns without io.stop()
+    // Not itself the claim either test is actually making: for
+    // StopAllLetsIoContextFinishWithoutIoStop below, this returning
+    // without io.stop() *is* the claim under test; for
+    // OnAllDrainedFiresExactlyOnceAfterBothSessionsFinish, the real
+    // claim is on_all_drained's exactly-once contract (checked via
+    // drained_count after this helper returns) - this join is just what
+    // both callers need done first, for the same reason (stop_all()
+    // driving both properties).
+    io_thread.join();
 
     {
         std::lock_guard lock(watchdog_mutex);
@@ -159,9 +168,67 @@ TEST(IngestionRunnerTest, StopAllLetsIoContextFinishWithoutIoStop) {
     }
     watchdog_cv.notify_all();
     watchdog.join();
+}
+
+// After stop_all(), io_thread.join() should return on its own - no
+// io.stop() needed - because every session's own drain (cancel the
+// in-flight read/backoff wait, wait out any in-flight snapshot fetch)
+// has actually finished.
+TEST(IngestionRunnerTest, StopAllLetsIoContextFinishWithoutIoStop) {
+    TwoSessionSetup setup;
+    setup.runner.start_all();
+
+    std::thread io_thread([&setup] { setup.io.run(); });
+
+    // Let both sessions connect, get closed on by the single-shot servers
+    // above, invalidate, and settle into their reconnect backoff wait
+    // (>=1s, per VenueSession::backoff()) before asking them to stop.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    std::atomic<bool> watchdog_fired{false};
+    stop_all_and_join_with_watchdog(setup.io, setup.runner, io_thread, watchdog_fired);
 
     EXPECT_FALSE(watchdog_fired.load())
         << "io_thread.join() needed io.stop() as a backstop - stop_all() isn't draining on its own";
+}
+
+// start_all()'s on_all_drained callback exists so a caller (server_main.cpp)
+// can cancel something else - there, a signal_set's re-armed wait - exactly
+// once every session has actually finished, instead of on a timing guess.
+// This test is that contract, directly: the callback must not fire while
+// either session is still running (asserted immediately after start_all(),
+// well before stop_all() below), and must fire exactly once - not once per
+// session - only once both have drained.
+TEST(IngestionRunnerTest, OnAllDrainedFiresExactlyOnceAfterBothSessionsFinish) {
+    TwoSessionSetup setup;
+    std::atomic<int> drained_count{0};
+    setup.runner.start_all([&drained_count] { ++drained_count; });
+
+    std::thread io_thread([&setup] { setup.io.run(); });
+
+    // Same reconnect-backoff settling window as the test above - both
+    // sessions are alive and reconnecting, nowhere near drained, so the
+    // callback firing here would be the bug this test exists to catch.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(drained_count.load(), 0) << "on_all_drained fired before stop_all() was even called";
+
+    std::atomic<bool> watchdog_fired{false};
+    stop_all_and_join_with_watchdog(setup.io, setup.runner, io_thread, watchdog_fired);
+
+    ASSERT_FALSE(watchdog_fired.load());
+    EXPECT_EQ(drained_count.load(), 1);
+}
+
+// start_all() with nothing ever add()ed has nothing to wait on, so
+// on_all_drained must fire synchronously, inline, rather than never firing
+// at all - a caller like server_main.cpp that cancels its own signal_set
+// from this callback needs that to happen even for a config with zero
+// venues wired.
+TEST(IngestionRunnerTest, OnAllDrainedFiresImmediatelyWithNoSessions) {
+    IngestionRunner runner;
+    bool drained = false;
+    runner.start_all([&drained] { drained = true; });
+    EXPECT_TRUE(drained);
 }
 
 }  // namespace

@@ -2,10 +2,13 @@
 #include <grpcpp/grpcpp.h>
 #include <simdjson.h>
 
+#include <boost/asio/bind_executor.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/post.hpp>
 #include <boost/asio/signal_set.hpp>
 #include <boost/asio/ssl.hpp>
+#include <boost/asio/strand.hpp>
 #include <boost/beast/core/tcp_stream.hpp>
 
 #include <atomic>
@@ -243,6 +246,21 @@ int main(int argc, char** argv) {
     }
 
     net::io_context io;
+    // Declared here, well before `signals`/`signal_strand` further down -
+    // meaning, by C++'s reverse-declaration-order rule, `runner` is
+    // *destroyed after* those, once main() returns. That's only safe
+    // because nothing in this function lets it matter:
+    // runner.start_all()'s on_all_drained callback (which is the only
+    // thing that ever touches either) is guaranteed to have already
+    // fired by the time main() reaches its own `return 0;` below -
+    // runner.stop_all() followed by joining every io_threads_pool thread
+    // (both well before that return) together guarantee every
+    // VenueSession::run() has finished, and IngestionRunner never
+    // triggers that callback any other way, including from its own
+    // destructor (a plain member-wise teardown, no callback machinery of
+    // its own). If a future change ever let a session's completion fire
+    // outside that stop_all()+join() sequence, this ordering would need
+    // to be revisited then, not before.
     bobby::hermeneutic::ingestion::IngestionRunner runner;
     std::vector<std::string> wired_venues;
     std::unordered_set<VenueId> wired_venue_ids;
@@ -355,11 +373,43 @@ int main(int argc, char** argv) {
     // signal after the first. Re-arming lets a second signal reach this
     // same handler, which calls std::_Exit() instead of asking nicely again.
     constexpr auto kGrpcShutdownDeadline = std::chrono::seconds(5);
+    // Guards grpc_shutdown_thread only: on_signal (below) writes it from
+    // whichever io_thread happens to run that invocation, while main()'s
+    // own thread later reads it (grpc_shutdown_thread.joinable()/join()) -
+    // with io_threads > 1 those two accesses have no ordering relationship
+    // otherwise (server->Wait() unblocking only means Shutdown() was
+    // called on the spawned thread below, which races independently of
+    // this assignment itself completing) - confirmed a genuine data race
+    // by ThreadSanitizer under io_threads: 2 with a real signal-driven
+    // shutdown, previously unexercised since io_threads defaults to 1.
+    // shutdown_requested needs no lock the way grpc_shutdown_thread does,
+    // and no atomic<bool> either (plain bool is enough): signal_set only
+    // ever has one async_wait outstanding at a time, so on_signal's own
+    // invocations - including the async_wait(on_signal) re-arm at the
+    // end of this one - are inherently serialized regardless of which
+    // thread runs each one, and nothing outside on_signal itself ever
+    // touches this variable (IngestionRunner::start_all()'s own contract
+    // means the on_all_drained callback below doesn't need to check it -
+    // see that callback's own comment).
+    std::mutex grpc_shutdown_thread_mutex;
     std::thread grpc_shutdown_thread;
     bool shutdown_requested = false;
     net::signal_set signals(io, SIGINT, SIGTERM);
+    // `signals` itself needs the same care grpc_shutdown_thread got above:
+    // boost::asio::basic_signal_set is documented "Shared objects:
+    // Unsafe," and with io_threads > 1, on_signal's own re-arm
+    // (signals.async_wait() below) can run on one io_thread while
+    // runner.start_all()'s on_all_drained callback (below) calls
+    // signals.cancel() on a different one - a second instance of the
+    // exact same race class ThreadSanitizer already caught once in this
+    // file. A strand serializes every touch of `signals` (the initial
+    // arm, every re-arm, and the cancel from on_all_drained) onto one
+    // logical execution context, regardless of which io_thread actually
+    // runs each one.
+    net::strand<net::any_io_executor> signal_strand = net::make_strand(io.get_executor());
     std::function<void(const boost::system::error_code&, int)> on_signal;
     on_signal = [&server, &signals, &on_signal, &shutdown_requested, &grpc_shutdown_thread,
+                 &grpc_shutdown_thread_mutex, &signal_strand,
                  kGrpcShutdownDeadline](const boost::system::error_code& ec, int signal_number) {
         if (ec) return;  // e.g. the signal_set was cancelled/destroyed first
         // Single std::cerr call, same reasoning as venue_session.hpp's
@@ -376,14 +426,51 @@ int main(int argc, char** argv) {
             std::_Exit(1);
         }
         shutdown_requested = true;
-        grpc_shutdown_thread = std::thread([&server, kGrpcShutdownDeadline] {
-            server->Shutdown(std::chrono::system_clock::now() + kGrpcShutdownDeadline);
-        });
-        signals.async_wait(on_signal);
+        {
+            std::lock_guard<std::mutex> lock(grpc_shutdown_thread_mutex);
+            grpc_shutdown_thread = std::thread([&server, kGrpcShutdownDeadline] {
+                server->Shutdown(std::chrono::system_clock::now() + kGrpcShutdownDeadline);
+            });
+        }
+        signals.async_wait(net::bind_executor(signal_strand, on_signal));
     };
-    signals.async_wait(on_signal);
+    signals.async_wait(net::bind_executor(signal_strand, on_signal));
 
-    runner.start_all();
+    // Cancels `signals`' own re-armed wait (see above - kept alive after
+    // the first signal specifically to catch a second one) only once
+    // every venue session has actually finished, not on a timing guess:
+    // that re-armed async_wait is itself outstanding work on `io`, so as
+    // long as it stays armed, io_threads_pool's io.run() calls below can
+    // never return on their own no matter what runner.stop_all() does -
+    // they'd depend entirely on kShutdownTimeout's watchdog forcing
+    // io.stop(), every single shutdown, regardless of venue count or
+    // health. Cancelling unconditionally right before stop_all() instead
+    // would fix that same-old-way, but at a cost: a genuinely stuck
+    // drain (this file's own comment below on kShutdownTimeout - a
+    // black-holed DNS resolution, say) is exactly when an operator would
+    // want that second-signal escape hatch most, and cancelling on a
+    // timing guess would have already given it up by then. Tying the
+    // cancel to actual completion instead means a stuck drain never
+    // reaches this callback at all, so the escape hatch stays live for
+    // as long as it's stuck - only the (overwhelmingly common) healthy,
+    // fast drain cancels quickly and lets io.run() return promptly.
+    //
+    // Posted through signal_strand, not called directly: this callback
+    // runs on whichever io_thread happens to process the last session's
+    // completion, which is not necessarily free of a concurrently
+    // in-flight on_signal invocation (or re-arm) on a different
+    // io_thread - see signal_strand's own comment above for why every
+    // touch of `signals` has to go through it.
+    //
+    // No separate shutdown_requested check needed here: IngestionRunner::
+    // start_all()'s own contract (see its doc comment) already guarantees
+    // on_all_drained never fires unless stop_all() was actually called -
+    // and in this binary, stop_all() (below) is never reached until
+    // server->Wait() has already returned, which itself only happens
+    // after on_signal has already set shutdown_requested. Duplicating
+    // that check here would just be re-verifying something the API this
+    // callback is handed to already guarantees.
+    runner.start_all([&signals, &signal_strand] { net::post(signal_strand, [&signals] { signals.cancel(); }); });
     // One thread when *io_threads == 1 (the default, and every existing
     // deployment's behavior), N when the config asked for more - see
     // parse_io_threads()'s own comment for why calling io.run() from
@@ -401,12 +488,26 @@ int main(int argc, char** argv) {
     for (const auto& venue : wired_venues) std::cout << ' ' << venue;
     std::cout << std::endl;
     server->Wait();
-    if (grpc_shutdown_thread.joinable()) grpc_shutdown_thread.join();
+    {
+        // Locked around the read too, not just on_signal's write above -
+        // join() itself can safely happen inside the lock, not just the
+        // joinable() check: on_signal's own shutdown_requested guard
+        // means grpc_shutdown_thread is written at most once, ever, so
+        // nothing else can ever contend for grpc_shutdown_thread_mutex
+        // while this blocks here.
+        std::lock_guard<std::mutex> lock(grpc_shutdown_thread_mutex);
+        if (grpc_shutdown_thread.joinable()) grpc_shutdown_thread.join();
+    }
 
     // No io.stop() as the primary shutdown mechanism: stop_all() aborts
     // every session's in-flight read/backoff wait and drains any in-flight
     // snapshot fetch (see VenueSession::stop()), so io.run() should return
-    // on its own. kShutdownTimeout is a backstop, not the expected path,
+    // on its own - true only because `signals` above is now cancelled via
+    // start_all()'s on_all_drained callback once that's actually
+    // confirmed, rather than the re-armed second-signal wait sitting
+    // there as outstanding work forever; io.run() otherwise never returns
+    // regardless of what runner.stop_all() does. kShutdownTimeout is a
+    // backstop, not the expected path,
     // and has to be comfortably longer than the longest timeout any
     // single in-flight operation could legitimately still be running
     // under when stop() lands - currently WebSocketConnection::connect()'s
@@ -432,9 +533,18 @@ int main(int argc, char** argv) {
             // comment above: this thread can still be racing an
             // io_threads_pool thread's own VenueSession logging at this
             // point, since io_threads_pool hasn't joined yet.
+            // Not "runner.stop_all() did not drain": that's the expected
+            // culprit (a stuck venue), but io.run() failing to return on
+            // its own after every session drains cleanly - a regression
+            // in the on_all_drained/signals.cancel() wiring above - would
+            // land here too, with an identical symptom. Naming only the
+            // first cause would misdirect whoever reads this log line
+            // toward ingestion code when the actual regression is in
+            // signal-handling.
             std::ostringstream line;
-            line << "runner.stop_all() did not drain within " << kShutdownTimeout.count()
-                 << "s - forcing io.stop() as a backstop\n";
+            line << "io.run() did not return within " << kShutdownTimeout.count()
+                 << "s (stuck venue drain, or a regression in the on_all_drained/signal cancellation that's "
+                    "supposed to let it return on its own) - forcing io.stop() as a backstop\n";
             std::cerr << line.str();
             io.stop();
         }
