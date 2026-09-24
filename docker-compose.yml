@@ -1,7 +1,7 @@
-# Runs the aggregator and, via the `run-all` profile, its three client
-# services too, on a single host. See README.md's "Building and running
-# with Docker" section for the reasoning behind the two-target Dockerfile
-# this builds from.
+# Runs the aggregator and its three client services together on a
+# single host - `docker compose up` starts all four. See README.md's
+# "Building and running with Docker" section for how to start a subset
+# instead, and for the two-target Dockerfile this builds from.
 
 # Fixed project name: like the per-service `image:` names below, this
 # keeps container names (e.g. "hermeneutic-aggregator-service-1") stable
@@ -20,11 +20,8 @@ x-build-base: &build-base
 # binary, three concurrent invocations distinguished only by `command:`
 # (bbo/volume-bands/price-bands can't share a single Compose service - each
 # needs its own container and its own long-running foreground process).
-# Each is a real service, not a diagnostic extra - `profiles: ["run-all"]`
-# below isn't "opt-in/best-effort", it's this compose file's explicit,
-# named way to bring up the whole stack on one host in one command
-# (`docker compose --profile run-all up`), as opposed to `docker compose
-# up` alone, which starts only aggregator-service.
+# None sit behind a Compose profile - name a service explicitly (e.g.
+# `docker compose up aggregator-client-bbo`) to run just that one.
 x-client-base: &client-base
   build:
     <<: *build-base
@@ -32,7 +29,6 @@ x-client-base: &client-base
   depends_on:
     aggregator-service:
       condition: service_healthy
-  profiles: ["run-all"]
   # client_main.cpp never resubscribes on a book_seq GAP or a
   # server-ended stream - it deliberately just stops that book's thread
   # and, once every book it was given has stopped, exits (see the "GAP:"
@@ -99,8 +95,7 @@ services:
       start_period: 5s
 
   # Three client services (apps/aggregator/client_main.cpp), one per view -
-  # `docker compose --profile run-all up` starts all three alongside
-  # aggregator-service. Each is
+  # each is
   # `<address> <bbo|volume-bands|price-bands> [--volume-thresholds=...]
   # [--price-bps=...] <duration_seconds> <book...>` - see client_main.cpp's
   # print_usage() (and the per-service comments below, for the two

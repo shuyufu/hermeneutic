@@ -21,7 +21,7 @@ Docker with BuildKit (the default since Docker 23) and Compose v2.
 
 ```sh
 docker compose build
-docker compose --profile run-all up -d          # brings up the service and all three clients
+docker compose up -d                            # brings up the service and all three clients
 ```
 
 This serves the three-venue `BTC_USDT` spot+perp example config
@@ -38,12 +38,19 @@ volumes:
 `aggregator-service` runs as a non-root, home-less system user, so make
 sure your own config is world-readable (`chmod 644 your-subscriptions.json`).
 
-The three clients (`aggregator-client-bbo`, `aggregator-client-volume-bands`,
-`aggregator-client-price-bands`) are the `run-all` profile above:
+None of the four services (`aggregator-service`, `aggregator-client-bbo`,
+`aggregator-client-volume-bands`, `aggregator-client-price-bands`) sit
+behind a Compose profile, so plain `docker compose up` always brings up
+all of them together. To run a subset instead, name the wanted
+service(s) explicitly - Compose starts exactly those plus whatever they
+`depends_on`, regardless of what else is defined in the file:
 
 ```sh
+docker compose up -d aggregator-service         # just the server
+docker compose up -d aggregator-client-bbo      # one client (pulls in aggregator-service too)
 docker compose logs -f aggregator-client-bbo    # follow one client's output
-docker compose --profile run-all down           # tear down with the same profile
+docker compose down aggregator-client-bbo       # tear down just that one client
+docker compose down                             # tear down everything
 ```
 
 ## Test coverage
